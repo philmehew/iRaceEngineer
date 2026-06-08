@@ -10,7 +10,7 @@ build/
 venv/
 
 # iRacing telemetry captures
-tests/sample_data/session_*/
+tests/sample_data/
 
 # IDE
 .vscode/
