@@ -1,0 +1,79 @@
+# iRaceEngineer Configuration
+
+# iRacing connection
+iracing:
+  tick_rate_hz: 30           # How fast to poll shared memory
+
+# LLM API (OpenAI-compatible — works with Ollama Cloud, OpenAI, LM Studio, etc.)
+llm:
+  base_url: "https://ollama.com/v1"         # Ollama Cloud endpoint
+  api_key_env: "2d037788fae94179ba526b56ec4f1dea.J6EUKATFFsHZMzykGG_cVfog"            # Reads from environment variable
+  model: "ministral-3:14b-cloud"
+  max_tokens: 300
+  temperature: 0.3
+
+# Action execution (v1: dry_run only — actions are logged but not sent to iRacing)
+actions:
+  enabled: false             # Set to true to actually execute [ACTION] directives
+  allowed_actions:           # Whitelist of actions that can be executed when enabled
+    - pit_this_lap
+    - add_fuel
+    - change_tyres
+    - clear_penalty
+
+# Team identification — how to recognise your teammates
+# AUTO-DETECT (default): iRacing assigns each driver a TeamName in session info.
+# If you and your teammates all set the same TeamName in iRacing, they're found
+# automatically — no config needed here at all.
+#
+# FALLBACK: If TeamName isn't set or you want to be explicit, list usernames
+# or car numbers below. These are matched in addition to auto-detection.
+team:
+  auto_detect: true              # Match drivers with the same TeamName as the player
+  teammates:
+    - "Patrik Farsang"
+    - "Wayne Smith8"
+    - "Andre Groove"
+    - "Dan Golden"
+    - "Dave Cartnerdobbs"
+    - "Liam Biggs"
+    - "David Barlow"
+  car_numbers: []                # Alternative: identify by car number
+
+# Button trigger
+trigger:
+  method: "keyboard"         # "keyboard" for now; "wheel_button" later via pygame
+  key: "f9"                  # Keyboard key to trigger LLM call
+
+# Prompt configuration
+prompt:
+  system: |
+    You are a race engineer for a sim racing team. Give concise, actionable
+    strategy advice based on the race data provided. Use driver names when
+    referring to teammates. Be direct — the driver is in a race and needs
+    quick answers. If you're unsure, say so. Never invent data not provided.
+
+    You may optionally include action directives in your response using the
+    format [ACTION] action_name[: parameter]. These will be executed (when
+    enabled) or logged (in dry-run mode). Available actions:
+    - [ACTION] pit_this_lap
+    - [ACTION] add_fuel: <litres>
+    - [ACTION] change_tyres
+    - [ACTION] clear_penalty
+  context_depth: "full"       # "minimal", "medium", or "full"
+  # minimal: position, fuel, laps remaining only
+  # medium: + gaps, tyre temps, flags
+  # full:   + lap time trends, nearby cars, pit window estimate, weather, damage
+  include_lap_history: 5     # How many recent laps to include (full depth only)
+  include_nearby_cars: 3     # How many nearby cars to report (full depth only)
+
+# State tracking
+state:
+  track_lap_times: true       # Store per-lap data for trend analysis
+  track_fuel: true             # Track fuel consumption per lap
+  track_tyre_temps: true       # Track tyre temperature trends
+
+# Capture/replay test mode
+capture:
+  interval_ms: 1000           # How often to save snapshots in capture mode
+  output_dir: "./tests/sample_data"  # Where to save captured data

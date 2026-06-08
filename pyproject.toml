@@ -1,0 +1,35 @@
+[project]
+name = "iraceengineer"
+version = "0.1.0"
+description = "Real-time iRacing data collection with on-demand LLM race engineering"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "keyboard>=0.13.5",
+    "openai>=2.41.0",
+    "pyirsdk>=1.3.5",
+    "pyyaml>=6.0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit>=4.2.0",
+    "ruff>=0.11.10",
+    "mypy>=1.16.0",
+]
+
+[tool.setuptools]
+py-modules = [
+    "action_executor",
+    "capture",
+    "context_builder",
+    "iracing_client",
+    "llm_client",
+    "main",
+    "race_state",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

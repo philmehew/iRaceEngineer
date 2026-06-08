@@ -1,0 +1,3 @@
+# Captured/generated telemetry sessions are ephemeral
+# Use --replay to feed them through the pipeline, not version control
+session_*
