@@ -83,6 +83,9 @@ python main.py --capture
 # Generate sample data for testing
 python main.py --generate-samples
 
+# Save real iRacing data to the sample data folder
+python main.py --save-samples
+
 # Override context depth
 python main.py --depth minimal
 ```
@@ -123,6 +126,36 @@ Nearby:
   P3 (Smith): -0.020s, last lap 1:32.400, P2P available
   P2 (Dave): 0.000s, last lap 1:32.100
 ```
+
+## Team Detection
+
+iRaceEngineer identifies your teammates using two strategies that work **additively** — both are checked, and results are unioned:
+
+### Auto-detect (default)
+
+iRacing assigns each driver a `TeamName` in session info. If you and your teammates all set the same TeamName in the iRacing UI, they're found automatically — no config needed. Enabled by default (`team.auto_detect: true`).
+
+### Config fallback
+
+If TeamName isn't set or you want to be explicit, list usernames or car numbers in `config.yaml`. These are matched **in addition to** auto-detect, not as a replacement:
+
+```yaml
+team:
+  auto_detect: true
+  teammates:
+    - "Patrik Farsang"
+    - "Wayne Smith8"
+    - "Andre Groove"
+  car_numbers: []        # Alternative: identify by car number
+```
+
+### Team data in the LLM prompt
+
+- **Team incidents** — the prompt includes `team_incidents` (an iRacing-provided aggregate of your whole team's incident count), shown as `Incidents: 0 (team: 2)` in full depth mode
+- **Nearby cars** — teammates appear in the nearby cars section based on position proximity, but are not explicitly labelled as teammates in the prompt (the system prompt tells the LLM to "use driver names when referring to teammates")
+- **DriverState is universal** — the same `DriverState` class is used for the player, teammates, and opponents. Player-only fields (fuel, tyre temps/wear, brakes) default to zero for non-player cars
+
+> **Note:** Team car indices are detected and stored internally, but are not yet used to give teammates special treatment in the prompt (e.g., richer data, explicit team labels, separate team section). This is planned for a future update.
 
 ## Action Directives
 
@@ -223,7 +256,50 @@ state:
 capture:
   interval_ms: 1000
   output_dir: "./tests/sample_data"
+
+# LLM query logging
+logging:
+  llm_query_log_dir: "logs"              # Directory for log files
+  llm_query_log_file: "llm_queries.log" # Log filename
+  llm_query_max_bytes: 1000000          # Rotate at 1 MB
+  llm_query_backup_count: 5             # Keep 5 rotated files
 ```
+
+## LLM Query Logging
+
+Every time the LLM is queried (via F9 keypress, `--question`, or interactive replay), the full prompt and response are written to a local log file. This is useful for debugging context quality, reviewing what the LLM received, and auditing responses.
+
+Log files are written to `logs/llm_queries.log` by default, with automatic rotation (1 MB per file, 5 backups). The `logs/` directory is gitignored.
+
+### Example log entry
+
+```
+2026-06-08 14:30:05
+--- LLM QUERY ---
+Depth: full
+Question: Should I pit now?
+
+=== PROMPT SENT ===
+[
+  {
+    "role": "system",
+    "content": "You are a race engineer for a sim racing team..."
+  },
+  {
+    "role": "user",
+    "content": "Race: Circuit de Spa-Francorchamps Grand Prix, Lap 10/60, P4 (Class P2)\nFlags: Green\n..."
+  }
+]
+
+=== RESPONSE ===
+Based on current tyre wear and fuel levels, I recommend pitting this lap...
+--- END ---
+```
+
+Log entries are tagged by source:
+- `--- LLM QUERY ---` — live F9 keypress
+- `--- LLM QUERY (replay) ---` — one-shot `--question` with `--replay`
+- `--- LLM QUERY (replay interactive) ---` — typed question in interactive replay mode
 
 ## Testing Without iRacing
 
@@ -238,22 +314,39 @@ Creates simulated telemetry (10 laps of a Spa 24h race stint) in `tests/sample_d
 ### Replay Captured Data
 
 ```bash
-# Replay with looping (default)
+# Replay with looping (default) — loads all snapshots instantly
 python main.py --replay tests/sample_data/session_2026-06-08_13-38-41
 
 # Replay once and stop
 python main.py --replay tests/sample_data/session_2026-06-08_13-38-41 --no-loop
+
+# Timed replay — feed one snapshot every 10 seconds (state evolves like a real race)
+python main.py --replay tests/sample_data/session_2026-06-08_13-38-41 --replay-speed 10
 ```
 
-Press F9 during replay to trigger an LLM query with the current replay state.
+Enters interactive mode where you can type questions and press Enter. Press Enter with no input for a general strategy query (same as pressing F9 in live mode). Type `state` to see current race state, `next` to advance to the next snapshot immediately, `quit` to exit.
+
+With `--replay-speed N`, snapshots are fed automatically every N seconds in the background. The race state evolves over time so you can ask the LLM questions at different points in the stint. Without it (or `--replay-speed 0`), all snapshots are loaded instantly and you interact with the final state.
+
+Works over SSH — no GUI or physical keyboard needed.
 
 ### Capture Live Data
 
 ```bash
+# Capture to a custom directory
 python main.py --capture --capture-interval 1000
 ```
 
 Records telemetry snapshots every 1 second while iRacing is running. Useful for building a library of race scenarios for testing.
+
+### Save Real Data as Samples
+
+```bash
+# Save real iRacing data directly to tests/sample_data/
+python main.py --save-samples
+```
+
+Same as `--capture` but always saves to the `tests/sample_data/` folder (from config), making it easy to capture real race data for replay and testing without specifying a directory.
 
 ## Module Reference
 
@@ -278,6 +371,7 @@ This is the first working slice of the iRaceEngineer spotter system. Planned nex
 - [ ] **Multi-driver audio** — name-prefixed calls for 7 drivers
 - [ ] **Spotter proximity logic** — deterministic 30Hz calls for safety-critical alerts
 - [ ] **Action execution** — enable real `[ACTION]` commands to iRacing
+- [ ] **Team-aware prompts** — label teammates explicitly in nearby cars section, show per-teammate data, separate team section in full depth
 
 ## License
 

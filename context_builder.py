@@ -65,10 +65,14 @@ class ContextBuilder:
 
     def _default_system_prompt(self) -> str:
         return (
-            "You are a race engineer for a sim racing team. Give concise, actionable "
-            "strategy advice based on the race data provided. Use driver names when "
-            "referring to teammates. Be direct — the driver is in a race and needs "
-            "quick answers. If you're unsure, say so. Never invent data not provided.\n\n"
+            "You are a race engineer talking to your driver over radio. "
+            "Speak in short, clear sentences like a real race engineer — "
+            "the driver is in a race and needs fast, spoken-style answers. "
+            "No markdown, no bullet points, no bold, no headers. "
+            "Just plain sentences, like you're on the radio. "
+            "Example: 'Box this lap. Tyres are gone. Add 60 litres.' "
+            "If you're unsure, say so. Never invent data not provided. "
+            "The 'Your car' section is the driver you are talking to.\n\n"
             "You may optionally include action directives in your response using the "
             "format [ACTION] action_name[: parameter]. These will be executed (when "
             "enabled) or logged (in dry-run mode). Available actions:\n"
@@ -112,6 +116,9 @@ class ContextBuilder:
         session = state.get("session", {})
         player = state.get("player", {})
 
+        # Driver identity
+        driver_name = player.get("driver_name", "Driver")
+
         # Session line
         track = session.get("track_name", "Unknown")
         laps_remain = session.get("laps_remain", "?")
@@ -119,7 +126,7 @@ class ContextBuilder:
         pos = player.get("position", "?")
 
         lines.append(
-            f"Race: {track}, P{pos}, Lap {race_laps}/{race_laps + laps_remain if isinstance(laps_remain, int) and isinstance(race_laps, int) else '?'}"
+            f"Driver: {driver_name}. Race: {track}, P{pos}, Lap {race_laps}/{race_laps + laps_remain if isinstance(laps_remain, int) and isinstance(race_laps, int) else '?'}"
         )
 
         # Fuel
@@ -135,6 +142,9 @@ class ContextBuilder:
         lines = []
         session = state.get("session", {})
         player = state.get("player", {})
+
+        # Driver identity
+        driver_name = player.get("driver_name", "Driver")
 
         # Session header
         track = session.get("track_name", "Unknown")
@@ -152,7 +162,7 @@ class ContextBuilder:
         flags = session.get("flags", ["Green"])
 
         lines.append(
-            f"Race: {track_str}, Lap {race_laps}/{total_laps}, P{pos} (Class P{class_pos})"
+            f"Driver: {driver_name}. Race: {track_str}, Lap {race_laps}/{total_laps}, P{pos} (Class P{class_pos})"
         )
         lines.append(f"Flags: {', '.join(flags)}")
 
@@ -199,9 +209,10 @@ class ContextBuilder:
         pos = player.get("position", "?")
         class_pos = player.get("class_position", "?")
         flags = session.get("flags", ["Green"])
+        driver_name = player.get("driver_name", "Driver")
 
         lines.append(
-            f"Race: {track_str}, Lap {race_laps}/{total_laps}, P{pos} (Class P{class_pos})"
+            f"Driver: {driver_name}. Race: {track_str}, Lap {race_laps}/{total_laps}, P{pos} (Class P{class_pos})"
         )
         lines.append(f"Flags: {', '.join(flags)}")
 

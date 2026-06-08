@@ -13,11 +13,14 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
+import threading
 import time
 import yaml
+from logging.handlers import RotatingFileHandler
 
 # Fix Windows console encoding for emoji/special characters
 if sys.platform == "win32":
@@ -39,6 +42,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger("iraceengineer")
 
+# Dedicated logger for LLM query data — writes prompt/response to a local file
+llm_query_logger = logging.getLogger("iraceengineer.llm_query")
+llm_query_logger.propagate = False  # Don't double-print to console
+
+# Thread safety for live mode: protects state reads/writes between the main
+# poll loop and the keyboard-hook thread, and prevents double-press.
+_state_lock = threading.Lock()
+_llm_in_progress = threading.Event()
+
+
+def setup_llm_query_log(config: dict):
+    """Set up the LLM query log file handler.
+
+    Creates a RotatingFileHandler that writes the prompt and response
+    for every LLM call to a local log file. Defaults to logs/llm_queries.log
+    with 5 rotating files of 1 MB each.
+    """
+    log_config = config.get("logging", {})
+    log_dir = log_config.get("llm_query_log_dir", "logs")
+    log_file = log_config.get("llm_query_log_file", "llm_queries.log")
+    max_bytes = log_config.get("llm_query_max_bytes", 1_000_000)
+    backup_count = log_config.get("llm_query_backup_count", 5)
+
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, log_file)
+
+    handler = RotatingFileHandler(
+        log_path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s\n%(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    llm_query_logger.addHandler(handler)
+    llm_query_logger.setLevel(logging.INFO)
+    logger.info(f"LLM query log: {log_path}")
+
 
 def load_config(config_path: str) -> dict:
     """Load configuration from YAML file."""
@@ -59,40 +98,68 @@ def handle_button_press(
     executor: ActionExecutor,
     question: str = "",
 ):
-    """Handle a button press — build context, call LLM, process response."""
-    logger.info("Button pressed — querying LLM...")
+    """Handle a button press — build context, call LLM, process response.
 
-    # Get snapshot and build prompt
-    snapshot = state.get_snapshot()
-    messages = context_builder.build_prompt(snapshot, question=question)
-
-    # Log the context being sent
-    depth = context_builder.context_depth
-    logger.info(
-        f"Sending context (depth={depth}, ~{len(str(messages[-1]['content']))} bytes) to LLM..."
-    )
-
-    # Call LLM
-    response_text = llm.ask(messages)
-
-    if not response_text:
-        logger.warning("LLM returned empty response")
+    Thread-safe: acquires the state lock to read a consistent snapshot,
+    and guards against double-press (skips if an LLM call is already in progress).
+    """
+    # Guard against double-press — skip if an LLM call is already running
+    if _llm_in_progress.is_set():
+        logger.info("LLM call already in progress — skipping")
         return
+    _llm_in_progress.set()
 
-    # Parse actions from response
-    clean_text, actions = executor.parse_response(response_text)
+    try:
+        logger.info("Button pressed — querying LLM...")
 
-    # Display response
-    print("\n" + "=" * 60)
-    print(f"🏁 RACE ENGINEER (depth={depth})")
-    print("=" * 60)
-    print(clean_text)
-    if actions:
-        print("\n--- Actions ---")
-        results = executor.execute(actions)
-        for result in results:
-            print(f"  {result}")
-    print("=" * 60 + "\n")
+        # Get a consistent snapshot under the state lock
+        with _state_lock:
+            snapshot = state.get_snapshot()
+
+        messages = context_builder.build_prompt(snapshot, question=question)
+
+        # Log the context being sent
+        depth = context_builder.context_depth
+        logger.info(
+            f"Sending context (depth={depth}, ~{len(str(messages[-1]['content']))} bytes) to LLM..."
+        )
+
+        # Call LLM
+        response_text = llm.ask(messages)
+
+        # Log the prompt and response to the LLM query log file
+        llm_query_logger.info(
+            "--- LLM QUERY ---\n"
+            f"Depth: {depth}\n"
+            f"Question: {question or '(none)'}\n\n"
+            "=== PROMPT SENT ===\n"
+            f"{json.dumps(messages, indent=2, ensure_ascii=False)}\n\n"
+            "=== RESPONSE ===\n"
+            f"{response_text or '(empty)'}\n"
+            "--- END ---"
+        )
+
+        if not response_text:
+            logger.warning("LLM returned empty response")
+            return
+
+        # Parse actions from response
+        clean_text, actions = executor.parse_response(response_text)
+
+        # Display response
+        print("\n" + "=" * 60)
+        print(f"🏁 RACE ENGINEER (depth={depth})")
+        print("=" * 60)
+        print(clean_text)
+        if actions:
+            print("\n--- Actions ---")
+            results = executor.execute(actions)
+            for result in results:
+                print(f"  {result}")
+        print("=" * 60 + "\n")
+
+    finally:
+        _llm_in_progress.clear()
 
 
 def run_live_mode(config: dict, tick_rate_hz: int = 30):
@@ -159,9 +226,10 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                 telemetry = iracing.get_telemetry()
                 session_info = iracing.get_session_info()
 
-                # Update race state
+                # Update race state (under lock to prevent stale reads from F9 handler)
                 driver_names = {d.car_idx: d.driver_name for d in iracing.drivers}
-                state.update(telemetry, session_info, driver_names)
+                with _state_lock:
+                    state.update(telemetry, session_info, driver_names)
 
             else:
                 # iRacing disconnected — try to reconnect
@@ -228,12 +296,20 @@ def run_capture_mode(config: dict, capture_dir: str, interval_ms: int = 1000):
 
 
 def run_replay_mode(
-    config: dict, replay_dir: str, loop: bool = True, question: str | None = None
+    config: dict,
+    replay_dir: str,
+    loop: bool = True,
+    question: str | None = None,
+    replay_speed: int = 0,
 ):
     """Replay mode — feed captured data through the pipeline.
 
     If question is provided, process all snapshots then ask once.
     Otherwise, enter interactive mode where you can type questions at any time.
+
+    replay_speed controls how fast snapshots are fed in interactive mode:
+        0 = load all instantly (legacy behaviour), then interactive
+        N = feed one snapshot every N seconds, state evolves over time
     """
     context_builder = ContextBuilder(config)
     llm = LLMClient(config)
@@ -245,10 +321,13 @@ def run_replay_mode(
     count = replay.load()
     print(f"✅ Loaded {count} snapshots\n")
 
-    # Process all snapshots to build state
-    # For question mode or one-shot processing, don't loop — just consume all snapshots once
+    # Process snapshots to build state
+    # For question mode or instant replay (speed=0), load all upfront.
+    # For timed replay (speed>0), load only the first snapshot — the rest
+    # are fed one at a time in the interactive loop.
     snapshots_processed = 0
-    for i in range(count):
+    snapshots_to_preload = count if (question or replay_speed == 0) else 1
+    for i in range(snapshots_to_preload):
         snapshot = replay.next_snapshot()
         if snapshot is None:
             break
@@ -264,15 +343,35 @@ def run_replay_mode(
     player = state.player
     flags = ", ".join(state.flags_list) if state.flags_list else "Green"
     print(
-        f"📊 Final state: Lap {player.lap}, P{player.position}, "
+        f"📊 State: Lap {player.lap}, P{player.position}, "
         f"Fuel {player.fuel_pct:.0%}, Flags: {flags}"
     )
-    print(f"   Processed {snapshots_processed} snapshots\n")
+    if replay_speed > 0 and not question:
+        print(
+            f"   Processed {snapshots_processed}/{count} snapshots "
+            f"(feeding one every {replay_speed}s)"
+        )
+    else:
+        print(f"   Processed {snapshots_processed} snapshots")
+    print()
 
     # If question provided on command line, ask it and exit
     if question:
         messages = context_builder.build_prompt(state.get_snapshot(), question=question)
         response = llm.ask(messages)
+
+        # Log the prompt and response to the LLM query log file
+        depth = context_builder.context_depth
+        llm_query_logger.info(
+            "--- LLM QUERY (replay) ---\n"
+            f"Depth: {depth}\n"
+            f"Question: {question}\n\n"
+            "=== PROMPT SENT ===\n"
+            f"{json.dumps(messages, indent=2, ensure_ascii=False)}\n\n"
+            "=== RESPONSE ===\n"
+            f"{response or '(empty)'}\n"
+            "--- END ---"
+        )
 
         clean_text, actions = executor.parse_response(response)
         print("=" * 60)
@@ -291,20 +390,88 @@ def run_replay_mode(
     print("=" * 60)
     print("🎙️  Interactive Replay Mode")
     print("=" * 60)
+    if replay_speed > 0:
+        print(f"Timed replay: feeding one snapshot every {replay_speed}s")
+        print("Snapshots will advance automatically. Type at any time.")
     print("Type a question and press Enter to query the race engineer.")
+    print("Press Enter with no input for a general strategy query.")
     print("Type 'state' to see current race state.")
     print("Type 'depth minimal/medium/full' to change context depth.")
+    print("Type 'next' to advance to the next snapshot immediately.")
     print("Type 'quit' or press Ctrl+C to exit.\n")
+
+    # For timed replay, feed snapshots in a background thread
+    replay_stop = threading.Event()
+
+    def _replay_feeder():
+        """Background thread that feeds snapshots at the configured interval."""
+        while not replay_stop.is_set():
+            time.sleep(replay_speed)
+            if replay_stop.is_set():
+                break
+            snapshot = replay.next_snapshot()
+            if snapshot is None:
+                print("\n  🏁 Replay complete — all snapshots consumed.\n")
+                replay_stop.set()
+                break
+            telemetry = snapshot.get("telemetry", {})
+            session_info = snapshot.get("session_info", {})
+            driver_names = snapshot.get("driver_names", {})
+            if driver_names:
+                driver_names = {int(k): v for k, v in driver_names.items()}
+            state.update(telemetry, session_info, driver_names)
+            p = state.player
+            print(
+                f"  📊 Lap {p.lap}, P{p.position}, "
+                f"Fuel {p.fuel_pct:.0%} — "
+                f"snapshot {replay._index}/{count}"
+            )
+
+    if replay_speed > 0:
+        feeder_thread = threading.Thread(target=_replay_feeder, daemon=True)
+        feeder_thread.start()
 
     while True:
         try:
             user_input = input("🏎️ > ").strip()
+            # Strip UTF-8 BOM that PowerShell may prepend when piping input
+            if user_input.startswith("﻿"):
+                user_input = user_input[1:].strip()
         except (EOFError, KeyboardInterrupt):
             print("\n\n👋 Replay ended.")
             break
 
         if not user_input:
+            # Empty input = general strategy query (like pressing F9 in live mode)
+            user_input = "What's my current strategy?"
+
+        if user_input.lower() in ("quit", "exit", "q"):
+            print("👋 Bye!")
+            break
+
+        if user_input.lower() == "next":
+            # Advance to the next snapshot immediately
+            snapshot = replay.next_snapshot()
+            if snapshot is None:
+                print("  🏁 No more snapshots to replay.\n")
+                continue
+            telemetry = snapshot.get("telemetry", {})
+            session_info = snapshot.get("session_info", {})
+            driver_names = snapshot.get("driver_names", {})
+            if driver_names:
+                driver_names = {int(k): v for k, v in driver_names.items()}
+            state.update(telemetry, session_info, driver_names)
+            p = state.player
+            print(
+                f"  📊 Lap {p.lap}, P{p.position}, "
+                f"Fuel {p.fuel_pct:.0%} — "
+                f"snapshot {replay._index}/{count}\n"
+            )
             continue
+
+        if not user_input:
+            # Empty input = general strategy query (like pressing F9 in live mode)
+            user_input = "What's my current strategy?"
 
         if user_input.lower() in ("quit", "exit", "q"):
             print("👋 Bye!")
@@ -362,6 +529,19 @@ def run_replay_mode(
         print("  ⏳ Asking race engineer...\n")
         response = llm.ask(messages)
 
+        # Log the prompt and response to the LLM query log file
+        depth = context_builder.context_depth
+        llm_query_logger.info(
+            "--- LLM QUERY (replay interactive) ---\n"
+            f"Depth: {depth}\n"
+            f"Question: {user_input}\n\n"
+            "=== PROMPT SENT ===\n"
+            f"{json.dumps(messages, indent=2, ensure_ascii=False)}\n\n"
+            "=== RESPONSE ===\n"
+            f"{response or '(empty)'}\n"
+            "--- END ---"
+        )
+
         if response:
             clean_text, actions = executor.parse_response(response)
             print("  " + "=" * 56)
@@ -377,6 +557,11 @@ def run_replay_mode(
             print("  " + "=" * 56 + "\n")
         else:
             print("  ❌ No response from LLM.\n")
+
+    # Clean up replay feeder thread if running
+    if replay_speed > 0:
+        replay_stop.set()
+        feeder_thread.join(timeout=2)
 
 
 def run_generate_samples(config: dict):
@@ -416,6 +601,12 @@ def main():
         "--replay", help="Replay mode — feed captured data from this directory"
     )
     parser.add_argument(
+        "--replay-speed",
+        type=int,
+        default=0,
+        help="Seconds between replay snapshots (0 = load all instantly, default: 0)",
+    )
+    parser.add_argument(
         "--no-loop",
         action="store_true",
         help="Don't loop replay when all snapshots are consumed",
@@ -424,6 +615,11 @@ def main():
         "--generate-samples",
         action="store_true",
         help="Generate sample telemetry data for testing",
+    )
+    parser.add_argument(
+        "--save-samples",
+        action="store_true",
+        help="Capture real iRacing data to tests/sample_data/ (like --capture but saves to the sample data folder for replay/testing)",
     )
     parser.add_argument(
         "--depth",
@@ -448,6 +644,9 @@ def main():
     # Load config
     config = load_config(args.config)
 
+    # Set up LLM query log file
+    setup_llm_query_log(config)
+
     # Override context depth if specified
     if args.depth:
         config.setdefault("prompt", {})["context_depth"] = args.depth
@@ -467,6 +666,9 @@ def main():
 
     if args.generate_samples:
         run_generate_samples(config)
+    elif args.save_samples:
+        sample_dir = config.get("capture", {}).get("output_dir", "./tests/sample_data")
+        run_capture_mode(config, sample_dir, args.capture_interval)
     elif args.capture:
         capture_dir = args.capture_dir or config.get("capture", {}).get(
             "output_dir", "./tests/sample_data"
@@ -474,7 +676,11 @@ def main():
         run_capture_mode(config, capture_dir, args.capture_interval)
     elif args.replay:
         run_replay_mode(
-            config, args.replay, loop=not args.no_loop, question=args.question
+            config,
+            args.replay,
+            loop=not args.no_loop,
+            question=args.question,
+            replay_speed=args.replay_speed,
         )
     else:
         run_live_mode(config, config.get("iracing", {}).get("tick_rate_hz", 30))

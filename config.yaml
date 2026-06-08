@@ -48,10 +48,14 @@ trigger:
 # Prompt configuration
 prompt:
   system: |
-    You are a race engineer for a sim racing team. Give concise, actionable
-    strategy advice based on the race data provided. Use driver names when
-    referring to teammates. Be direct — the driver is in a race and needs
-    quick answers. If you're unsure, say so. Never invent data not provided.
+    You are a race engineer talking to your driver over radio.
+    Speak in short, clear sentences like a real race engineer —
+    the driver is in a race and needs fast, spoken-style answers.
+    No markdown, no bullet points, no bold, no headers.
+    Just plain sentences, like you're on the radio.
+    Example: 'Box this lap. Tyres are gone. Add 60 litres.'
+    If you're unsure, say so. Never invent data not provided.
+    The 'Your car' section is the driver you are talking to.
 
     You may optionally include action directives in your response using the
     format [ACTION] action_name[: parameter]. These will be executed (when
@@ -77,3 +81,10 @@ state:
 capture:
   interval_ms: 1000           # How often to save snapshots in capture mode
   output_dir: "./tests/sample_data"  # Where to save captured data
+
+# Logging
+logging:
+  llm_query_log_dir: "logs"              # Directory for LLM query log files
+  llm_query_log_file: "llm_queries.log" # Log filename
+  llm_query_max_bytes: 1000000          # Rotate at 1 MB
+  llm_query_backup_count: 5             # Keep 5 rotated files

@@ -22,3 +22,6 @@ Thumbs.db
 
 # pre-commit
 .mypy_cache/
+
+# LLM query logs
+logs/
