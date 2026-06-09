@@ -300,7 +300,7 @@ def run_replay_mode(
     replay_dir: str,
     loop: bool = True,
     question: str | None = None,
-    replay_speed: int = 0,
+    replay_speed: float = 0,
 ):
     """Replay mode — feed captured data through the pipeline.
 
@@ -402,6 +402,14 @@ def run_replay_mode(
 
     # For timed replay, feed snapshots in a background thread
     replay_stop = threading.Event()
+    # Shared state for dynamic prompt — seed from current state
+    prompt_state = {
+        "lap": state.player.lap,
+        "pos": state.player.position,
+        "fuel_pct": state.player.fuel_pct,
+        "snapshot_num": snapshots_processed,
+    }
+    last_progress_idx = [0]  # Track last printed progress milestone
 
     def _replay_feeder():
         """Background thread that feeds snapshots at the configured interval."""
@@ -421,11 +429,23 @@ def run_replay_mode(
                 driver_names = {int(k): v for k, v in driver_names.items()}
             state.update(telemetry, session_info, driver_names)
             p = state.player
-            print(
-                f"  📊 Lap {p.lap}, P{p.position}, "
-                f"Fuel {p.fuel_pct:.0%} — "
-                f"snapshot {replay._index}/{count}"
-            )
+            # Update shared prompt state
+            prompt_state["lap"] = p.lap
+            prompt_state["pos"] = p.position
+            prompt_state["fuel_pct"] = p.fuel_pct
+            prompt_state["snapshot_num"] = replay._index
+            # Print progress at milestones (every ~20% of total snapshots)
+            step = max(1, count // 5)
+            if (
+                replay._index > 1
+                and replay._index % step == 0
+                and replay._index != last_progress_idx[0]
+            ):
+                flags = ", ".join(state.flags_list) if state.flags_list else "Green"
+                print(
+                    f"  📊 Lap {p.lap}, P{p.position}, Fuel {p.fuel_pct:.0%}, {flags} — {replay._index}/{count}"
+                )
+                last_progress_idx[0] = replay._index
 
     if replay_speed > 0:
         feeder_thread = threading.Thread(target=_replay_feeder, daemon=True)
@@ -433,7 +453,13 @@ def run_replay_mode(
 
     while True:
         try:
-            user_input = input("🏎️ > ").strip()
+            # Build dynamic prompt with current state
+            lap = prompt_state["lap"]
+            pos = prompt_state["pos"]
+            fuel_pct = prompt_state["fuel_pct"]
+            snap = prompt_state["snapshot_num"]
+            prompt_prefix = f"🏎️ [Lap {lap} P{pos} {fuel_pct:.0%}⛽ {snap}/{count}]"
+            user_input = input(f"{prompt_prefix} > ").strip()
             # Strip UTF-8 BOM that PowerShell may prepend when piping input
             if user_input.startswith("﻿"):
                 user_input = user_input[1:].strip()
@@ -602,9 +628,9 @@ def main():
     )
     parser.add_argument(
         "--replay-speed",
-        type=int,
+        type=float,
         default=0,
-        help="Seconds between replay snapshots (0 = load all instantly, default: 0)",
+        help="Seconds between replay snapshots (0 = load all instantly, e.g. 0.1 = ~3min for 1920 snapshots, default: 0)",
     )
     parser.add_argument(
         "--no-loop",
