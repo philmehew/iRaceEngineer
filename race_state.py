@@ -205,6 +205,7 @@ class SessionState:
     shift_first_rpm: float = 0.0
     shift_last_rpm: float = 0.0
     shift_blink_rpm: float = 0.0
+    est_lap_time: float = 0.0  # DriverCarEstLapTime from session info
 
 
 # Session flag constants (from iRacing SDK)
@@ -369,6 +370,9 @@ class RaceState:
             )
             self.session.shift_blink_rpm = float(
                 driver_info.get("DriverCarSLBlinkRPM", 0.0)
+            )
+            self.session.est_lap_time = float(
+                driver_info.get("DriverCarEstLapTime", 0.0)
             )
 
     def _update_player(self, telemetry: dict):
@@ -637,26 +641,50 @@ class RaceState:
 
     @property
     def fuel_laps_remaining(self) -> float:
-        """Estimate how many laps of fuel remain for the player."""
-        if not self.player.lap_history or self.player.fuel_use_per_hour <= 0:
+        """Estimate how many laps of fuel remain for the player.
+
+        Uses lap history when available, falls back to burn rate + estimated
+        lap time when no history exists yet (e.g. early race).
+        """
+        # Primary method: use actual lap history
+        if self.player.lap_history:
+            recent = (
+                self.player.lap_history[-5:]
+                if len(self.player.lap_history) >= 5
+                else self.player.lap_history
+            )
+            fuel_per_lap = sum(r.fuel_used for r in recent if r.fuel_used > 0)
+            laps_with_fuel = sum(1 for r in recent if r.fuel_used > 0)
+
+            if laps_with_fuel > 0:
+                avg_fuel_per_lap = fuel_per_lap / laps_with_fuel
+                if avg_fuel_per_lap > 0:
+                    return self.player.fuel_level / avg_fuel_per_lap
+
+        # Fallback: estimate from burn rate and best/current lap time
+        fuel_rate = self.player.fuel_use_per_hour  # L/hr
+        if fuel_rate <= 0:
             return 0.0
 
-        recent = (
-            self.player.lap_history[-5:]
-            if len(self.player.lap_history) >= 5
-            else self.player.lap_history
-        )
-        fuel_per_lap = sum(r.fuel_used for r in recent if r.fuel_used > 0)
-        laps_with_fuel = sum(1 for r in recent if r.fuel_used > 0)
+        # Use best lap time if available, then current lap time, then
+        # session estimated lap time from DriverInfo
+        est_lap_time = self.player.best_lap_time
+        if est_lap_time <= 0:
+            est_lap_time = self.player.last_lap_time
+        if est_lap_time <= 0:
+            est_lap_time = self.player.current_lap_time
+        if est_lap_time <= 0:
+            # Last resort: use DriverCarEstLapTime from session
+            est_lap_time = getattr(self.session, "est_lap_time", 0) or 0
+        if est_lap_time <= 0:
+            return 0.0  # No way to estimate without any time reference
 
-        if laps_with_fuel == 0:
+        # fuel_per_lap = fuel_rate * (lap_time_seconds / 3600)
+        fuel_per_lap = fuel_rate * (est_lap_time / 3600.0)
+        if fuel_per_lap <= 0:
             return 0.0
 
-        avg_fuel_per_lap = fuel_per_lap / laps_with_fuel
-        if avg_fuel_per_lap <= 0:
-            return 0.0
-
-        return self.player.fuel_level / avg_fuel_per_lap
+        return self.player.fuel_level / fuel_per_lap
 
     @property
     def lap_time_trend(self) -> float:
@@ -734,6 +762,7 @@ class RaceState:
                     "idle_rpm": self.session.idle_rpm,
                     "redline_rpm": self.session.redline_rpm,
                     "shift_rpm": self.session.shift_rpm,
+                    "est_lap_time": self.session.est_lap_time,
                 },
             },
             "player": {

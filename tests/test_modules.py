@@ -181,6 +181,7 @@ def sample_session_info():
             "DriverCarSLFirstRPM": 5500.0,
             "DriverCarSLLastRPM": 7200.0,
             "DriverCarSLBlinkRPM": 7000.0,
+            "DriverCarEstLapTime": 92.5,
             "Drivers": [
                 {
                     "CarIdx": 0,
@@ -285,9 +286,12 @@ class TestRaceState:
 
     def test_fuel_laps_remaining_with_history(self):
         state = make_state()
-        # Single update has no lap history, so fuel_laps_remaining is 0
-        # (it requires at least one completed lap to calculate fuel burn)
-        assert state.fuel_laps_remaining == 0.0
+        # With no lap history, fuel_laps_remaining falls back to
+        # burn rate + estimated lap time from session info
+        # (DriverCarEstLapTime=92.5, FuelUsePerHour=28.5, FuelLevel=72.0)
+        # fuel_per_lap = 28.5 * (92.5 / 3600) ≈ 0.73 L/lap
+        # laps_remaining = 72.0 / 0.73 ≈ 98.3
+        assert state.fuel_laps_remaining > 0
 
         # Simulate a completed lap by adding history manually
         state.player.lap_history.append(
@@ -308,7 +312,7 @@ class TestRaceState:
                 fuel_at_end=102.4,
             )
         )
-        # Now fuel_laps_remaining should be calculated
+        # Now fuel_laps_remaining should use actual lap history
         laps = state.fuel_laps_remaining
         assert laps > 0
 

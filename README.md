@@ -4,8 +4,8 @@ Real-time iRacing data collection with on-demand LLM race engineering. Collects 
 
 ## What It Does
 
-- **Collects** real-time telemetry from iRacing at ~30Hz via pyirsdk (327 telemetry variables + YAML session info)
-- **Maintains** an in-memory race state model — positions, gaps, fuel, tyres, lap trends, weather, damage, push-to-pass
+- **Collects** real-time telemetry from iRacing at ~30Hz via pyirsdk (323+ telemetry variables + YAML session info)
+- **Maintains** an in-memory race state model — positions, gaps, fuel, tyres, lap trends, weather, engine health, damage, push-to-pass
 - **Condenses** that state into a ~1-2KB context prompt, filtered by configurable depth (minimal / medium / full)
 - **Sends** the prompt to any OpenAI-compatible LLM endpoint when you press a button
 - **Parses** optional `[ACTION]` directives in the LLM response (pit this lap, add fuel, change tyres) — logged in dry-run mode, executable when enabled
@@ -97,34 +97,40 @@ The amount of race data sent to the LLM is controlled by `context_depth` in `con
 | Depth | Includes | Approx. Size |
 |-------|----------|-------------|
 | `minimal` | Position, fuel, laps remaining | ~100 bytes |
-| `medium` | + gaps, tyre temps, flags | ~200 bytes |
-| `full` | + lap trends, nearby cars, pit status, weather, damage, push-to-pass | ~800 bytes |
+| `medium` | + gaps, tyre temps, flags, engine warnings, track conditions | ~250 bytes |
+| `full` | + engine health, tyre life & odometers, damage, proximity, session config, lap trends, nearby cars, pit status, weather, shift lights | ~1-2 KB |
 
 ### Example: Full Context
 
 ```
-Race: Circuit de Spa-Franchamps Grand Prix, Lap 10/60, P4 (Class P2)
+Driver: Mayhem. Race: Silverstone Circuit Arena Grand Prix, Lap 4/32771, P16 (Class P16)
 Flags: Green
-Track: 27°C, Air: 22°C
+Track: 5.8km | 18 turns | pit limit 60.0kph
+Session: FIXED SETUP | incidents: unlimited | fast repairs: unlimited | tank: 22L
+Weather: Track 40.6°C | Air 18.3°C | track Damp | wind 0.89m/s
+Engine: Oil 69.6°C | OilP 3.40bar | Water 70.5°C | 13.80V | Manifold 0.99bar
 
 Your car:
-  Position: P4 (Class P2)
-  Fuel: 72.0L (65%), ~18.9 laps remaining
-  Fuel burn rate: 28.5 L/hr
-  LF: 97°C | 26.5 PSI | wear 10.0%
-  RF: 99°C | 26.3 PSI | wear 9.0%
-  LR: 105°C | 24.8 PSI | wear 14.0%
-  RR: 107°C | 24.5 PSI | wear 15.0%
-  Incidents: 0 (team: 2)
-  Push-to-pass: 3 remaining
-  Last 5 laps: 1:33.400, 1:33.550, 1:33.700, 1:33.850, 1:34.000 (fuel: 3.8L each)
-  Trend: slowing 0.15s/lap
+  Position: P16 (Class P16)
+  Fuel: 11.66L (53%), ~22.0 laps remaining
+  Tank capacity: 22.0L (53% full)
+  Fuel burn rate: 34.38 L/hr
+  Tyres:
+    LF: 79.9°C | 124.11PSI | life 98.4% | 18800km
+    RF: 73.8°C | 124.11PSI | life 98.5% | 18700km
+    LR: 81.7°C | 124.11PSI | life 98.5% | 18800km
+    RR: 76.6°C | 124.11PSI | life 98.4% | 18800km
+  Brake bias: 56.00%
+  Damage: incidents 16x (team 16x)
+  Shift: shift at 6000rpm | 40% throttle
+  Proximity: car LEFT | +15.57s ahead | -7.86s behind
 
-Pit: Pits open | Fast repair available | Tire sets available: 3
+Pit: Pits open | Fast repair available | Tire sets available: 1
 
 Nearby:
-  P3 (Smith): -0.020s, last lap 1:32.400, P2P available
-  P2 (Dave): 0.000s, last lap 1:32.100
+  P15 (Car #5): -6.223s, last lap 2:28.872
+  P17 (Car #3): -0.001s, last lap 2:28.872
+  P14 (Car #12): +0.003s, last lap 2:28.339
 ```
 
 ## Team Detection
@@ -191,21 +197,24 @@ Available actions (mapped to pyirsdk `PitCommandMode`):
 
 ## iRacing SDK Data
 
-The script captures all 327 telemetry variables from iRacing shared memory. Key categories:
+The client captures 323+ telemetry variables from iRacing shared memory plus session info (YAML). Key categories sent to the LLM:
 
 | Category | Example Variables | Use for LLM |
 |----------|-------------------|-------------|
-| Car state | Speed, Gear, RPM, Throttle, Brake | Driving style analysis |
-| Fuel | FuelLevel, FuelLevelPct, FuelUsePerHour | Pit strategy |
-| Tyres | LF/RF/LR/RR temps, pressures, wear (per zone) | Degradation model |
-| Brakes | Brake line pressure per corner, ABS | Brake management |
-| Position | CarIdxPosition, CarDistAhead/Behind | Gap analysis |
-| Laps | Lap times, deltas, best laps | Trend analysis |
-| Weather | TrackTemp, TrackWetness, AirTemp, Precipitation | Weather strategy |
-| Pit | PitsOpen, PitstopActive, FastRepairAvailable | Pit window |
+| Car state | Speed, Gear, RPM, Throttle, Brake, IsOnTrack | Driving style, car status |
+| Engine health | OilTemp, OilPress, WaterTemp, EngineWarnings, Voltage, ManifoldPress | Engine health monitoring |
+| Fuel | FuelLevel, FuelLevelPct, FuelUsePerHour, tank capacity | Pit strategy |
+| Tyres | Per-corner temps (3 zones), pressures, life %, odometers | Degradation model |
+| Brakes | Brake line pressure per corner, brake bias, ABS | Brake management |
+| Damage | Incident counts, weight penalty, fast repairs, repair time needed | Impact assessment |
+| Position & proximity | CarIdxPosition, CarDistAhead/Behind, CarLeftRight, tow time | Gap analysis |
+| Laps | Lap times, deltas, best laps, trend | Pace analysis |
+| Weather | TrackTemp, TrackWetness (Dry/Damp/Wet/VeryWet), AirTemp, WindVel | Weather strategy |
+| Session config | Fixed setup, incident limit, tank capacity, shift RPMs, pit speed limit | Rules awareness |
+| Pit | PitsOpen, PitstopActive, FastRepairAvailable, tyre sets | Pit window |
 | Push-to-pass | P2P_Status, P2P_Count | Overtake opportunities |
-| Damage | Incident counts, weight penalty | Impact assessment |
-| Session | Flags, laps remaining, time remaining | Race state |
+| Shift | ShiftIndicatorPct, PlayerCarSLShiftRPM | Shift lights |
+| G-forces | LatAccel, LongAccel, VertAccel | Driving analysis |
 
 ## Configuration
 
@@ -320,15 +329,50 @@ python main.py --replay tests/sample_data/session_2026-06-08_13-38-41
 # Replay once and stop
 python main.py --replay tests/sample_data/session_2026-06-08_13-38-41 --no-loop
 
-# Timed replay — feed one snapshot every 10 seconds (state evolves like a real race)
-python main.py --replay tests/sample_data/session_2026-06-08_13-38-41 --replay-speed 10
+# Timed replay — feed one snapshot every N seconds (state evolves like a real race)
+# Use floats for sub-second intervals:
+python main.py --replay tests/sample_data/session_2026-06-08_13-38-41 --replay-speed 0.1   # ~3 min for 1920 snapshots
+python main.py --replay tests/sample_data/session_2026-06-08_13-38-41 --replay-speed 1     # ~32 min (roughly real-time at 1Hz)
+python main.py --replay tests/sample_data/session_2026-06-08_13-38-41 --replay-speed 10    # slow: one snapshot every 10s
 ```
 
-Enters interactive mode where you can type questions and press Enter. Press Enter with no input for a general strategy query (same as pressing F9 in live mode). Type `state` to see current race state, `next` to advance to the next snapshot immediately, `quit` to exit.
+Enters interactive mode where you can type questions and press Enter. The prompt shows live race state:
 
-With `--replay-speed N`, snapshots are fed automatically every N seconds in the background. The race state evolves over time so you can ask the LLM questions at different points in the stint. Without it (or `--replay-speed 0`), all snapshots are loaded instantly and you interact with the final state.
+```
+🏎️ [Lap 4 P16 53%⛽ 500/1920] > Should I pit?
+```
+
+Interactive commands:
+- Type a question and press Enter to query the race engineer
+- Press Enter with no input for a general strategy query
+- `state` — show current race state summary
+- `depth minimal/medium/full` — change context depth
+- `next` — advance to the next snapshot immediately
+- `quit` or Ctrl+C — exit
+
+With `--replay-speed > 0`, snapshots feed automatically in the background and the prompt updates with live Lap, Position, Fuel, and snapshot progress. Milestone progress is printed every ~20% of total snapshots. Without it (or `--replay-speed 0`), all snapshots are loaded instantly and you interact with the final state.
 
 Works over SSH — no GUI or physical keyboard needed.
+
+### LLM Response Evaluation
+
+Batch-test the race engineer by replaying a session and asking 50 questions at even intervals:
+
+```bash
+# Run 50 questions against the Silverstone race data
+python tests/eval_llm_responses.py --count 50 --output logs/llm_eval.md
+
+# Fewer questions, different context depth
+python tests/eval_llm_responses.py --count 10 --depth medium --output logs/eval_medium.md
+```
+
+This picks evenly-spaced snapshots from the race, asks a rotating set of race engineering questions (fuel, tyres, strategy, engine health, etc.), and logs the full prompt + response to a markdown file. Each entry has an expandable `<details>` section showing exactly what context was sent to the LLM.
+
+Options:
+- `--count N` — number of questions to ask (default 50)
+- `--depth minimal/medium/full` — context depth (default: full)
+- `--output PATH` — output markdown file (default: `logs/llm_eval.md`)
+- `--session PATH` — session data directory (default: the Silverstone session)
 
 ### Capture Live Data
 
@@ -352,13 +396,14 @@ Same as `--capture` but always saves to the `tests/sample_data/` folder (from co
 
 | Module | Purpose |
 |--------|---------|
-| `main.py` | Entry point — CLI args, poll loop, keyboard trigger |
+| `main.py` | Entry point — CLI args, poll loop, keyboard trigger, interactive replay |
 | `iracing_client.py` | pyirsdk wrapper — telemetry, session info, pit commands |
-| `race_state.py` | In-memory model — positions, gaps, fuel, tyres, lap trends |
-| `context_builder.py` | Condenses state → LLM prompt (3 depth levels) |
+| `race_state.py` | In-memory model — positions, gaps, fuel, tyres, engine health, lap trends |
+| `context_builder.py` | Condenses state → LLM prompt (3 depth levels, format helpers) |
 | `llm_client.py` | OpenAI-compatible API caller (works with any `/v1` endpoint) |
 | `action_executor.py` | Parses `[ACTION]` directives from LLM responses |
 | `capture.py` | Record/replay telemetry JSON for testing |
+| `tests/eval_llm_responses.py` | Batch LLM evaluation — asks 50 questions against replay data, logs results |
 
 ## Roadmap
 

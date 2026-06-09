@@ -40,10 +40,14 @@ def format_pct(value: float) -> str:
 
 
 def format_wear(wear: float) -> str:
-    """Format tyre wear (0-1) as a percentage."""
+    """Format tyre life remaining (0-1) as a percentage.
+
+    iRacing reports wear as 1.0=new, 0.0=worn out, so higher = more life left.
+    The label 'life' makes this unambiguous to the LLM.
+    """
     if wear <= 0:
         return "N/A"
-    return f"{wear * 100:.1f}%"
+    return f"life {wear * 100:.1f}%"
 
 
 def format_metric(value: float, unit: str = "", decimals: int = 2) -> str:
@@ -91,6 +95,10 @@ def format_car_proximity(car_left_right: int) -> str:
     if car_left_right & 2:
         parts.append("car RIGHT")
     return " | ".join(parts)
+
+
+# iRacing TrackWetness scale (integer, not percentage)
+TRACK_WETNESS_LABELS = {0: "Dry", 1: "Damp", 2: "Wet", 3: "Very Wet"}
 
 
 class ContextBuilder:
@@ -219,7 +227,12 @@ class ContextBuilder:
             track_temp = weather.get("track_temp", 0)
             air_temp = weather.get("air_temp", 0)
             wetness = weather.get("track_wetness", 0)
-            wet_str = ", WET" if wetness > 0 else ""
+            wet_str = ""
+            if wetness > 0:
+                wet_label = TRACK_WETNESS_LABELS.get(
+                    int(wetness), f"level {int(wetness)}"
+                )
+                wet_str = f", {wet_label}"
             if track_temp > 0 or air_temp > 0:
                 lines.append(
                     f"Track: {format_temp(track_temp)}, Air: {format_temp(air_temp)}{wet_str}"
@@ -334,13 +347,16 @@ class ContextBuilder:
             if air_temp > 0:
                 weather_parts.append(f"Air {format_temp(air_temp)}")
             if wetness > 0:
-                weather_parts.append(f"wetness {wetness:.0%}")
+                wet_label = TRACK_WETNESS_LABELS.get(
+                    int(wetness), f"level {int(wetness)}"
+                )
+                weather_parts.append(f"track {wet_label}")
             if declared_wet:
                 weather_parts.append("DECLARED WET")
             if precipitation > 0:
                 weather_parts.append(f"rain {precipitation:.0%}")
             if wind_vel > 0.5:
-                weather_parts.append(f"wind {wind_vel:.1f}m/s")
+                weather_parts.append(f"wind {wind_vel:.2f}m/s")
             if weather_parts:
                 lines.append(f"Weather: {' | '.join(weather_parts)}")
 
@@ -388,9 +404,14 @@ class ContextBuilder:
             lines.append(f"  Status: {' | '.join(status_parts)}")
 
         lines.append(f"  Position: P{pos} (Class P{class_pos})")
-        lines.append(
-            f"  Fuel: {fuel_level:.2f}L ({format_pct(fuel_pct)}), ~{fuel_laps:.2f} laps remaining"
-        )
+        # Fuel display — avoid showing "0 laps remaining" when we have fuel
+        # (happens early race before lap history is established)
+        if fuel_laps > 0:
+            lines.append(
+                f"  Fuel: {fuel_level:.2f}L ({format_pct(fuel_pct)}), ~{fuel_laps:.1f} laps remaining"
+            )
+        else:
+            lines.append(f"  Fuel: {fuel_level:.2f}L ({format_pct(fuel_pct)})")
         if fuel_max and fuel_level > 0:
             lines.append(
                 f"  Tank capacity: {fuel_max:.1f}L ({fuel_level / fuel_max * 100:.0f}% full)"
@@ -415,7 +436,7 @@ class ContextBuilder:
                 if pressure > 0:
                     parts.append(f"{pressure:.2f}PSI")
                 if wear_center > 0:
-                    parts.append(f"wear {format_wear(wear_center)}")
+                    parts.append(f"{format_wear(wear_center)}")
                 if odo > 0:
                     parts.append(f"{odo:.0f}km")
                 lines.append(f"    {corner}: {' | '.join(parts)}")

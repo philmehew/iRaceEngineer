@@ -1,0 +1,256 @@
+"""
+LLM Response Evaluation — replay race snapshots and ask questions to log
+the race engineer's responses for manual review.
+
+Usage:
+    python tests/eval_llm_responses.py [--count 50] [--output logs/eval.md]
+
+Replays the Silverstone race data, picks snapshots at even intervals,
+and asks a variety of race-engineering questions at each point.
+Outputs a markdown file with prompt + response for review.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+# Fix Windows console encoding for emoji/special characters
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from race_state import RaceState
+from context_builder import ContextBuilder
+from llm_client import LLMClient
+
+# --- Questions to cycle through, designed to test different data areas ---
+
+QUESTIONS = [
+    # General strategy
+    "What's my strategy for the next stint?",
+    "How are we looking?",
+    "Give me a status update.",
+    # Fuel
+    "Should I pit for fuel?",
+    "How much fuel do I need to finish?",
+    "Can I make it to the end on this fuel?",
+    # Tyres
+    "How are the tyres doing?",
+    "Should I change tyres this stop?",
+    "Are the tyres still ok?",
+    # Damage / incidents
+    "How much damage do I have?",
+    "I had an incident, what should I do?",
+    "Do I need a fast repair?",
+    # Engine health
+    "How's the engine?",
+    "Is the oil temp ok?",
+    "Should I be worried about engine temps?",
+    # Pit strategy
+    "When should I pit?",
+    "What's my pit window?",
+    "How many laps until I need to pit?",
+    # Track / weather
+    "What are the track conditions?",
+    "Is it going to rain?",
+    # Position / gaps
+    "Where am I relative to the cars around me?",
+    "Can I catch the car ahead?",
+    "Am I safe from the car behind?",
+    # Push-to-pass
+    "Should I use push-to-pass?",
+    # Brake / setup
+    "What's my brake bias?",
+    # Combined scenarios
+    "I'm struggling with grip, what should I do?",
+    "The car feels off, what would you check?",
+    "What's the gap to the car ahead?",
+    "",
+    "Should I box this lap?",
+    "How many laps of fuel left?",
+    "What's my race engineer telling me?",
+    "Tyre pressures ok?",
+    "Any warnings I should know about?",
+    "Are we on strategy?",
+    "What's the plan for the next 10 laps?",
+    "How's my pace compared to the leaders?",
+]
+
+
+def load_snapshots(session_dir: str, count: int):
+    """Load evenly-spaced snapshots from a session directory."""
+    all_files = sorted(
+        f
+        for f in os.listdir(session_dir)
+        if f.startswith("snapshot_") and f.endswith(".json")
+    )
+    total = len(all_files)
+    if total == 0:
+        raise ValueError(f"No snapshots found in {session_dir}")
+
+    # Pick evenly-spaced indices
+    if count >= total:
+        indices = list(range(total))
+    else:
+        indices = [int(i * (total - 1) / (count - 1)) for i in range(count)]
+
+    snapshots = []
+    for idx in indices:
+        filepath = os.path.join(session_dir, all_files[idx])
+        with open(filepath) as f:
+            data = json.load(f)
+        snapshots.append((idx + 1, data))  # snapshot_num is 1-based
+
+    return snapshots
+
+
+def run_eval(session_dir: str, count: int, output_file: str, config: dict):
+    """Run the evaluation: load snapshots, ask questions, log responses."""
+    llm = LLMClient(config)
+    context_builder = ContextBuilder(config)
+
+    snapshots = load_snapshots(session_dir, count)
+    print(f"Loaded {len(snapshots)} snapshots from {session_dir}")
+
+    results = []
+    question_idx = 0
+
+    for i, (snap_num, data) in enumerate(snapshots):
+        # Build race state
+        state = RaceState(config)
+        # Feed all snapshots up to this point for best state
+        # (but for speed, just use the single snapshot)
+        telemetry = data.get("telemetry", {})
+        session_info = data.get("session_info", {})
+        driver_names = data.get("driver_names", {})
+        if driver_names:
+            driver_names = {int(k): v for k, v in driver_names.items()}
+        state.update(telemetry, session_info, driver_names)
+        snapshot = state.get_snapshot()
+
+        # Pick question (cycle through)
+        question = QUESTIONS[question_idx % len(QUESTIONS)]
+        question_idx += 1
+
+        # Build prompt
+        messages = context_builder.build_prompt(snapshot, question=question)
+
+        # Call LLM
+        try:
+            response = llm.ask(messages)
+        except Exception as e:
+            response = f"[ERROR: {e}]"
+
+        # Extract context sent
+        context = messages[1]["content"]
+
+        # Summary line for the state
+        player = snapshot.get("player", {})
+        session = snapshot.get("session", {})
+        summary = (
+            f"Lap {player.get('lap', '?')} | "
+            f"P{player.get('position', '?')} | "
+            f"Fuel {player.get('fuel_pct', 0) * 100:.0f}% | "
+            f"Flags: {', '.join(session.get('flags', ['Green']))}"
+        )
+
+        results.append(
+            {
+                "snapshot": snap_num,
+                "question": question or "(general strategy)",
+                "context": context,
+                "response": response or "(empty)",
+                "state_summary": summary,
+            }
+        )
+
+        print(f"  [{i + 1}/{len(snapshots)}] Snap {snap_num}: {summary}")
+        print(f"    Q: {question or '(general strategy)'}")
+        print(f"    A: {(response or '(empty)')[:120]}...")
+        print()
+
+    # Write markdown report
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write("# LLM Response Evaluation\n\n")
+        f.write(f"Session: `{session_dir}`\n")
+        f.write(f"Model: `{config.get('llm', {}).get('model', 'unknown')}`\n")
+        f.write(
+            f"Context depth: `{config.get('prompt', {}).get('context_depth', 'full')}`\n"
+        )
+        f.write(f"Questions: {len(results)}\n\n")
+        f.write("---\n\n")
+
+        for r in results:
+            f.write(f"## Snapshot {r['snapshot']} — {r['state_summary']}\n\n")
+            q_display = r["question"] if r["question"] else "*(general strategy)*"
+            f.write(f"**Q:** {q_display}\n\n")
+            f.write("<details>\n<summary>Context sent to LLM</summary>\n\n")
+            f.write(f"```\n{r['context']}\n```\n\n")
+            f.write("</details>\n\n")
+            f.write(f"**A:** {r['response']}\n\n")
+            f.write("---\n\n")
+
+    print(f"\n✅ Evaluation complete. Results written to {output_file}")
+    print(f"   {len(results)} questions asked.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Evaluate LLM responses against race data"
+    )
+    parser.add_argument(
+        "--session",
+        default="tests/sample_data/session_2026-06-08_20-47-17",
+        help="Path to session data directory",
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=50,
+        help="Number of snapshots to evaluate (default: 50)",
+    )
+    parser.add_argument(
+        "--output",
+        default="logs/llm_eval.md",
+        help="Output markdown file (default: logs/llm_eval.md)",
+    )
+    parser.add_argument(
+        "--depth",
+        default="full",
+        choices=["minimal", "medium", "full"],
+        help="Context depth (default: full)",
+    )
+    args = parser.parse_args()
+
+    # Load config
+    import yaml
+
+    config_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml"
+    )
+    with open(config_path) as f:
+        config = yaml.safe_load(f) or {}
+
+    # Override context depth
+    config.setdefault("prompt", {})["context_depth"] = args.depth
+
+    print("=" * 60)
+    print("🏁 LLM Response Evaluation")
+    print("=" * 60)
+    print(f"Session: {args.session}")
+    print(f"Questions: {args.count}")
+    print(f"Output: {args.output}")
+    print(f"Depth: {args.depth}")
+    print(f"Model: {config.get('llm', {}).get('model', 'unknown')}")
+    print()
+
+    run_eval(args.session, args.count, args.output, config)
+
+
+if __name__ == "__main__":
+    main()
