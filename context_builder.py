@@ -120,21 +120,18 @@ class ContextBuilder:
 
     def _default_system_prompt(self) -> str:
         return (
-            "You are a race engineer talking to your driver over radio. "
-            "Speak in short, clear sentences like a real race engineer — "
-            "the driver is in a race and needs fast, spoken-style answers. "
-            "No markdown, no bullet points, no bold, no headers. "
-            "Just plain sentences, like you're on the radio. "
-            "Example: 'Box this lap. Tyres are gone. Add 60 litres.' "
-            "If you're unsure, say so. Never invent data not provided. "
-            "The 'Your car' section is the driver you are talking to.\n\n"
-            "You may optionally include action directives in your response using the "
-            "format [ACTION] action_name[: parameter]. These will be executed (when "
-            "enabled) or logged (in dry-run mode). Available actions:\n"
-            "- [ACTION] pit_this_lap\n"
-            "- [ACTION] add_fuel: <litres>\n"
-            "- [ACTION] change_tyres\n"
-            "- [ACTION] clear_penalty"
+            "You are a race engineer. Speak in short radio-style sentences. No markdown, bullets, or headers.\n"
+            "Example: 'Box this lap. Tyres are gone. Add 60 litres.'\n"
+            "If unsure, say so. Never invent data. The 'Your car' section is the driver you're talking to.\n\n"
+            "Rules:\n"
+            "- Only respond when asked. Don't promise to monitor or call pit later.\n"
+            "- Don't suggest setup changes (pressures, brake bias) without known reference ranges.\n"
+            "- Don't assess temps as high/low without knowing the car's normal range — just report values.\n"
+            "- Don't name track corners unless that data is in the context.\n"
+            "- 'Incidents' are safety points (0x per off-track), NOT car damage.\n"
+            "- If tyre data is marked FROZEN, it hasn't changed since pit exit — don't comment on degradation.\n"
+            "- [ACTION] add_fuel amounts: whole litres, min 1L, max = tank capacity - current fuel.\n\n"
+            "Optional actions: [ACTION] pit_this_lap | add_fuel: <litres> | change_tyres | clear_penalty"
         )
 
     def build_prompt(self, state: dict, question: str = "") -> list[dict]:
@@ -178,16 +175,44 @@ class ContextBuilder:
         track = session.get("track_name", "Unknown")
         laps_remain = session.get("laps_remain", "?")
         race_laps = session.get("race_laps", "?")
+        estimated_total = state.get("estimated_total_laps")
+        LAPS_REMAIN_SENTINEL = 32767
+        is_time_race = (
+            isinstance(laps_remain, int) and laps_remain >= LAPS_REMAIN_SENTINEL
+        )
+
+        if is_time_race and estimated_total:
+            total_laps_str = f"~{estimated_total}"
+        elif (
+            isinstance(race_laps, int)
+            and isinstance(laps_remain, int)
+            and laps_remain < LAPS_REMAIN_SENTINEL
+        ):
+            total_laps_str = str(race_laps + laps_remain)
+        else:
+            total_laps_str = "?"
+
         pos = player.get("position", "?")
 
         lines.append(
-            f"Driver: {driver_name}. Race: {track}, P{pos}, Lap {race_laps}/{race_laps + laps_remain if isinstance(laps_remain, int) and isinstance(race_laps, int) else '?'}"
+            f"Driver: {driver_name}. Race: {track}, P{pos}, Lap {race_laps}/{total_laps_str}"
         )
 
-        # Fuel
+        # Fuel with quality indicator
         fuel_laps = player.get("fuel_laps_remaining", 0)
         fuel_pct = player.get("fuel_pct", 0)
-        lines.append(f"Fuel: {format_pct(fuel_pct)} (~{fuel_laps:.2f} laps remaining)")
+        fuel_est_quality = player.get("fuel_est_quality", "unreliable")
+        quality_tag = ""
+        if fuel_laps > 0:
+            if fuel_est_quality == "unreliable":
+                quality_tag = " (rough estimate)"
+            elif fuel_est_quality == "rough":
+                quality_tag = " (approx)"
+            lines.append(
+                f"Fuel: {format_pct(fuel_pct)} (~{fuel_laps:.1f} laps{quality_tag})"
+            )
+        else:
+            lines.append(f"Fuel: {format_pct(fuel_pct)}")
         lines.append(f"Laps remaining: {laps_remain}")
 
         return "\n".join(lines)
@@ -207,17 +232,29 @@ class ContextBuilder:
         track_str = f"{track} {config}".strip() if config else track
         laps_remain = session.get("laps_remain", "?")
         race_laps = session.get("race_laps", "?")
-        total_laps = (
-            race_laps + laps_remain
-            if isinstance(race_laps, int) and isinstance(laps_remain, int)
-            else "?"
+        estimated_total = state.get("estimated_total_laps")
+        LAPS_REMAIN_SENTINEL = 32767
+        is_time_race = (
+            isinstance(laps_remain, int) and laps_remain >= LAPS_REMAIN_SENTINEL
         )
+
+        if is_time_race and estimated_total:
+            total_laps_str = f"~{estimated_total}"
+        elif (
+            isinstance(race_laps, int)
+            and isinstance(laps_remain, int)
+            and laps_remain < LAPS_REMAIN_SENTINEL
+        ):
+            total_laps_str = str(race_laps + laps_remain)
+        else:
+            total_laps_str = "?"
+
         pos = player.get("position", "?")
         class_pos = player.get("class_position", "?")
         flags = session.get("flags", ["Green"])
 
         lines.append(
-            f"Driver: {driver_name}. Race: {track_str}, Lap {race_laps}/{total_laps}, P{pos} (Class P{class_pos})"
+            f"Driver: {driver_name}. Race: {track_str}, Lap {race_laps}/{total_laps_str}, P{pos} (Class P{class_pos})"
         )
         lines.append(f"Flags: {', '.join(flags)}")
 
@@ -283,20 +320,31 @@ class ContextBuilder:
         track = session.get("track_name", "Unknown")
         config_name = session.get("track_config", "")
         track_str = f"{track} {config_name}".strip() if config_name else track
-        laps_remain = session.get("laps_remain", "?")
+        laps_remain_raw = session.get("laps_remain", "?")
         race_laps = session.get("race_laps", "?")
-        total_laps = (
-            race_laps + laps_remain
-            if isinstance(race_laps, int) and isinstance(laps_remain, int)
-            else "?"
+        estimated_total = state.get("estimated_total_laps")
+        LAPS_REMAIN_SENTINEL = 32767  # iRacing sentinel for unlimited/time-based
+        is_time_race = (
+            isinstance(laps_remain_raw, int) and laps_remain_raw >= LAPS_REMAIN_SENTINEL
         )
+
+        # Determine total laps display
+        if is_time_race and estimated_total:
+            total_laps_str = f"~{estimated_total}"
+        elif is_time_race:
+            total_laps_str = "?"
+        elif isinstance(race_laps, int) and isinstance(laps_remain_raw, int):
+            total_laps_str = str(race_laps + laps_remain_raw)
+        else:
+            total_laps_str = "?"
+
         pos = player.get("position", "?")
         class_pos = player.get("class_position", "?")
         flags = session.get("flags", ["Green"])
         driver_name = player.get("driver_name", "Driver")
 
         lines.append(
-            f"Driver: {driver_name}. Race: {track_str}, Lap {race_laps}/{total_laps}, P{pos} (Class P{class_pos})"
+            f"Driver: {driver_name}. Race: {track_str}, Lap {race_laps}/{total_laps_str}, P{pos} (Class P{class_pos})"
         )
         lines.append(f"Flags: {', '.join(flags)}")
 
@@ -391,6 +439,8 @@ class ContextBuilder:
         fuel_pct = player.get("fuel_pct", 0)
         fuel_level = player.get("fuel_level", 0)
         fuel_rate = player.get("fuel_use_per_hour", 0)
+        fuel_est_quality = player.get("fuel_est_quality", "unreliable")
+        avg_fuel_per_lap = player.get("avg_fuel_per_lap", 0)
 
         lines.append("\nYour car:")
         on_track = player.get("is_on_track", True)
@@ -404,26 +454,74 @@ class ContextBuilder:
             lines.append(f"  Status: {' | '.join(status_parts)}")
 
         lines.append(f"  Position: P{pos} (Class P{class_pos})")
-        # Fuel display — avoid showing "0 laps remaining" when we have fuel
-        # (happens early race before lap history is established)
-        if fuel_laps > 0:
-            lines.append(
-                f"  Fuel: {fuel_level:.2f}L ({format_pct(fuel_pct)}), ~{fuel_laps:.1f} laps remaining"
-            )
-        else:
-            lines.append(f"  Fuel: {fuel_level:.2f}L ({format_pct(fuel_pct)})")
-        if fuel_max and fuel_level > 0:
-            lines.append(
-                f"  Tank capacity: {fuel_max:.1f}L ({fuel_level / fuel_max * 100:.0f}% full)"
-            )
-        if fuel_rate > 0:
-            lines.append(f"  Fuel burn rate: {fuel_rate:.2f} L/hr")
 
-        # Tyres
+        # Fuel display with qualitative descriptor and tank capacity
+        # Descriptor bands: critical (<10%), low (10-20%), half (20-50%), adequate (50-80%), full (>80%)
+        if fuel_pct >= 0.8:
+            fuel_desc = "full"
+        elif fuel_pct >= 0.5:
+            fuel_desc = "adequate"
+        elif fuel_pct >= 0.2:
+            fuel_desc = "half"
+        elif fuel_pct >= 0.1:
+            fuel_desc = "low"
+        else:
+            fuel_desc = "⚠ CRITICAL"
+
+        fuel_line = f"  Fuel: {fuel_level:.2f}L"
+        if fuel_max and fuel_level > 0:
+            fuel_line += f"/{fuel_max:.0f}L"
+        fuel_line += f" ({format_pct(fuel_pct)}, {fuel_desc})"
+
+        # Laps remaining — show quality indicator
+        if fuel_laps > 0:
+            quality_tag = ""
+            if fuel_est_quality == "unreliable":
+                quality_tag = " (rough estimate)"
+            elif fuel_est_quality == "rough":
+                quality_tag = " (approx)"
+            fuel_line += f" — ~{fuel_laps:.1f} laps{quality_tag}"
+        elif fuel_pct > 0 and fuel_est_quality == "unreliable":
+            fuel_line += " — laps remaining: N/A (no lap history yet)"
+
+        # Fuel urgency warning
+        if 0 < fuel_pct < 0.2 and fuel_laps > 0:
+            fuel_line += " ⚠ FUEL WARNING"
+
+        lines.append(fuel_line)
+
+        # Per-lap burn rate (from lap history) — much more reliable than instantaneous
+        if avg_fuel_per_lap > 0:
+            lines.append(
+                f"  Fuel burn: ~{avg_fuel_per_lap:.2f} L/lap (avg over recent laps)"
+            )
+        elif fuel_rate > 0:
+            lines.append(
+                f"  Fuel burn rate: {fuel_rate:.2f} L/hr (instantaneous, unreliable)"
+            )
+
+        # Race laps remaining (estimated for time-based races)
+        if is_time_race and estimated_total and isinstance(race_laps, int):
+            race_laps_remain = max(0, estimated_total - race_laps)
+            lines.append(
+                f"  Race laps remaining: ~{race_laps_remain} (estimated from session time)"
+            )
+
+        # Tyres — show staleness indicator
+        # iRacing freezes tyre data on track for most cars — only updates in pits.
+        # Always show staleness so the LLM knows whether to trust the values.
         tyres = player.get("tyres", {})
         tyre_odometers = player.get("tyre_odometers", {})
+        tyre_staleness = player.get("tyre_staleness", "unknown")
         if tyres:
-            lines.append("  Tyres:")
+            if tyre_staleness == "stale":
+                lines.append(
+                    "  Tyres: ⚠ FROZEN — on track, data unchanged since pit exit"
+                )
+            elif tyre_staleness == "live":
+                lines.append("  Tyres: (live data — values updating)")
+            else:
+                lines.append("  Tyres: (status unknown — may be frozen on track)")
             for corner in ["LF", "RF", "LR", "RR"]:
                 ts = tyres.get(corner, {})
                 if not ts:
@@ -454,7 +552,7 @@ class ContextBuilder:
         if brake_bias:
             lines.append(f"  Brake bias: {brake_bias:.2f}%")
 
-        # Damage / incidents / penalties
+        # Incidents (safety-rating points, NOT car damage) / penalties
         incidents = player.get("incidents", 0)
         team_incidents = player.get("team_incidents", 0)
         weight_penalty = player.get("weight_penalty", 0)
@@ -462,9 +560,10 @@ class ContextBuilder:
         repair_time = player.get("pit_repair_time_left", 0)
         opt_repair_time = player.get("pit_opt_repair_time_left", 0)
 
-        damage_parts = []
+        incident_parts = []
         if incidents > 0 or team_incidents > 0:
-            damage_parts.append(f"incidents {incidents}x (team {team_incidents}x)")
+            incident_parts.append(f"incidents {incidents}x (team {team_incidents}x)")
+        damage_parts = []
         if weight_penalty > 0:
             damage_parts.append(f"+{weight_penalty:.2f}kg damage weight")
         if fast_repairs_used > 0:
@@ -473,6 +572,8 @@ class ContextBuilder:
             damage_parts.append(f"{repair_time:.0f}s repair time needed")
         if opt_repair_time > 0:
             damage_parts.append(f"{opt_repair_time:.0f}s opt repair time")
+        if incident_parts:
+            lines.append(f"  Incidents: {' | '.join(incident_parts)}")
         if damage_parts:
             lines.append(f"  Damage: {' | '.join(damage_parts)}")
 
@@ -495,19 +596,20 @@ class ContextBuilder:
                 shift_str.append(f"{shift_pct:.0%} throttle")
             lines.append(f"  Shift: {' | '.join(shift_str)}")
 
-        # Proximity
+        # Proximity — filter out iRacing sentinel values (e.g. 500000.0 = no car nearby)
         car_prox = player.get("car_left_right", 0)
         dist_ahead = player.get("car_dist_ahead", 0)
         dist_behind = player.get("car_dist_behind", 0)
         tow_time = player.get("tow_time", 0)
+        PROXIMITY_SENTINEL = 1000.0  # Values above this mean "no car nearby"
         prox_parts = []
         if car_prox:
             prox_str = format_car_proximity(car_prox)
             if prox_str:
                 prox_parts.append(prox_str)
-        if dist_ahead > 0:
+        if 0 < dist_ahead < PROXIMITY_SENTINEL:
             prox_parts.append(f"+{dist_ahead:.2f}s ahead")
-        if dist_behind > 0:
+        if 0 < dist_behind < PROXIMITY_SENTINEL:
             prox_parts.append(f"-{dist_behind:.2f}s behind")
         if tow_time > 0:
             prox_parts.append(f"tow {tow_time:.2f}s")
@@ -550,6 +652,16 @@ class ContextBuilder:
 
         # === Nearby cars ===
         nearby = state.get("nearby_cars", [])
+        # Driver name aliases come from config (parsed from teammates list)
+        # and from the race state (populated by iracing_client.detect_team_indices)
+        driver_aliases = self.config.get("driver_aliases", {})
+        # Also merge any aliases passed in the state (from RaceState.set_team_indices)
+        state_aliases = state.get("driver_aliases", {})
+        if state_aliases:
+            merged_aliases = dict(driver_aliases)
+            merged_aliases.update(state_aliases)
+            driver_aliases = merged_aliases
+
         if nearby:
             lines.append("\nNearby:")
             for car in nearby[: self.include_nearby_cars]:
@@ -560,7 +672,18 @@ class ContextBuilder:
                 p2p = "P2P available" if car.get("p2p_available") else ""
                 on_pit = " (in pits)" if car.get("on_pit_road") else ""
 
-                car_str = f"  P{pos} ({name}): {format_gap(gap)}"
+                # Resolve display name: show "Nickname / Real Name" when alias exists
+                display_name = name
+                if name in driver_aliases and driver_aliases[name] != name:
+                    display_name = f"{name} / {driver_aliases[name]}"
+                elif (
+                    car.get("is_teammate")
+                    and car.get("real_name")
+                    and car["real_name"] != name
+                ):
+                    display_name = f"{name} / {car['real_name']}"
+
+                car_str = f"  P{pos} ({display_name}): {format_gap(gap)}"
                 if lap_time > 0:
                     car_str += f", last lap {format_lap_time(lap_time)}"
                 if p2p:

@@ -240,6 +240,15 @@ class RaceState:
         self._last_lap_completed: int = -1
         self._fuel_at_lap_start: float = 0.0
 
+        # Tyre staleness tracking: store previous tick's tyre values
+        self._prev_tyre_values: dict[str, TyreState] | None = None
+
+        # Teammate real names: car_idx → config name (for showing both names)
+        self._teammate_real_names: dict[int, str] = {}
+
+        # Driver name aliases: iRacing UserName → real name (from config)
+        self._driver_aliases: dict[str, str] = self.config.get("driver_aliases", {})
+
         # Timing
         self._last_update_time: float = 0.0
         self._tick_count: int = 0
@@ -254,9 +263,30 @@ class RaceState:
         """Set driver name lookup from IRacingClient."""
         self._driver_names = names
 
-    def set_team_indices(self, indices: set[int]):
-        """Set which car indices are team drivers (for full tracking)."""
+    def set_team_indices(
+        self, indices: set[int], driver_aliases: dict[str, str] | None = None
+    ):
+        """Set which car indices are team drivers (for full tracking).
+
+        Also resolves teammate real names using driver_aliases.
+        driver_aliases maps iRacing UserName → real name (e.g. "Evolution" → "Patrik Farsang").
+        """
         self._team_car_indices = indices
+
+        # Merge provided aliases with any in config
+        aliases = dict(self.config.get("driver_aliases", {}))
+        if driver_aliases:
+            aliases.update(driver_aliases)
+        self._driver_aliases = aliases
+
+        # Build mapping of teammate car_idx → real name
+        self._teammate_real_names = {}
+        for idx in indices:
+            display_name = self._driver_names.get(idx, "")
+            if display_name in aliases and aliases[display_name] != display_name:
+                self._teammate_real_names[idx] = aliases[display_name]
+            else:
+                self._teammate_real_names[idx] = ""
 
     def update(
         self,
@@ -378,6 +408,22 @@ class RaceState:
     def _update_player(self, telemetry: dict):
         """Update player car state from telemetry."""
         p = self.player
+
+        # Save previous tyre values for staleness detection
+        if p.tyres:
+            self._prev_tyre_values = {
+                corner: TyreState(
+                    temp_left=ts.temp_left,
+                    temp_center=ts.temp_center,
+                    temp_right=ts.temp_right,
+                    cold_pressure=ts.cold_pressure,
+                    wear_left=ts.wear_left,
+                    wear_center=ts.wear_center,
+                    wear_right=ts.wear_right,
+                )
+                for corner, ts in p.tyres.items()
+            }
+
         p.car_idx = int(telemetry.get("PlayerCarIdx", 0))
         p.driver_name = self._driver_names.get(p.car_idx, "Player")
 
@@ -640,26 +686,49 @@ class RaceState:
     # --- Derived values ---
 
     @property
+    def avg_fuel_per_lap(self) -> float:
+        """Rolling average fuel consumption per lap (last 3 completed laps).
+
+        Returns 0.0 if no lap history with fuel data is available.
+        """
+        if not self.player.lap_history:
+            return 0.0
+
+        recent = self.player.lap_history[-3:]
+        fuel_per_lap = sum(r.fuel_used for r in recent if r.fuel_used > 0)
+        laps_with_fuel = sum(1 for r in recent if r.fuel_used > 0)
+
+        if laps_with_fuel > 0 and fuel_per_lap > 0:
+            return fuel_per_lap / laps_with_fuel
+        return 0.0
+
+    @property
+    def fuel_est_quality(self) -> str:
+        """Quality indicator for fuel laps remaining estimate.
+
+        Returns:
+            'good' — ≥3 laps of history, reliable estimate
+            'rough' — 1-2 laps of history, approximate
+            'unreliable' — no lap history, based on instantaneous rate
+        """
+        laps_with_fuel = sum(1 for r in self.player.lap_history if r.fuel_used > 0)
+        if laps_with_fuel >= 3:
+            return "good"
+        elif laps_with_fuel >= 1:
+            return "rough"
+        return "unreliable"
+
+    @property
     def fuel_laps_remaining(self) -> float:
         """Estimate how many laps of fuel remain for the player.
 
         Uses lap history when available, falls back to burn rate + estimated
         lap time when no history exists yet (e.g. early race).
         """
-        # Primary method: use actual lap history
-        if self.player.lap_history:
-            recent = (
-                self.player.lap_history[-5:]
-                if len(self.player.lap_history) >= 5
-                else self.player.lap_history
-            )
-            fuel_per_lap = sum(r.fuel_used for r in recent if r.fuel_used > 0)
-            laps_with_fuel = sum(1 for r in recent if r.fuel_used > 0)
-
-            if laps_with_fuel > 0:
-                avg_fuel_per_lap = fuel_per_lap / laps_with_fuel
-                if avg_fuel_per_lap > 0:
-                    return self.player.fuel_level / avg_fuel_per_lap
+        # Primary method: use per-lap average from lap history
+        avg = self.avg_fuel_per_lap
+        if avg > 0:
+            return self.player.fuel_level / avg
 
         # Fallback: estimate from burn rate and best/current lap time
         fuel_rate = self.player.fuel_use_per_hour  # L/hr
@@ -698,6 +767,98 @@ class RaceState:
         n = len(times)
         slope = (times[-1] - times[0]) / (n - 1) if n > 1 else 0.0
         return slope
+
+    @property
+    def tyre_staleness(self) -> str:
+        """Determine if tyre data is stale (frozen on track) or live.
+
+        Uses two signals:
+        1. Primary: whether the car is on track or in pits. Most iRacing cars
+           freeze tyre data (temps, pressures, wear) while on track — it only
+           updates during pit stops. So on-track data is presumed stale unless
+           proven otherwise.
+        2. Secondary: tick-to-tick comparison. If tyre values are actively
+           changing between updates, they're definitely live regardless of
+           car location.
+
+        Returns:
+            'live' — tyre values are actively changing (real-time data)
+            'stale' — car is on track and data is likely frozen
+            'unknown' — not enough info (car off track, no data, or first tick)
+        """
+        # If car is in pits, tyre data is likely live (just updated)
+        if self.player.on_pit_road:
+            return "live"
+
+        # If car is off track entirely, we can't determine staleness
+        if not self.player.is_on_track:
+            return "unknown"
+
+        # Car is on track — tyre data is likely frozen for most iRacing cars.
+        # But check tick-to-tick: if values ARE actively changing, they're live.
+        if hasattr(self, "_prev_tyre_values") and self._prev_tyre_values:
+            curr = self.player.tyres
+            prev = self._prev_tyre_values
+            for corner in ["LF", "RF", "LR", "RR"]:
+                if corner not in curr or corner not in prev:
+                    continue
+                c = curr[corner]
+                p = prev[corner]
+                if abs(c.temp_center - p.temp_center) > 0.05:
+                    return "live"
+                if abs(c.cold_pressure - p.cold_pressure) > 0.01:
+                    return "live"
+                if abs(c.wear_center - p.wear_center) > 0.0001:
+                    return "live"
+
+        # On track and values aren't changing (or no previous tick to compare)
+        # → presume stale (frozen data, iRacing limitation for most cars)
+        return "stale"
+
+    @property
+    def estimated_total_laps(self) -> int | None:
+        """Estimate total race laps from session time and average lap time.
+
+        For time-based races (SessionLapsRemain >= 32767), estimate total laps
+        from remaining session time divided by average lap time.
+
+        For lap-based races, use the actual total.
+
+        Returns None if estimation is not possible.
+        """
+        LAPS_REMAIN_SENTINEL = 32767  # iRacing sentinel for unlimited/time-based
+
+        laps_remain = self.session.laps_remain
+        race_laps = self.session.race_laps
+
+        # If this is a lap-based race, we can compute total directly
+        if laps_remain > 0 and laps_remain < LAPS_REMAIN_SENTINEL:
+            return race_laps + laps_remain
+
+        # Time-based race: estimate from remaining session time
+        time_remain = self.session.time_remain
+        if time_remain <= 0:
+            return None
+
+        # Get the best available lap time for estimation
+        avg_lap = self.player.best_lap_time
+        if avg_lap <= 0:
+            avg_lap = self.player.last_lap_time
+        if avg_lap <= 0 and self.player.lap_history:
+            # Use average of recent lap times
+            recent = self.player.lap_history[-5:]
+            times = [r.lap_time for r in recent if r.lap_time > 0]
+            if times:
+                avg_lap = sum(times) / len(times)
+        if avg_lap <= 0:
+            # Last resort: use DriverCarEstLapTime from session
+            avg_lap = getattr(self.session, "est_lap_time", 0) or 0
+        if avg_lap <= 0:
+            return None
+
+        # estimated laps remaining = time_remain / avg_lap_time
+        laps_estimated = time_remain / avg_lap
+        return race_laps + int(laps_estimated)
 
     @property
     def flags_list(self) -> list[str]:
@@ -779,6 +940,9 @@ class RaceState:
                 "fuel_pct": self.player.fuel_pct,
                 "fuel_use_per_hour": self.player.fuel_use_per_hour,
                 "fuel_laps_remaining": self.fuel_laps_remaining,
+                "fuel_est_quality": self.fuel_est_quality,
+                "avg_fuel_per_lap": self.avg_fuel_per_lap,
+                "tyre_staleness": self.tyre_staleness,
                 "current_lap_time": self.player.current_lap_time,
                 "best_lap_time": self.player.best_lap_time,
                 "last_lap_time": self.player.last_lap_time,
@@ -852,6 +1016,8 @@ class RaceState:
                     "on_pit_road": car.on_pit_road,
                     "p2p_available": car.p2p_remaining > 0,
                     "p2p_remaining": car.p2p_remaining,
+                    "is_teammate": car.car_idx in self._team_car_indices,
+                    "real_name": self._teammate_real_names.get(car.car_idx, ""),
                     "tire_compound": car.tire_compound,
                     "track_surface": car.track_surface,
                     "rpm": car.rpm,
@@ -871,4 +1037,6 @@ class RaceState:
             "standings_count": len(self.standings),
             "tick_count": self._tick_count,
             "last_update_time": self._last_update_time,
+            "estimated_total_laps": self.estimated_total_laps,
+            "driver_aliases": self._driver_aliases,
         }

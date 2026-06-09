@@ -198,7 +198,8 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
 
     # Detect teammates
     team_indices = iracing.detect_team_indices(config)
-    state.set_team_indices(team_indices)
+    driver_aliases = getattr(iracing, "driver_aliases", {})
+    state.set_team_indices(team_indices, driver_aliases)
     driver_names = {d.car_idx: d.driver_name for d in iracing.drivers}
     state.set_driver_names(driver_names)
     print(

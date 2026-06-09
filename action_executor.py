@@ -40,14 +40,22 @@ class ActionExecutor:
         "clear_penalty": None,  # Uses chat_command
     }
 
-    def __init__(self, iracing_client=None, config: dict | None = None):
+    # Maximum fuel that can be added in a single action (litres)
+    MAX_FUEL_ADD = 110  # Most iRacing cars have tanks ≤110L
+
+    def __init__(
+        self, iracing_client=None, config: dict | None = None, fuel_max: float = 0.0
+    ):
         """
         Args:
             iracing_client: IRacingClient instance for executing commands.
                             Can be None for dry-run/testing.
             config: Configuration dict with 'actions' key.
+            fuel_max: Maximum tank capacity in litres (from session info).
+                      Used to clamp add_fuel actions.
         """
         self.iracing = iracing_client
+        self.fuel_max = fuel_max
         actions_config = (config or {}).get("actions", {})
         self.dry_run = not actions_config.get("enabled", False)
         self.allowed_actions = actions_config.get(
@@ -102,7 +110,7 @@ class ActionExecutor:
         clean_text = "\n".join(clean_lines)
         return clean_text, actions
 
-    def execute(self, actions: list[dict]) -> list[str]:
+    def execute(self, actions: list[dict], current_fuel: float = 0.0) -> list[str]:
         """Execute a list of parsed actions.
 
         In dry_run mode, actions are logged but not sent to iRacing.
@@ -110,6 +118,7 @@ class ActionExecutor:
 
         Args:
             actions: List of action dicts from parse_response().
+            current_fuel: Current fuel level in litres (for clamping add_fuel).
 
         Returns:
             List of result strings for each action.
@@ -140,17 +149,20 @@ class ActionExecutor:
                 results.append(msg)
                 continue
 
-            result = self._execute_action(action, param)
+            result = self._execute_action(action, param, current_fuel)
             results.append(result)
 
         return results
 
-    def _execute_action(self, action: str, param: str | None) -> str:
+    def _execute_action(
+        self, action: str, param: str | None, current_fuel: float = 0.0
+    ) -> str:
         """Execute a single action via the iRacing client.
 
         Args:
             action: Action name (e.g. 'add_fuel', 'change_tyres')
             param: Optional parameter (e.g. '60' for add_fuel)
+            current_fuel: Current fuel level in litres (for clamping add_fuel).
 
         Returns:
             Result string describing what happened.
@@ -162,9 +174,31 @@ class ActionExecutor:
                 return "[EXECUTED] pit_this_lap — pit stop requested"
 
             elif action == "add_fuel":
-                litres = int(param) if param else 0
-                self.iracing.pit_command("fuel", litres)
-                return f"[EXECUTED] add_fuel: {litres}L"
+                if param is None:
+                    return "[ERROR] add_fuel requires a parameter (litres)"
+
+                try:
+                    litres = float(param)
+                except (ValueError, TypeError):
+                    return f"[ERROR] Invalid fuel amount: {param}"
+
+                # Clamp to reasonable values
+                original = litres
+                litres = max(1, round(litres))  # Minimum 1L, whole litres
+
+                # Cap at tank capacity if known
+                if self.fuel_max > 0:
+                    max_add = max(0, self.fuel_max - current_fuel)
+                    if litres > max_add:
+                        litres = max(0, round(max_add))
+
+                if litres <= 0:
+                    return f"[BLOCKED] add_fuel: {original}L would exceed tank capacity ({self.fuel_max:.0f}L)"
+
+                self.iracing.pit_command("fuel", int(litres))
+                return f"[EXECUTED] add_fuel: {int(litres)}L" + (
+                    f" (clamped from {original}L)" if original != litres else ""
+                )
 
             elif action == "change_tyres":
                 self.iracing.pit_command("clear_tires")

@@ -28,16 +28,25 @@ actions:
 #
 # FALLBACK: If TeamName isn't set or you want to be explicit, list usernames
 # or car numbers below. These are matched in addition to auto-detection.
+#
+# Teammates can be specified as:
+#   - Plain string: matches iRacing UserName exactly, displayed as-is
+#     e.g. "Wayne Smith8"
+#   - Mapping (nickname: real_name): iRacing UserName is the key, real name is the value.
+#     Used when the iRacing display name differs from the driver's real name.
+#     e.g. Evolution: Patrik Farsang
+#     Both names are shown in context: "Evolution / Patrik Farsang"
 team:
   auto_detect: true              # Match drivers with the same TeamName as the player
   teammates:
-    - "Patrik Farsang"
-    - "Wayne Smith8"
-    - "Andre Groove"
-    - "Dan Golden"
-    - "Dave Cartnerdobbs"
-    - "Liam Biggs"
-    - "David Barlow"
+    - Evolution: Patrik Farsang
+    - Wayne Smith8
+    - Andre Groove
+    - Dan Golden
+    - Dave Cartnerdobbs
+    - Liam Biggs
+    - David Barlow
+    - Mayhem: Phil Mehew
   car_numbers: []                # Alternative: identify by car number
 
 # Button trigger
@@ -48,22 +57,20 @@ trigger:
 # Prompt configuration
 prompt:
   system: |
-    You are a race engineer talking to your driver over radio.
-    Speak in short, clear sentences like a real race engineer —
-    the driver is in a race and needs fast, spoken-style answers.
-    No markdown, no bullet points, no bold, no headers.
-    Just plain sentences, like you're on the radio.
+    You are a race engineer. Speak in short radio-style sentences. No markdown, bullets, or headers.
     Example: 'Box this lap. Tyres are gone. Add 60 litres.'
-    If you're unsure, say so. Never invent data not provided.
-    The 'Your car' section is the driver you are talking to.
+    If unsure, say so. Never invent data. The 'Your car' section is the driver you're talking to.
 
-    You may optionally include action directives in your response using the
-    format [ACTION] action_name[: parameter]. These will be executed (when
-    enabled) or logged (in dry-run mode). Available actions:
-    - [ACTION] pit_this_lap
-    - [ACTION] add_fuel: <litres>
-    - [ACTION] change_tyres
-    - [ACTION] clear_penalty
+    Rules:
+    - Only respond when asked. Don't promise to monitor or call pit later.
+    - Don't suggest setup changes (pressures, brake bias) without known reference ranges.
+    - Don't assess temps as high/low without knowing the car's normal range — just report values.
+    - Don't name track corners unless that data is in the context.
+    - 'Incidents' are safety points (0x per off-track), NOT car damage.
+    - Tyre data may be FROZEN (unchanged since pit exit) — iRacing freezes it on track for most cars. If marked FROZEN, don't comment on degradation or trends.
+    - [ACTION] add_fuel amounts: whole litres, min 1L, max = tank capacity - current fuel.
+
+    Optional actions: [ACTION] pit_this_lap | add_fuel: <litres> | change_tyres | clear_penalty
   context_depth: "full"       # "minimal", "medium", or "full"
   # minimal: position, fuel, laps remaining only
   # medium: + gaps, tyre temps, flags

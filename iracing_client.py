@@ -260,16 +260,45 @@ class IRacingClient:
                         )
 
         # Strategy 2: Config fallback — match by username or car number
+        # Teammates list can contain:
+        #   - Plain strings: "Wayne Smith8" (matches iRacing UserName, displayed as-is)
+        #   - Mappings: "Evolution: Patrik Farsang" (nickname -> real name for display)
         explicit_teammates = team_config.get("teammates", [])
         explicit_car_numbers = team_config.get("car_numbers", [])
 
-        if explicit_teammates and self._drivers:
+        # Parse teammates into a list of (iracing_name, real_name) tuples
+        teammate_map: dict[str, str] = {}  # iracing_name -> real_name
+        for entry in explicit_teammates:
+            if isinstance(entry, str) and ":" in entry:
+                # "Evolution: Patrik Farsang" -> nickname: real_name
+                iracing_name, real_name = entry.split(":", 1)
+                iracing_name = iracing_name.strip()
+                real_name = real_name.strip()
+                teammate_map[iracing_name] = real_name
+            elif isinstance(entry, str):
+                # Plain name — iRacing name = real name
+                teammate_map[entry] = entry
+            elif isinstance(entry, dict):
+                # YAML mapping format: {Evolution: Patrik Farsang}
+                for k, v in entry.items():
+                    teammate_map[str(k)] = str(v)
+
+        # Store the alias map on the client for later use
+        self.driver_aliases = teammate_map
+
+        if teammate_map and self._drivers:
             for d in self._drivers:
-                if d.driver_name in explicit_teammates:
+                if d.driver_name in teammate_map:
                     team_indices.add(d.car_idx)
-                    logger.debug(
-                        f"Config-matched teammate: {d.driver_name} (#{d.car_number})"
-                    )
+                    real_name = teammate_map[d.driver_name]
+                    if real_name != d.driver_name:
+                        logger.debug(
+                            f"Config-matched teammate: {d.driver_name} / {real_name} (#{d.car_number})"
+                        )
+                    else:
+                        logger.debug(
+                            f"Config-matched teammate: {d.driver_name} (#{d.car_number})"
+                        )
 
         if explicit_car_numbers and self._drivers:
             for d in self._drivers:
