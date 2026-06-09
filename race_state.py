@@ -70,6 +70,17 @@ class DriverState:
     throttle: float = 0.0
     brake: float = 0.0
 
+    # Player-only: engine health
+    oil_temp: float = 0.0  # °C
+    oil_press: float = 0.0  # bar/PSI
+    oil_level: float = 0.0
+    water_temp: float = 0.0  # °C
+    water_level: float = 0.0
+    fuel_press: float = 0.0
+    engine_warnings: int = 0  # Bitmask
+    manifold_press: float = 0.0
+    voltage: float = 0.0
+
     # Player-only: fuel
     fuel_level: float = 0.0  # Litres
     fuel_pct: float = 0.0  # 0-1
@@ -81,10 +92,38 @@ class DriverState:
     # For other cars: only compound is available
     tyres: dict[str, TyreState] = field(default_factory=dict)
     tire_compound: int = 0
+    # Player-only: per-corner odometer (km driven on that tyre)
+    tyre_odometers: dict[str, float] = field(default_factory=dict)
 
     # Player-only: brakes
     brake_pressures: dict[str, float] = field(default_factory=dict)
     brake_abs_active: bool = False
+    brake_bias: float = 0.0  # dcBrakeBias
+
+    # Player-only: G-forces
+    lat_accel: float = 0.0  # Lateral g-force
+    long_accel: float = 0.0  # Longitudinal g-force
+    vert_accel: float = 0.0  # Vertical g-force
+
+    # Player-only: damage and penalties
+    weight_penalty: float = 0.0  # kg added for damage
+    fast_repairs_used: int = 0
+    pit_repair_time_left: float = 0.0  # Repair time remaining in pits
+    pit_opt_repair_time_left: float = 0.0  # Optimal repair time remaining
+
+    # Player-only: car status
+    is_on_track: bool = False
+    is_in_garage: bool = False
+
+    # Player-only: proximity
+    car_left_right: int = 0  # 0=none, 1=car left, 2=car right, 3=both
+    car_dist_ahead: float = 0.0  # metres
+    car_dist_behind: float = 0.0  # metres
+    tow_time: float = 0.0  # seconds of tow available
+
+    # Player-only: shift lights
+    shift_indicator_pct: float = 0.0
+    shift_rpm: float = 0.0
 
     # Lap times
     current_lap_time: float = -1.0
@@ -141,12 +180,31 @@ class SessionState:
     # Weather (shared across all cars)
     track_temp: float = 0.0  # °C
     track_wetness: float = 0.0  # 0-1
+    weather_declared_wet: bool = False  # iRacing declared wet conditions
     air_temp: float = 0.0  # °C
     air_pressure: float = 0.0
     precipitation: float = 0.0  # 0-1
     wind_dir: float = 0.0
     wind_vel: float = 0.0
     skies: int = 0
+
+    # Session config (from WeekendInfo / DriverInfo)
+    fuel_max_litres: float = 0.0  # Tank capacity
+    is_fixed_setup: bool = False
+    incident_limit: str = ""  # e.g. "unlimited", "17x"
+    fast_repairs_limit: str = ""  # e.g. "unlimited"
+    track_num_turns: int = 0
+    track_length_km: float = 0.0
+    pit_speed_limit_kph: float = 0.0
+    num_starters: int = 0
+    car_class_name: str = ""
+    # Shift RPMs
+    idle_rpm: float = 0.0
+    redline_rpm: float = 0.0
+    shift_rpm: float = 0.0
+    shift_first_rpm: float = 0.0
+    shift_last_rpm: float = 0.0
+    shift_blink_rpm: float = 0.0
 
 
 # Session flag constants (from iRacing SDK)
@@ -239,6 +297,9 @@ class RaceState:
         # Weather
         self.session.track_temp = float(telemetry.get("TrackTemp", 0.0))
         self.session.track_wetness = float(telemetry.get("TrackWetness", 0.0))
+        self.session.weather_declared_wet = bool(
+            telemetry.get("WeatherDeclaredWet", False)
+        )
         self.session.air_temp = float(telemetry.get("AirTemp", 0.0))
         self.session.air_pressure = float(telemetry.get("AirPressure", 0.0))
         self.session.precipitation = float(telemetry.get("Precipitation", 0.0))
@@ -253,6 +314,32 @@ class RaceState:
             self.session.track_config = weekend.get(
                 "TrackConfigName", self.session.track_config
             )
+            # Parse track length — may be "5.7961 km" or numeric
+            track_length_raw = weekend.get("TrackLength", 0)
+            if isinstance(track_length_raw, str):
+                self.session.track_length_km = float(
+                    track_length_raw.replace(" km", "").replace(" km", "")
+                )
+            else:
+                self.session.track_length_km = float(track_length_raw or 0)
+            self.session.track_num_turns = int(weekend.get("TrackNumTurns", 0))
+            # Parse pit speed limit — may be "60.00 kph" or numeric
+            pit_speed_raw = weekend.get("TrackPitSpeedLimit", 0)
+            if isinstance(pit_speed_raw, str):
+                self.session.pit_speed_limit_kph = float(
+                    pit_speed_raw.replace(" kph", "")
+                )
+            else:
+                self.session.pit_speed_limit_kph = float(pit_speed_raw or 0)
+
+            # WeekendOptions
+            options = weekend.get("WeekendOptions") or {}
+            self.session.is_fixed_setup = bool(int(options.get("IsFixedSetup", 0)))
+            self.session.incident_limit = str(options.get("IncidentLimit", ""))
+            self.session.fast_repairs_limit = str(options.get("FastRepairsLimit", ""))
+            self.session.num_starters = int(
+                options.get("NumStarters", weekend.get("MaxDrivers", 0))
+            )
 
             sessions = session_info.get("SessionInfo", {}).get("Sessions", [])
             current_num = self.session.session_num
@@ -265,6 +352,24 @@ class RaceState:
                         "SessionName", self.session.session_name
                     )
                     break
+
+            # Driver info — car spec and shift RPMs
+            driver_info = session_info.get("DriverInfo", {})
+            self.session.fuel_max_litres = float(
+                driver_info.get("DriverCarFuelMaxLtr", 0.0)
+            )
+            self.session.idle_rpm = float(driver_info.get("DriverCarIdleRPM", 0.0))
+            self.session.redline_rpm = float(driver_info.get("DriverCarRedLine", 0.0))
+            self.session.shift_rpm = float(driver_info.get("DriverCarSLShiftRPM", 0.0))
+            self.session.shift_first_rpm = float(
+                driver_info.get("DriverCarSLFirstRPM", 0.0)
+            )
+            self.session.shift_last_rpm = float(
+                driver_info.get("DriverCarSLLastRPM", 0.0)
+            )
+            self.session.shift_blink_rpm = float(
+                driver_info.get("DriverCarSLBlinkRPM", 0.0)
+            )
 
     def _update_player(self, telemetry: dict):
         """Update player car state from telemetry."""
@@ -284,6 +389,45 @@ class RaceState:
         p.throttle = float(telemetry.get("Throttle", 0.0))
         p.brake = float(telemetry.get("Brake", 0.0))
 
+        # Engine health (player only)
+        p.oil_temp = float(telemetry.get("OilTemp", 0.0))
+        p.oil_press = float(telemetry.get("OilPress", 0.0))
+        p.oil_level = float(telemetry.get("OilLevel", 0.0))
+        p.water_temp = float(telemetry.get("WaterTemp", 0.0))
+        p.water_level = float(telemetry.get("WaterLevel", 0.0))
+        p.fuel_press = float(telemetry.get("FuelPress", 0.0))
+        p.engine_warnings = int(telemetry.get("EngineWarnings", 0))
+        p.manifold_press = float(telemetry.get("ManifoldPress", 0.0))
+        p.voltage = float(telemetry.get("Voltage", 0.0))
+
+        # Car status
+        p.is_on_track = bool(telemetry.get("IsOnTrack", False))
+        p.is_in_garage = bool(telemetry.get("IsInGarage", False))
+
+        # G-forces (player only)
+        p.lat_accel = float(telemetry.get("LatAccel", 0.0))
+        p.long_accel = float(telemetry.get("LongAccel", 0.0))
+        p.vert_accel = float(telemetry.get("VertAccel", 0.0))
+
+        # Damage and penalties (player only)
+        p.weight_penalty = float(telemetry.get("PlayerCarWeightPenalty", 0.0))
+        p.fast_repairs_used = int(telemetry.get("PlayerFastRepairsUsed", 0))
+        p.pit_repair_time_left = float(telemetry.get("PitRepairLeft", 0.0))
+        p.pit_opt_repair_time_left = float(telemetry.get("PitOptRepairLeft", 0.0))
+
+        # Proximity (player only)
+        p.car_left_right = int(telemetry.get("CarLeftRight", 0))
+        p.car_dist_ahead = float(telemetry.get("CarDistAhead", 0.0))
+        p.car_dist_behind = float(telemetry.get("CarDistBehind", 0.0))
+        p.tow_time = float(telemetry.get("PlayerCarTowTime", 0.0))
+
+        # Shift lights (player only)
+        p.shift_indicator_pct = float(telemetry.get("ShiftIndicatorPct", 0.0))
+        p.shift_rpm = float(telemetry.get("PlayerCarSLShiftRPM", 0.0))
+
+        # Brake bias (player only)
+        p.brake_bias = float(telemetry.get("dcBrakeBias", 0.0))
+
         # Fuel (player only)
         p.fuel_level = float(telemetry.get("FuelLevel", 0.0))
         p.fuel_pct = float(telemetry.get("FuelLevelPct", 0.0))
@@ -301,6 +445,14 @@ class RaceState:
                 wear_center=float(telemetry.get(f"{prefix}wearM", 0.0)),
                 wear_right=float(telemetry.get(f"{prefix}wearR", 0.0)),
             )
+
+        # Tyre odometers (per corner — km driven on that tyre)
+        p.tyre_odometers = {
+            "LF": float(telemetry.get("LFodometer", 0.0)),
+            "RF": float(telemetry.get("RFodometer", 0.0)),
+            "LR": float(telemetry.get("LRodometer", 0.0)),
+            "RR": float(telemetry.get("RRodometer", 0.0)),
+        }
 
         # Brakes (player only)
         p.brake_pressures = {
@@ -564,10 +716,24 @@ class RaceState:
                 "weather": {
                     "track_temp": self.session.track_temp,
                     "track_wetness": self.session.track_wetness,
+                    "weather_declared_wet": self.session.weather_declared_wet,
                     "air_temp": self.session.air_temp,
                     "precipitation": self.session.precipitation,
                     "wind_dir": self.session.wind_dir,
                     "wind_vel": self.session.wind_vel,
+                },
+                "config": {
+                    "fuel_max_litres": self.session.fuel_max_litres,
+                    "is_fixed_setup": self.session.is_fixed_setup,
+                    "incident_limit": self.session.incident_limit,
+                    "fast_repairs_limit": self.session.fast_repairs_limit,
+                    "track_num_turns": self.session.track_num_turns,
+                    "track_length_km": self.session.track_length_km,
+                    "pit_speed_limit_kph": self.session.pit_speed_limit_kph,
+                    "num_starters": self.session.num_starters,
+                    "idle_rpm": self.session.idle_rpm,
+                    "redline_rpm": self.session.redline_rpm,
+                    "shift_rpm": self.session.shift_rpm,
                 },
             },
             "player": {
@@ -578,6 +744,8 @@ class RaceState:
                 "lap": self.player.lap,
                 "lap_completed": self.player.lap_completed,
                 "speed": self.player.speed,
+                "is_on_track": self.player.is_on_track,
+                "is_in_garage": self.player.is_in_garage,
                 "fuel_level": self.player.fuel_level,
                 "fuel_pct": self.player.fuel_pct,
                 "fuel_use_per_hour": self.player.fuel_use_per_hour,
@@ -587,6 +755,36 @@ class RaceState:
                 "last_lap_time": self.player.last_lap_time,
                 "delta_to_best": self.player.delta_to_best,
                 "lap_time_trend": self.lap_time_trend,
+                # Engine health
+                "oil_temp": self.player.oil_temp,
+                "oil_press": self.player.oil_press,
+                "oil_level": self.player.oil_level,
+                "water_temp": self.player.water_temp,
+                "water_level": self.player.water_level,
+                "fuel_press": self.player.fuel_press,
+                "engine_warnings": self.player.engine_warnings,
+                "manifold_press": self.player.manifold_press,
+                "voltage": self.player.voltage,
+                # Damage and penalties
+                "weight_penalty": self.player.weight_penalty,
+                "fast_repairs_used": self.player.fast_repairs_used,
+                "pit_repair_time_left": self.player.pit_repair_time_left,
+                "pit_opt_repair_time_left": self.player.pit_opt_repair_time_left,
+                # Proximity
+                "car_left_right": self.player.car_left_right,
+                "car_dist_ahead": self.player.car_dist_ahead,
+                "car_dist_behind": self.player.car_dist_behind,
+                "tow_time": self.player.tow_time,
+                # G-forces
+                "lat_accel": self.player.lat_accel,
+                "long_accel": self.player.long_accel,
+                "vert_accel": self.player.vert_accel,
+                # Brake bias
+                "brake_bias": self.player.brake_bias,
+                # Shift lights
+                "shift_indicator_pct": self.player.shift_indicator_pct,
+                "shift_rpm": self.player.shift_rpm,
+                # Tyres
                 "tyres": {
                     corner: {
                         "temp_left": ts.temp_left,
@@ -599,6 +797,7 @@ class RaceState:
                     }
                     for corner, ts in self.player.tyres.items()
                 },
+                "tyre_odometers": self.player.tyre_odometers,
                 "brake_pressures": self.player.brake_pressures,
                 "brake_abs_active": self.player.brake_abs_active,
                 "incidents": self.player.incidents,

@@ -14,6 +14,8 @@ from context_builder import (
     format_gap,
     format_temp,
     format_pct,
+    format_engine_warnings,
+    format_car_proximity,
 )
 from action_executor import ActionExecutor
 from capture import TelemetryReplay
@@ -107,6 +109,45 @@ def sample_telemetry(lap=10, fuel=72.0, flags=1):
         "PlayerCarTeamIncidentCount": 2,
         "CarDistAhead": 2.1,
         "CarDistBehind": -1.8,
+        # Engine health
+        "OilTemp": 95.0,
+        "OilPress": 4.2,
+        "OilLevel": 6.5,
+        "WaterTemp": 88.0,
+        "WaterLevel": 6.7,
+        "FuelPress": 3.9,
+        "EngineWarnings": 0,
+        "ManifoldPress": 1.02,
+        "Voltage": 13.8,
+        # Car status
+        "IsOnTrack": True,
+        "IsInGarage": False,
+        # Damage and penalties
+        "PlayerCarWeightPenalty": 0.0,
+        "PlayerFastRepairsUsed": 0,
+        "PitRepairLeft": 0.0,
+        "PitOptRepairLeft": 0.0,
+        # Proximity
+        "CarLeftRight": 0,
+        "PlayerCarTowTime": 0.0,
+        # G-forces
+        "LatAccel": 1.2,
+        "LongAccel": 0.3,
+        "VertAccel": 9.8,
+        # Brake bias
+        "dcBrakeBias": 54.0,
+        # Shift lights
+        "ShiftIndicatorPct": 0.75,
+        "PlayerCarSLShiftRPM": 6800.0,
+        # Tyre odometers
+        "LFodometer": 1500.0,
+        "RFodometer": 1500.0,
+        "LRodometer": 1500.0,
+        "RRodometer": 1500.0,
+        # Track conditions
+        "WeatherDeclaredWet": False,
+        "PlayerTrackSurface": 3,
+        "PlayerTrackSurfaceMaterial": 1,
     }
 
 
@@ -116,6 +157,16 @@ def sample_session_info():
         "WeekendInfo": {
             "TrackName": "Circuit de Spa-Francorchamps",
             "TrackConfigName": "Grand Prix",
+            "TrackLength": "7.004 km",
+            "TrackNumTurns": 20,
+            "TrackPitSpeedLimit": "60.00 kph",
+            "MaxDrivers": 1,
+            "WeekendOptions": {
+                "IsFixedSetup": 0,
+                "IncidentLimit": "17x",
+                "FastRepairsLimit": "2",
+                "NumStarters": 30,
+            },
         },
         "SessionInfo": {
             "Sessions": [
@@ -123,20 +174,29 @@ def sample_session_info():
             ]
         },
         "DriverInfo": {
+            "DriverCarFuelMaxLtr": 110.0,
+            "DriverCarIdleRPM": 800.0,
+            "DriverCarRedLine": 7500.0,
+            "DriverCarSLShiftRPM": 6800.0,
+            "DriverCarSLFirstRPM": 5500.0,
+            "DriverCarSLLastRPM": 7200.0,
+            "DriverCarSLBlinkRPM": 7000.0,
             "Drivers": [
                 {
                     "CarIdx": 0,
                     "UserName": "Patrik Farsang",
                     "CarNumber": "7",
                     "TeamName": "iRaceEngineer",
+                    "CurDriverIncidentCount": 0,
                 },
                 {
                     "CarIdx": 1,
                     "UserName": "Wayne Smith8",
                     "CarNumber": "4",
                     "TeamName": "iRaceEngineer",
+                    "CurDriverIncidentCount": 2,
                 },
-            ]
+            ],
         },
     }
 
@@ -318,11 +378,94 @@ class TestContextBuilder:
         assert format_gap(0) == "0.000s"
 
     def test_format_temp(self):
-        assert format_temp(97.0) == "97°C"
+        assert format_temp(97.0) == "97.0°C"
         assert format_temp(0) == "N/A"
 
     def test_format_pct(self):
         assert format_pct(0.65) == "65%"
+
+    def test_format_engine_warnings(self):
+        assert format_engine_warnings(0) == ""
+        assert format_engine_warnings(1) == "water temp"
+        assert format_engine_warnings(4) == "oil pressure"
+        assert format_engine_warnings(0x20) == "rev limiter"
+        # Combined warnings: 0x05 = water temp | oil pressure
+        result = format_engine_warnings(0x05)
+        assert "water temp" in result
+        assert "oil pressure" in result
+        assert "water temp" in result or "fuel pressure" in result
+
+    def test_format_car_proximity(self):
+        assert format_car_proximity(0) == ""
+        assert format_car_proximity(1) == "car LEFT"
+        assert format_car_proximity(2) == "car RIGHT"
+        assert "LEFT" in format_car_proximity(3) and "RIGHT" in format_car_proximity(3)
+
+    def test_full_context_includes_engine_health(self):
+        state = make_state()
+        config = {
+            "prompt": {
+                "context_depth": "full",
+                "system": "test",
+                "include_lap_history": 5,
+                "include_nearby_cars": 3,
+            }
+        }
+        builder = ContextBuilder(config)
+        messages = builder.build_prompt(state.get_snapshot())
+        content = messages[1]["content"]
+        # Engine health should appear in full context
+        assert "Engine:" in content
+        assert "Oil" in content
+
+    def test_full_context_includes_session_config(self):
+        state = make_state()
+        config = {
+            "prompt": {
+                "context_depth": "full",
+                "system": "test",
+                "include_lap_history": 5,
+                "include_nearby_cars": 3,
+            }
+        }
+        builder = ContextBuilder(config)
+        messages = builder.build_prompt(state.get_snapshot())
+        content = messages[1]["content"]
+        # Session config should appear in full context
+        assert "incidents:" in content
+        assert "tank:" in content
+
+    def test_snapshot_includes_engine_health(self):
+        state = make_state()
+        snap = state.get_snapshot()
+        player = snap["player"]
+        assert player["oil_temp"] == 95.0
+        assert player["oil_press"] == 4.2
+        assert player["water_temp"] == 88.0
+        assert player["engine_warnings"] == 0
+        assert player["voltage"] == 13.8
+        assert player["brake_bias"] == 54.0
+        assert player["is_on_track"] is True
+        assert player["is_in_garage"] is False
+
+    def test_snapshot_includes_session_config(self):
+        state = make_state()
+        snap = state.get_snapshot()
+        config = snap["session"]["config"]
+        assert config["fuel_max_litres"] == 110.0
+        assert config["track_num_turns"] == 20
+        assert config["track_length_km"] == 7.004
+        assert config["is_fixed_setup"] is False
+        assert config["incident_limit"] == "17x"
+        assert config["fast_repairs_limit"] == "2"
+        assert config["shift_rpm"] == 6800.0
+
+    def test_snapshot_includes_tyre_odometers(self):
+        state = make_state()
+        snap = state.get_snapshot()
+        odometers = snap["player"]["tyre_odometers"]
+        assert odometers["LF"] == 1500.0
+        assert odometers["RR"] == 1500.0
 
 
 # --- ActionExecutor tests ---

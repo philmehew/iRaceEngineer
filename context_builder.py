@@ -26,10 +26,10 @@ def format_gap(seconds: float) -> str:
 
 
 def format_temp(temp: float) -> str:
-    """Format a temperature value."""
+    """Format a temperature value to 1 decimal place."""
     if temp <= 0:
         return "N/A"
-    return f"{temp:.0f}°C"
+    return f"{temp:.1f}°C"
 
 
 def format_pct(value: float) -> str:
@@ -44,6 +44,53 @@ def format_wear(wear: float) -> str:
     if wear <= 0:
         return "N/A"
     return f"{wear * 100:.1f}%"
+
+
+def format_metric(value: float, unit: str = "", decimals: int = 2) -> str:
+    """Format a numeric metric to a consistent number of decimal places."""
+    if value == 0:
+        return "N/A"
+    return f"{value:.{decimals}f}{unit}"
+
+
+def format_engine_warnings(warnings: int) -> str:
+    """Format EngineWarnings bitmask to human-readable labels."""
+    if warnings == 0:
+        return ""
+    labels = []
+    # iRacing EngineWarnings bits (from SDK docs)
+    if warnings & 0x01:
+        labels.append("water temp")
+    if warnings & 0x02:
+        labels.append("fuel pressure")
+    if warnings & 0x04:
+        labels.append("oil pressure")
+    if warnings & 0x08:
+        labels.append("engine stall")
+    if warnings & 0x10:
+        labels.append("pit speed limiter")
+    if warnings & 0x20:
+        labels.append("rev limiter")
+    if warnings & 0x40:
+        labels.append("fuel level")
+    if warnings & 0x80:
+        labels.append("oil temp")
+    # Bits 8+ are less common
+    if warnings & ~0xFF:
+        labels.append(f"other(0x{warnings & ~0xFF:x})")
+    return ", ".join(labels)
+
+
+def format_car_proximity(car_left_right: int) -> str:
+    """Format CarLeftRight value to human-readable string."""
+    if car_left_right == 0:
+        return ""
+    parts = []
+    if car_left_right & 1:
+        parts.append("car LEFT")
+    if car_left_right & 2:
+        parts.append("car RIGHT")
+    return " | ".join(parts)
 
 
 class ContextBuilder:
@@ -132,13 +179,13 @@ class ContextBuilder:
         # Fuel
         fuel_laps = player.get("fuel_laps_remaining", 0)
         fuel_pct = player.get("fuel_pct", 0)
-        lines.append(f"Fuel: {format_pct(fuel_pct)} (~{fuel_laps:.0f} laps remaining)")
+        lines.append(f"Fuel: {format_pct(fuel_pct)} (~{fuel_laps:.2f} laps remaining)")
         lines.append(f"Laps remaining: {laps_remain}")
 
         return "\n".join(lines)
 
     def _build_medium(self, state: dict) -> str:
-        """Build medium context: minimal + gaps, tyre temps, flags."""
+        """Build medium context: minimal + gaps, tyre temps, flags, engine health."""
         lines = []
         session = state.get("session", {})
         player = state.get("player", {})
@@ -166,14 +213,32 @@ class ContextBuilder:
         )
         lines.append(f"Flags: {', '.join(flags)}")
 
+        # Weather
+        weather = session.get("weather", {})
+        if weather:
+            track_temp = weather.get("track_temp", 0)
+            air_temp = weather.get("air_temp", 0)
+            wetness = weather.get("track_wetness", 0)
+            wet_str = ", WET" if wetness > 0 else ""
+            if track_temp > 0 or air_temp > 0:
+                lines.append(
+                    f"Track: {format_temp(track_temp)}, Air: {format_temp(air_temp)}{wet_str}"
+                )
+
         # Player car
         fuel_laps = player.get("fuel_laps_remaining", 0)
         fuel_pct = player.get("fuel_pct", 0)
         fuel_level = player.get("fuel_level", 0)
         lines.append("\nYour car:")
         lines.append(
-            f"  Fuel: {fuel_level:.1f}L ({format_pct(fuel_pct)}), ~{fuel_laps:.1f} laps remaining"
+            f"  Fuel: {fuel_level:.2f}L ({format_pct(fuel_pct)}), ~{fuel_laps:.2f} laps remaining"
         )
+
+        # Engine warnings (critical for race engineering)
+        engine_warnings = player.get("engine_warnings", 0)
+        if engine_warnings:
+            warning_str = format_engine_warnings(engine_warnings)
+            lines.append(f"  ⚠ ENGINE WARNING: {warning_str}")
 
         # Tyre temps
         tyres = player.get("tyres", {})
@@ -187,18 +252,24 @@ class ContextBuilder:
             if tyre_strs:
                 lines.append(f"  Tyres: {' / '.join(tyre_strs)}")
 
+        # Incidents
+        incidents = player.get("incidents", 0)
+        if incidents > 0:
+            lines.append(f"  Incidents: {incidents}x")
+
         return "\n".join(lines)
 
     def _build_full(self, state: dict) -> str:
-        """Build full context: medium + lap trends, nearby cars, pit window, weather, damage."""
+        """Build full context: everything a race engineer needs."""
         lines = []
         session = state.get("session", {})
         player = state.get("player", {})
+        config = session.get("config", {})
 
         # === Session header ===
         track = session.get("track_name", "Unknown")
-        config = session.get("track_config", "")
-        track_str = f"{track} {config}".strip() if config else track
+        config_name = session.get("track_config", "")
+        track_str = f"{track} {config_name}".strip() if config_name else track
         laps_remain = session.get("laps_remain", "?")
         race_laps = session.get("race_laps", "?")
         total_laps = (
@@ -216,17 +287,88 @@ class ContextBuilder:
         )
         lines.append(f"Flags: {', '.join(flags)}")
 
+        # Track config
+        track_length = config.get("track_length_km", 0)
+        track_turns = config.get("track_num_turns", 0)
+        pit_speed = config.get("pit_speed_limit_kph", 0)
+        if track_length or track_turns:
+            track_info = []
+            if track_length:
+                track_info.append(f"{track_length:.1f}km")
+            if track_turns:
+                track_info.append(f"{track_turns} turns")
+            if pit_speed:
+                track_info.append(f"pit limit {pit_speed:.1f}kph")
+            lines.append(f"Track: {' | '.join(track_info)}")
+
+        # Session config
+        is_fixed = config.get("is_fixed_setup", False)
+        incident_limit = config.get("incident_limit", "")
+        fast_repairs = config.get("fast_repairs_limit", "")
+        fuel_max = config.get("fuel_max_litres", 0)
+        if is_fixed or incident_limit or fuel_max:
+            cfg_parts = []
+            if is_fixed:
+                cfg_parts.append("FIXED SETUP")
+            if incident_limit:
+                cfg_parts.append(f"incidents: {incident_limit}")
+            if fast_repairs:
+                cfg_parts.append(f"fast repairs: {fast_repairs}")
+            if fuel_max:
+                cfg_parts.append(f"tank: {fuel_max:.0f}L")
+            lines.append(f"Session: {' | '.join(cfg_parts)}")
+
         # Weather
         weather = session.get("weather", {})
         if weather:
             track_temp = weather.get("track_temp", 0)
             air_temp = weather.get("air_temp", 0)
-            wetness = weather.get("precipitation", 0)
-            wet_str = f", Wetness: {wetness:.0%}" if wetness > 0 else ""
-            if track_temp > 0 or air_temp > 0:
-                lines.append(
-                    f"Track: {format_temp(track_temp)}, Air: {format_temp(air_temp)}{wet_str}"
-                )
+            wetness = weather.get("track_wetness", 0)
+            declared_wet = weather.get("weather_declared_wet", False)
+            precipitation = weather.get("precipitation", 0)
+            wind_vel = weather.get("wind_vel", 0)
+
+            weather_parts = []
+            if track_temp > 0:
+                weather_parts.append(f"Track {format_temp(track_temp)}")
+            if air_temp > 0:
+                weather_parts.append(f"Air {format_temp(air_temp)}")
+            if wetness > 0:
+                weather_parts.append(f"wetness {wetness:.0%}")
+            if declared_wet:
+                weather_parts.append("DECLARED WET")
+            if precipitation > 0:
+                weather_parts.append(f"rain {precipitation:.0%}")
+            if wind_vel > 0.5:
+                weather_parts.append(f"wind {wind_vel:.1f}m/s")
+            if weather_parts:
+                lines.append(f"Weather: {' | '.join(weather_parts)}")
+
+        # === Engine health ===
+        oil_temp = player.get("oil_temp", 0)
+        oil_press = player.get("oil_press", 0)
+        water_temp = player.get("water_temp", 0)
+        voltage = player.get("voltage", 0)
+        engine_warnings = player.get("engine_warnings", 0)
+        manifold_press = player.get("manifold_press", 0)
+
+        engine_parts = []
+        if oil_temp > 0:
+            engine_parts.append(f"Oil {format_temp(oil_temp)}")
+        if oil_press > 0:
+            engine_parts.append(f"OilP {oil_press:.2f}bar")
+        if water_temp > 0:
+            engine_parts.append(f"Water {format_temp(water_temp)}")
+        if voltage > 0:
+            engine_parts.append(f"{voltage:.2f}V")
+        if manifold_press > 0 and manifold_press < 5:  # Only show if not default-ish
+            engine_parts.append(f"Manifold {manifold_press:.2f}bar")
+        if engine_parts:
+            lines.append(f"Engine: {' | '.join(engine_parts)}")
+
+        if engine_warnings:
+            warning_str = format_engine_warnings(engine_warnings)
+            lines.append(f"  ⚠ ENGINE WARNING: {warning_str}")
 
         # === Player car ===
         fuel_laps = player.get("fuel_laps_remaining", 0)
@@ -235,16 +377,32 @@ class ContextBuilder:
         fuel_rate = player.get("fuel_use_per_hour", 0)
 
         lines.append("\nYour car:")
+        on_track = player.get("is_on_track", True)
+        in_garage = player.get("is_in_garage", False)
+        status_parts = []
+        if not on_track:
+            status_parts.append("OFF TRACK")
+        if in_garage:
+            status_parts.append("IN GARAGE")
+        if status_parts:
+            lines.append(f"  Status: {' | '.join(status_parts)}")
+
         lines.append(f"  Position: P{pos} (Class P{class_pos})")
         lines.append(
-            f"  Fuel: {fuel_level:.1f}L ({format_pct(fuel_pct)}), ~{fuel_laps:.1f} laps remaining"
+            f"  Fuel: {fuel_level:.2f}L ({format_pct(fuel_pct)}), ~{fuel_laps:.2f} laps remaining"
         )
+        if fuel_max and fuel_level > 0:
+            lines.append(
+                f"  Tank capacity: {fuel_max:.1f}L ({fuel_level / fuel_max * 100:.0f}% full)"
+            )
         if fuel_rate > 0:
-            lines.append(f"  Fuel burn rate: {fuel_rate:.1f} L/hr")
+            lines.append(f"  Fuel burn rate: {fuel_rate:.2f} L/hr")
 
         # Tyres
         tyres = player.get("tyres", {})
+        tyre_odometers = player.get("tyre_odometers", {})
         if tyres:
+            lines.append("  Tyres:")
             for corner in ["LF", "RF", "LR", "RR"]:
                 ts = tyres.get(corner, {})
                 if not ts:
@@ -252,14 +410,17 @@ class ContextBuilder:
                 avg_temp = ts.get("temp_center", 0)
                 pressure = ts.get("cold_pressure", 0)
                 wear_center = ts.get("wear_center", 0)
+                odo = tyre_odometers.get(corner, 0)
                 parts = [f"{format_temp(avg_temp)}"]
                 if pressure > 0:
-                    parts.append(f"{pressure:.1f} PSI")
+                    parts.append(f"{pressure:.2f}PSI")
                 if wear_center > 0:
                     parts.append(f"wear {format_wear(wear_center)}")
-                lines.append(f"  {corner}: {' | '.join(parts)}")
+                if odo > 0:
+                    parts.append(f"{odo:.0f}km")
+                lines.append(f"    {corner}: {' | '.join(parts)}")
 
-        # Brakes
+        # Brakes + brake bias
         brake_pressures = player.get("brake_pressures", {})
         brake_temps = []
         for corner in ["LF", "RF", "LR", "RR"]:
@@ -268,12 +429,31 @@ class ContextBuilder:
                 brake_temps.append(f"{corner} {bp:.0f}")
         if brake_temps:
             lines.append(f"  Brakes: {' / '.join(brake_temps)}")
+        brake_bias = player.get("brake_bias", 0)
+        if brake_bias:
+            lines.append(f"  Brake bias: {brake_bias:.2f}%")
 
-        # Damage / incidents
+        # Damage / incidents / penalties
         incidents = player.get("incidents", 0)
         team_incidents = player.get("team_incidents", 0)
+        weight_penalty = player.get("weight_penalty", 0)
+        fast_repairs_used = player.get("fast_repairs_used", 0)
+        repair_time = player.get("pit_repair_time_left", 0)
+        opt_repair_time = player.get("pit_opt_repair_time_left", 0)
+
+        damage_parts = []
         if incidents > 0 or team_incidents > 0:
-            lines.append(f"  Incidents: {incidents} (team: {team_incidents})")
+            damage_parts.append(f"incidents {incidents}x (team {team_incidents}x)")
+        if weight_penalty > 0:
+            damage_parts.append(f"+{weight_penalty:.2f}kg damage weight")
+        if fast_repairs_used > 0:
+            damage_parts.append(f"{fast_repairs_used} fast repairs used")
+        if repair_time > 0:
+            damage_parts.append(f"{repair_time:.0f}s repair time needed")
+        if opt_repair_time > 0:
+            damage_parts.append(f"{opt_repair_time:.0f}s opt repair time")
+        if damage_parts:
+            lines.append(f"  Damage: {' | '.join(damage_parts)}")
 
         # Push-to-pass
         p2p_remaining = player.get("p2p_remaining", 0)
@@ -282,6 +462,36 @@ class ContextBuilder:
             lines.append(
                 f"  Push-to-pass: {p2p_remaining} remaining{' (ACTIVE)' if p2p_active else ''}"
             )
+
+        # Shift lights
+        shift_pct = player.get("shift_indicator_pct", 0)
+        shift_rpm = player.get("shift_rpm", 0)
+        if shift_rpm > 0 or shift_pct > 0:
+            shift_str = []
+            if shift_rpm > 0:
+                shift_str.append(f"shift at {shift_rpm:.0f}rpm")
+            if shift_pct > 0:
+                shift_str.append(f"{shift_pct:.0%} throttle")
+            lines.append(f"  Shift: {' | '.join(shift_str)}")
+
+        # Proximity
+        car_prox = player.get("car_left_right", 0)
+        dist_ahead = player.get("car_dist_ahead", 0)
+        dist_behind = player.get("car_dist_behind", 0)
+        tow_time = player.get("tow_time", 0)
+        prox_parts = []
+        if car_prox:
+            prox_str = format_car_proximity(car_prox)
+            if prox_str:
+                prox_parts.append(prox_str)
+        if dist_ahead > 0:
+            prox_parts.append(f"+{dist_ahead:.2f}s ahead")
+        if dist_behind > 0:
+            prox_parts.append(f"-{dist_behind:.2f}s behind")
+        if tow_time > 0:
+            prox_parts.append(f"tow {tow_time:.2f}s")
+        if prox_parts:
+            lines.append(f"  Proximity: {' | '.join(prox_parts)}")
 
         # Lap history
         lap_history = state.get("lap_history", [])

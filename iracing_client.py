@@ -170,10 +170,19 @@ class IRacingClient:
         return self._session_info_cache or {}
 
     def _refresh_session_info(self):
-        """Parse and cache session info from iRacing."""
+        """Parse and cache session info from iRacing.
+
+        Fetches individual YAML sections via ir[key] (which calls
+        _get_session_info internally). The sections we need are:
+        WeekendInfo, SessionInfo, DriverInfo.
+        """
         try:
-            info = self._ir.get_session_info_update_by_key()
-            self._session_info_cache = info if isinstance(info, dict) else {}
+            info: dict[str, Any] = {}
+            for key in ("WeekendInfo", "SessionInfo", "DriverInfo"):
+                section = self._ir[key]
+                if section:
+                    info[key] = section
+            self._session_info_cache = info
             self._session_info_tick = getattr(self._ir, "session_info_update", -1)
             self._parse_drivers()
         except Exception as e:
@@ -304,7 +313,8 @@ class IRacingClient:
         p2p_statuses = self.get_telemetry_value("CarIdxP2P_Status", [])
         p2p_counts = self.get_telemetry_value("CarIdxP2P_Count", [])
         tire_compounds = self.get_telemetry_value("CarIdxTireCompound", [])
-        incidents = self.get_telemetry_value("CarIdxClass", [])  # Fallback
+        # Per-car incident counts aren't available as a telemetry array,
+        # but we can use CurDriverIncidentCount from session info
 
         num_cars = len(positions) if isinstance(positions, (list, tuple)) else 0
 
@@ -348,13 +358,25 @@ class IRacingClient:
                         tire_compound=int(tire_compounds[i])
                         if i < len(tire_compounds)
                         else 0,
-                        incidents=int(incidents[i]) if i < len(incidents) else 0,
+                        incidents=self._get_driver_incident_count(i),
                     )
                 )
             except (IndexError, TypeError, ValueError):
                 continue
 
         return standings
+
+    def _get_driver_incident_count(self, car_idx: int) -> int:
+        """Look up incident count for a car from session info."""
+        for d in self._drivers:
+            if d.car_idx == car_idx:
+                # CurDriverIncidentCount is in the raw session info
+                raw = self._session_info_cache or {}
+                driver_info = raw.get("DriverInfo", {})
+                for driver in driver_info.get("Drivers", []):
+                    if int(driver.get("CarIdx", -1)) == car_idx:
+                        return int(driver.get("CurDriverIncidentCount", 0))
+        return 0
 
     def get_player_telemetry(self) -> dict[str, Any]:
         """Get telemetry values specific to the player's car.
@@ -379,15 +401,31 @@ class IRacingClient:
             "FuelLevel",
             "FuelLevelPct",
             "FuelUsePerHour",
+            # Engine health
+            "OilPress",
+            "OilTemp",
+            "OilLevel",
+            "WaterTemp",
+            "WaterLevel",
+            "FuelPress",
+            "EngineWarnings",
+            "ManifoldPress",
+            "Voltage",
             # Player position
             "PlayerCarIdx",
             "PlayerCarPosition",
             "PlayerCarClassPosition",
             "CarDistAhead",
             "CarDistBehind",
+            "CarLeftRight",
             "PlayerCarMyIncidentCount",
             "PlayerCarDriverIncidentCount",
             "PlayerCarTeamIncidentCount",
+            "PlayerCarTowTime",
+            # Car status
+            "IsOnTrack",
+            "IsInGarage",
+            "EnterExitReset",
             # Laps
             "Lap",
             "LapCompleted",
@@ -397,7 +435,9 @@ class IRacingClient:
             "LapBestLap",
             "LapLastLapTime",
             "LapDeltaToBestLap",
+            "LapDeltaToBestLap_OK",
             "LapDeltaToSessionBestLap",
+            "LapDeltaToOptimalLap",
             # Tyre temps (per corner, per zone)
             "LFtempCL",
             "LFtempCM",
@@ -429,8 +469,14 @@ class IRacingClient:
             "RRwearL",
             "RRwearM",
             "RRwearR",
+            # Tyre odometer (per corner)
+            "LFodometer",
+            "RFodometer",
+            "LRodometer",
+            "RRodometer",
             # Tyre compound and sets
             "PlayerTireCompound",
+            "PlayerCarDryTireSetLimit",
             "TireSetsAvailable",
             "TireSetsUsed",
             "FrontTireSetsAvailable",
@@ -448,8 +494,13 @@ class IRacingClient:
             "RRbrakeLinePress",
             "Brake",
             "BrakeABSactive",
-            # Damage
+            "dcBrakeBias",
+            # Damage and penalties
             "PlayerCarWeightPenalty",
+            "PlayerFastRepairsUsed",
+            "PitRepairLeft",
+            "PitOptRepairLeft",
+            "PlayerIncidents",
             # Pit
             "OnPitRoad",
             "PitstopActive",
@@ -469,6 +520,8 @@ class IRacingClient:
             "dpFuelAddKg",
             "dpFuelAutoFillActive",
             "dpFuelAutoFillEnabled",
+            "dpFastRepair",
+            "dpTireChange",
             "dpLFTireChange",
             "dpRFTireChange",
             "dpLRTireChange",
@@ -490,10 +543,23 @@ class IRacingClient:
             "P2P_Status",
             "P2P_Count",
             "PushToPass",
-            # Weather
+            # Shift lights
+            "ShiftIndicatorPct",
+            "PlayerCarSLShiftRPM",
+            "PlayerCarSLFirstRPM",
+            "PlayerCarSLLastRPM",
+            "PlayerCarSLBlinkRPM",
+            # G-forces
+            "LatAccel",
+            "LongAccel",
+            "VertAccel",
+            # Track conditions
             "TrackTemp",
             "TrackTempCrew",
             "TrackWetness",
+            "WeatherDeclaredWet",
+            "PlayerTrackSurface",
+            "PlayerTrackSurfaceMaterial",
             "AirTemp",
             "AirPressure",
             "AirDensity",
@@ -503,8 +569,6 @@ class IRacingClient:
             "Skies",
             "FogLevel",
             "RelativeHumidity",
-            # Proximity
-            "CarLeftRight",
         ]
 
         result: dict[str, Any] = {}
