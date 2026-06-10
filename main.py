@@ -33,6 +33,8 @@ from context_builder import ContextBuilder
 from llm_client import LLMClient
 from action_executor import ActionExecutor
 from capture import TelemetryCapture, TelemetryReplay, create_sample_data
+from stt_client import STTClient
+from tts_client import TTSClient
 
 # Configure logging
 logging.basicConfig(
@@ -97,6 +99,7 @@ def handle_button_press(
     llm: LLMClient,
     executor: ActionExecutor,
     question: str = "",
+    tts: TTSClient | None = None,
 ):
     """Handle a button press — build context, call LLM, process response.
 
@@ -158,6 +161,10 @@ def handle_button_press(
                 print(f"  {result}")
         print("=" * 60 + "\n")
 
+        # Speak the response if TTS is enabled
+        if tts is not None:
+            tts.speak_async(clean_text)
+
     finally:
         _llm_in_progress.clear()
 
@@ -170,8 +177,39 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
     llm = LLMClient(config)
     executor = ActionExecutor(iracing, config)
 
+    # Set up voice clients (graceful if not installed)
+    voice_config = config.get("voice", {})
+    tts = None
+    if voice_config.get("tts", {}).get("enabled", False):
+        try:
+            tts = TTSClient(config)
+            if tts.is_available:
+                logger.info("TTS enabled — LLM responses will be spoken aloud")
+            else:
+                logger.warning("TTS configured but piper-tts not installed — disabled")
+                tts = None
+        except Exception as e:
+            logger.warning(f"TTS setup failed: {e}")
+            tts = None
+
+    stt = None
+    if voice_config.get("stt", {}).get("enabled", False):
+        try:
+            stt = STTClient(config)
+            if stt.is_available:
+                logger.info("STT enabled — voice input available via push-to-talk")
+            else:
+                logger.warning(
+                    "STT configured but faster-whisper not installed — disabled"
+                )
+                stt = None
+        except Exception as e:
+            logger.warning(f"STT setup failed: {e}")
+            stt = None
+
     # Set up keyboard trigger
     trigger_key = config.get("trigger", {}).get("key", "f9")
+    voice_key = voice_config.get("trigger", {}).get("voice_key", "f10")
     try:
         import keyboard  # noqa: F401 — testing availability
 
@@ -212,10 +250,55 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
 
         kb.add_hotkey(
             trigger_key,
-            lambda: handle_button_press(state, context_builder, llm, executor),
+            lambda: handle_button_press(state, context_builder, llm, executor, tts=tts),
         )
         print(f"🎧 Listening for {trigger_key.upper()} key press...")
         print(f"   Press {trigger_key.upper()} to ask the race engineer a question.")
+        if stt is not None:
+            # Push-to-talk: record while key is held, transcribe on release
+            _ptt_recording = threading.Event()
+            _ptt_stop = threading.Event()
+
+            def _on_voice_key_down():
+                """Start recording when voice key is pressed."""
+                if _ptt_recording.is_set():
+                    return  # Already recording
+                _ptt_recording.set()
+                _ptt_stop.clear()
+
+                def _record_and_query():
+                    """Record, transcribe, and query LLM."""
+                    logger.info("Voice key pressed — recording...")
+                    text = stt.listen_push_to_talk(
+                        _ptt_stop,
+                        max_duration_s=voice_config.get("trigger", {}).get(
+                            "max_record_seconds", 15
+                        ),
+                    )
+                    _ptt_recording.clear()
+                    if text.strip():
+                        logger.info(f"Transcribed: {text}")
+                        handle_button_press(
+                            state,
+                            context_builder,
+                            llm,
+                            executor,
+                            question=text,
+                            tts=tts,
+                        )
+                    else:
+                        logger.warning("No speech detected — skipping LLM query")
+
+                threading.Thread(target=_record_and_query, daemon=True).start()
+
+            def _on_voice_key_up():
+                """Stop recording when voice key is released."""
+                _ptt_stop.set()
+
+            # Register press/release hooks for push-to-talk
+            kb.on_press_key(voice_key, lambda e: _on_voice_key_down())
+            kb.on_release_key(voice_key, lambda e: _on_voice_key_up())
+            print(f"   Hold {voice_key.upper()} to speak your question (push-to-talk).")
         print("   Press Ctrl+C to exit.\n")
 
     # Main poll loop
@@ -317,6 +400,17 @@ def run_replay_mode(
     executor = ActionExecutor(config=config)  # No iRacing client in replay mode
     state = RaceState(config)
 
+    # Set up TTS for replay mode
+    voice_config = config.get("voice", {})
+    tts = None
+    if voice_config.get("tts", {}).get("enabled", False):
+        try:
+            tts = TTSClient(config)
+            if not tts.is_available:
+                tts = None
+        except Exception:
+            tts = None
+
     print(f"\n🔄 Loading replay data from {replay_dir}...")
     replay = TelemetryReplay(replay_dir, loop=loop)
     count = replay.load()
@@ -385,6 +479,8 @@ def run_replay_mode(
             for r in results:
                 print(f"  {r}")
         print("=" * 60)
+        if tts is not None:
+            tts.speak_async(clean_text)
         return
 
     # Interactive mode — type questions, get answers
@@ -399,7 +495,18 @@ def run_replay_mode(
     print("Type 'state' to see current race state.")
     print("Type 'depth minimal/medium/full' to change context depth.")
     print("Type 'next' to advance to the next snapshot immediately.")
+    print("Type 'voice' to speak your question via microphone.")
     print("Type 'quit' or press Ctrl+C to exit.\n")
+
+    # Set up STT for voice input in replay mode
+    stt = None
+    if voice_config.get("stt", {}).get("enabled", False):
+        try:
+            stt = STTClient(config)
+            if not stt.is_available:
+                stt = None
+        except Exception:
+            stt = None
 
     # For timed replay, feed snapshots in a background thread
     replay_stop = threading.Event()
@@ -476,6 +583,38 @@ def run_replay_mode(
             print("👋 Bye!")
             break
 
+        if user_input.lower() == "voice":
+            # Voice input mode — record from microphone, transcribe, query LLM
+            if stt is None:
+                print(
+                    "  ❌ Voice input not available. Install voice deps: uv pip install -e '.[voice]'\n"
+                )
+                continue
+            print("  🎤 Recording... Press Enter to stop.")
+            stop_event = threading.Event()
+            result = [""]
+
+            def _record():
+                result[0] = stt.listen_push_to_talk(
+                    stop_event,
+                    max_duration_s=voice_config.get("trigger", {}).get(
+                        "max_record_seconds", 15
+                    ),
+                )
+
+            rec_thread = threading.Thread(target=_record)
+            rec_thread.start()
+            input()  # Wait for Enter to stop
+            stop_event.set()
+            rec_thread.join(timeout=5)
+
+            if result[0].strip():
+                print(f'  📝 Heard: "{result[0]}"')
+                user_input = result[0]
+            else:
+                print("  ❌ No speech detected.\n")
+                continue
+
         if user_input.lower() == "next":
             # Advance to the next snapshot immediately
             snapshot = replay.next_snapshot()
@@ -499,10 +638,6 @@ def run_replay_mode(
         if not user_input:
             # Empty input = general strategy query (like pressing F9 in live mode)
             user_input = "What's my current strategy?"
-
-        if user_input.lower() in ("quit", "exit", "q"):
-            print("👋 Bye!")
-            break
 
         if user_input.lower() == "state":
             # Print current state summary
@@ -582,6 +717,8 @@ def run_replay_mode(
                 for r in results:
                     print(f"  {r}")
             print("  " + "=" * 56 + "\n")
+            if tts is not None:
+                tts.speak_async(clean_text)
         else:
             print("  ❌ No response from LLM.\n")
 
@@ -659,6 +796,16 @@ def main():
         help="Ask a specific question (works with --replay or live mode)",
     )
     parser.add_argument(
+        "--voice",
+        action="store_true",
+        help="Enable voice input/output (overrides voice.stt.enabled / voice.tts.enabled in config)",
+    )
+    parser.add_argument(
+        "--no-voice",
+        action="store_true",
+        help="Disable voice input/output for this run",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable debug logging"
     )
 
@@ -677,6 +824,15 @@ def main():
     # Override context depth if specified
     if args.depth:
         config.setdefault("prompt", {})["context_depth"] = args.depth
+
+    # Override voice settings from CLI flags
+    if args.voice or args.no_voice:
+        config.setdefault("voice", {}).setdefault("stt", {})["enabled"] = (
+            args.voice and not args.no_voice
+        )
+        config.setdefault("voice", {}).setdefault("tts", {})["enabled"] = (
+            args.voice and not args.no_voice
+        )
 
     # Set API key from config if not in environment
     llm_config = config.get("llm", {})

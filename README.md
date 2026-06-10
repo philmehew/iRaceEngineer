@@ -216,9 +216,124 @@ The client captures 323+ telemetry variables from iRacing shared memory plus ses
 | Shift | ShiftIndicatorPct, PlayerCarSLShiftRPM | Shift lights |
 | G-forces | LatAccel, LongAccel, VertAccel | Driving analysis |
 
-## Configuration
+## Voice Input/Output
 
-Full `config.yaml` reference:
+iRaceEngineer supports push-to-talk voice input (Whisper) and spoken responses (Piper TTS). Both are optional — install the voice extras to enable them.
+
+### Install Voice Dependencies
+
+```bash
+uv sync --extra voice
+```
+
+This installs `faster-whisper`, `piper-tts`, and `sounddevice`. For GPU acceleration (optional):
+
+```bash
+# Whisper GPU (CUDA 12 + cuDNN 9)
+uv pip install nvidia-cublas-cu12 nvidia-cudnn-cu12==9.*
+
+# Piper GPU (onnxruntime with CUDA)
+uv pip install onnxruntime-gpu
+```
+
+### Download a Voice Model
+
+```bash
+# Download the default British male voice (race engineer vibe)
+python -m piper.download_voices en_GB-alan-medium --data-dir voices
+
+# Or download via the test script
+python test_tts.py --download en_GB-alan-medium
+```
+
+Voice models are stored in `voices/` (gitignored). Available voices: [piper-samples](https://rhasspy.github.io/piper-samples/)
+
+### Test TTS Standalone
+
+```bash
+# Speak text through your default audio device
+python test_tts.py "Box this lap, tyres are gone. Add sixty litres."
+
+# List available audio output devices
+python test_tts.py --list-devices
+
+# Play through a specific device (use index from --list-devices)
+python test_tts.py --device 5 "Hello"
+
+# Use a different voice model
+python test_tts.py --model en_US-lessac-medium "Hello"
+
+# Read text from a file
+python test_tts.py --file response.txt
+
+# Adjust volume
+python test_tts.py --volume 0.5 "Quiet please"
+```
+
+### Test STT Standalone
+
+```bash
+# Record for 5 seconds, transcribe, print
+python test_stt.py
+
+# List available audio input devices
+python test_stt.py --list-devices
+
+# Use a specific microphone (use index from --list-devices)
+python test_stt.py --device 1
+
+# Push-to-talk: press Enter to start, Enter again to stop
+python test_stt.py --push-to-talk
+
+# Change Whisper model size
+python test_stt.py --model tiny     # fastest, least accurate
+python test_stt.py --model medium  # better accuracy, slower
+
+# Record for longer
+python test_stt.py --duration 10
+```
+
+### Voice in Live Mode
+
+In live mode, two keyboard keys are available:
+
+- **F9** — Text trigger (no question, general strategy query)
+- **F10** — Push-to-talk voice input (hold to speak, release to transcribe)
+
+Hold F10, speak your question, release F10. Your speech is transcribed by Whisper and sent to the LLM. The response is both printed and spoken aloud through Piper TTS.
+
+### Voice in Replay Mode
+
+In interactive replay mode:
+
+- Type **`voice`** to enter voice input mode — records from your microphone, transcribes, and sends to LLM
+- LLM responses are spoken aloud via TTS (when enabled)
+
+### CLI Flags
+
+```bash
+# Force-enable voice for this run (overrides config)
+python main.py --voice
+
+# Force-disable voice for this run
+python main.py --no-voice
+```
+
+### Audio Device Selection
+
+To route TTS output to a specific device (e.g. a headset or virtual audio cable), set the device index in `config.yaml`:
+
+```yaml
+voice:
+  tts:
+    output_device: 5  # Index from python test_tts.py --list-devices
+  stt:
+    input_device: 1   # Index from python test_stt.py --list-devices
+```
+
+Set to `null` (or omit) to use the system default.
+
+## Configuration
 
 ```yaml
 # iRacing connection
@@ -246,6 +361,29 @@ actions:
 trigger:
   method: "keyboard"    # "keyboard" or "wheel_button" (future)
   key: "f9"
+
+# Voice input/output (optional: uv sync --extra voice)
+voice:
+  stt:
+    enabled: true
+    model: "small"                    # Whisper model size
+    device: "cuda"                     # cuda or cpu
+    compute_type: "float16"
+    input_device: null                # null = system default
+    vad_filter: true
+    language: "en"
+  tts:
+    enabled: true
+    model: "en_GB-alan-medium"         # Piper voice model
+    voice_dir: "voices"
+    use_cuda: true
+    output_device: null               # null = system default
+    volume: 1.0
+    sentence_silence: 0.2
+  trigger:
+    voice_key: "f10"
+    push_to_talk: true
+    max_record_seconds: 15
 
 # Prompt configuration
 prompt:
@@ -345,6 +483,7 @@ Enters interactive mode where you can type questions and press Enter. The prompt
 Interactive commands:
 - Type a question and press Enter to query the race engineer
 - Press Enter with no input for a general strategy query
+- `voice` — speak your question via microphone (requires voice extras)
 - `state` — show current race state summary
 - `depth minimal/medium/full` — change context depth
 - `next` — advance to the next snapshot immediately
@@ -396,13 +535,17 @@ Same as `--capture` but always saves to the `tests/sample_data/` folder (from co
 
 | Module | Purpose |
 |--------|---------|
-| `main.py` | Entry point — CLI args, poll loop, keyboard trigger, interactive replay |
+| `main.py` | Entry point — CLI args, poll loop, keyboard trigger, interactive replay, voice |
 | `iracing_client.py` | pyirsdk wrapper — telemetry, session info, pit commands |
 | `race_state.py` | In-memory model — positions, gaps, fuel, tyres, engine health, lap trends |
 | `context_builder.py` | Condenses state → LLM prompt (3 depth levels, format helpers) |
 | `llm_client.py` | OpenAI-compatible API caller (works with any `/v1` endpoint) |
 | `action_executor.py` | Parses `[ACTION]` directives from LLM responses |
+| `stt_client.py` | Speech-to-text — Whisper (faster-whisper) + mic capture (sounddevice) |
+| `tts_client.py` | Text-to-speech — Piper TTS + audio playback (sounddevice) |
 | `capture.py` | Record/replay telemetry JSON for testing |
+| `test_stt.py` | Standalone STT test — record + transcribe without iRacing |
+| `test_tts.py` | Standalone TTS test — speak text without iRacing |
 | `tests/eval_llm_responses.py` | Batch LLM evaluation — asks 50 questions against replay data, logs results |
 
 ## Roadmap
@@ -411,8 +554,8 @@ This is the first working slice of the iRaceEngineer spotter system. Planned nex
 
 - [ ] **SQLite persistence** — store per-lap data for historical queries
 - [ ] **Pre-recorded audio** — spotter calls for flags, proximity, clearance
-- [ ] **TTS output** — Edge TTS (primary) + Piper (offline fallback) for variable content
-- [ ] **Mic input / STT** — faster-whisper for keyword detection and driver questions
+- [x] **TTS output** — Piper TTS for spoken LLM responses (local, offline)
+- [x] **Mic input / STT** — faster-whisper for push-to-talk voice questions
 - [ ] **Multi-driver audio** — name-prefixed calls for 7 drivers
 - [ ] **Spotter proximity logic** — deterministic 30Hz calls for safety-critical alerts
 - [ ] **Action execution** — enable real `[ACTION]` commands to iRacing

@@ -56,6 +56,31 @@ trigger:
   method: "keyboard"         # "keyboard" for now; "wheel_button" later via pygame
   key: "f9"                  # Keyboard key to trigger LLM call
 
+# Voice input/output (requires: uv pip install -e ".[voice]")
+voice:
+  stt:
+    enabled: true
+    model: "small"                    # Whisper model: tiny, small, medium, large-v3, turbo, distil-large-v3
+    device: "cuda"                     # cuda or cpu
+    compute_type: "float16"           # float16 (GPU), int8 (CPU/GPU), int8_float16
+    input_device: null                # null = system default, or device name/index
+    vad_filter: true                  # Use Silero VAD to trim silence from recordings
+    language: "en"                     # Language hint for Whisper
+
+  tts:
+    enabled: true
+    model: "en_GB-alan-medium"         # Piper voice model name
+    voice_dir: "voices"               # Where voice .onnx files are stored
+    use_cuda: true                    # GPU acceleration for Piper (requires onnxruntime-gpu)
+    output_device: null               # null = system default, or device name/index
+    volume: 1.0                        # Volume multiplier
+    sentence_silence: 0.2             # Seconds of silence between sentences
+
+  trigger:
+    voice_key: "f10"                  # Key for voice input (hold to speak, release to transcribe)
+    push_to_talk: true                # true = hold key to record, release to stop (like radio PTT)
+    max_record_seconds: 15           # Safety: auto-stop recording after this
+
 # Prompt configuration
 prompt:
   system: |

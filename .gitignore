@@ -25,3 +25,6 @@ Thumbs.db
 
 # LLM query logs
 logs/
+
+# Piper voice models (large .onnx files)
+voices/
