@@ -26,6 +26,7 @@ class STTClient:
         device:         Inference device (cuda or cpu)
         compute_type:   Quantization (float16, int8, int8_float16)
         input_device:   Audio input device (null = system default, or name/index)
+        input_gain:     Mic input gain multiplier (1.0 = no boost, 2.0 = 2x louder)
         vad_filter:     Use Silero VAD to trim silence from recordings
         language:       Language hint for transcription (e.g. "en")
     """
@@ -36,6 +37,7 @@ class STTClient:
         self.device = stt_config.get("device", "cuda")
         self.compute_type = stt_config.get("compute_type", "float16")
         self._input_device = stt_config.get("input_device", None)
+        self.input_gain = stt_config.get("input_gain", 1.0)
         self.vad_filter = stt_config.get("vad_filter", True)
         self.language = stt_config.get("language", "en")
         self._model = None
@@ -156,7 +158,13 @@ class STTClient:
         sd.wait()
         logger.info("Recording complete")
 
-        return audio.flatten()
+        audio = audio.flatten()
+
+        # Apply input gain
+        if self.input_gain != 1.0:
+            audio = audio * self.input_gain
+
+        return audio
 
     def record_until_release(
         self,
@@ -208,6 +216,11 @@ class STTClient:
                     logger.debug("Audio buffer overflow — some audio may be choppy")
 
         audio = np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
+
+        # Apply input gain
+        if self.input_gain != 1.0:
+            audio = audio * self.input_gain
+
         duration = len(audio) / samplerate
         logger.info(f"Recording complete: {duration:.1f}s, {len(audio)} samples")
 

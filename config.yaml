@@ -64,6 +64,7 @@ voice:
     device: "cuda"                    # cuda or cpu
     compute_type: "float16"          # float16 (GPU), int8 (CPU/GPU), int8_float16
     input_device: null                # null = system default, or device name/index
+    input_gain: 1.0                   # Mic input gain multiplier (1.0 = no boost, 2.0 = 2x louder)
     vad_filter: true                  # Use Silero VAD to trim silence from recordings
     language: "en"                     # Language hint for Whisper
 

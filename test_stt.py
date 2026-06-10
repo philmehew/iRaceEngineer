@@ -63,6 +63,7 @@ def test_fixed_duration(
     device: int | None = None,
     language: str = "en",
     vad: bool = True,
+    gain: float = 1.0,
 ):
     """Record for a fixed duration and transcribe."""
     config = {
@@ -72,6 +73,7 @@ def test_fixed_duration(
                 "device": "cpu",
                 "compute_type": "int8",
                 "input_device": device,
+                "input_gain": gain,
                 "vad_filter": vad,
                 "language": language,
             }
@@ -104,6 +106,7 @@ def test_push_to_talk(
     language: str = "en",
     vad: bool = True,
     max_duration: float = 15.0,
+    gain: float = 1.0,
 ):
     """Push-to-talk: press Enter to start recording, press Enter again to stop."""
     config = {
@@ -113,6 +116,7 @@ def test_push_to_talk(
                 "device": "cpu",
                 "compute_type": "int8",
                 "input_device": device,
+                "input_gain": gain,
                 "vad_filter": vad,
                 "language": language,
             }
@@ -194,6 +198,12 @@ def main():
         help="Language hint for transcription (default: en)",
     )
     parser.add_argument(
+        "--gain",
+        type=float,
+        default=1.0,
+        help="Mic input gain multiplier (default: 1.0, try 2.0 for quiet mics)",
+    )
+    parser.add_argument(
         "--max-duration",
         type=float,
         default=15.0,
@@ -213,6 +223,7 @@ def main():
             language=args.language,
             vad=not args.no_vad,
             max_duration=args.max_duration,
+            gain=args.gain,
         )
     else:
         test_fixed_duration(
@@ -221,6 +232,7 @@ def main():
             device=args.device,
             language=args.language,
             vad=not args.no_vad,
+            gain=args.gain,
         )
 
 

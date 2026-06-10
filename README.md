@@ -306,6 +306,9 @@ python test_stt.py --push-to-talk
 python test_stt.py --model tiny     # fastest, least accurate
 python test_stt.py --model medium  # better accuracy, slower
 
+# Boost mic input (useful for quiet microphones)
+python test_stt.py --gain 2.0 --push-to-talk
+
 # Record for longer
 python test_stt.py --duration 10
 ```
@@ -377,17 +380,68 @@ python main.py --no-voice
 
 ### Audio Device Selection
 
-To route TTS output to a specific device (e.g. a headset or virtual audio cable), set the device index in `config.yaml`:
+To route TTS output to a specific device (e.g. a headset or virtual audio cable), set the device index or name in `config.yaml`:
 
 ```yaml
 voice:
   tts:
-    output_device: 5  # Index from python test_tts.py --list-devices
+    output_device: 5               # Numeric index or device name string
   stt:
-    input_device: 1   # Index from python test_stt.py --list-devices
+    input_device: 1                # Numeric index or device name string
+```
+
+Find device indices with:
+```bash
+python test_tts.py --list-devices   # Output devices (for TTS + spotter)
+python test_stt.py --list-devices   # Input devices (for STT mic)
 ```
 
 Set to `null` (or omit) to use the system default.
+
+### Volume & Mic Gain
+
+All audio levels are configurable via multipliers in `config.yaml`:
+
+```yaml
+voice:
+  stt:
+    input_gain: 1.0    # Mic input gain (1.0 = no boost, try 1.5–2.0 for quiet mics)
+  tts:
+    volume: 1.0        # TTS output volume (1.0 = normal, 0.5 = half, 2.0 = double)
+spotter:
+  volume: 1.0          # Spotter call volume (1.0 = normal, independent of TTS)
+```
+
+- **`input_gain`** — multiplies mic audio before sending to Whisper. Useful if your mic is quiet and transcription is poor. Try `1.5` or `2.0`.
+- **`volume`** (TTS) — multiplies LLM spoken responses. Set to `0.5` to make them quieter, `2.0` for louder.
+- **`volume`** (Spotter) — same multiplier for car proximity calls. Independent of TTS volume.
+
+### Preventing Discord Pick-up (Virtual Audio Cable)
+
+If you use Discord voice chat while racing, teammates will hear the race engineer's audio through your mic. Turning the volume down helps but doesn't fully fix it — Discord's noise suppression is designed for steady background noise, not intermittent speech.
+
+The solution is to route race engineer audio through a **virtual audio cable** so you hear it but Discord doesn't pick it up:
+
+1. **Install VB-Audio Virtual Cable** (free): [vb-audio.com/Cable](https://vb-audio.com/Cable/)
+
+2. **Configure iRaceEngineer** to send TTS and spotter audio to the virtual cable:
+   ```yaml
+   voice:
+     tts:
+       output_device: "CABLE Input"     # Virtual cable output
+   spotter:
+     output_device: "CABLE Input"       # Same device for spotter calls
+   ```
+   Use the exact device name string, or the numeric index from `python test_tts.py --list-devices`.
+
+3. **Route the virtual cable to your headset** so you can still hear it:
+   - Windows Sound settings → Recording tab → right-click "CABLE Output" → Properties
+   - Listen tab → check "Listen to this device" → select your real headset/headphones
+   - This plays the virtual cable's audio through your headset — you hear it, Discord's mic doesn't
+
+4. **Keep Discord's input device** as your real microphone (not the virtual cable)
+
+Result: you hear the race engineer and spotter through your headset, but Discord only transmits your voice — not the race engineer.
 
 ## Spotter (Car Proximity Audio)
 
@@ -460,6 +514,7 @@ voice:
     device: "cuda"                     # cuda or cpu
     compute_type: "float16"
     input_device: null                # null = system default
+    input_gain: 1.0                   # Mic input gain multiplier (1.0 = no boost, 2.0 = 2x louder)
     vad_filter: true
     language: "en"
   tts:
