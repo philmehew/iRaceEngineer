@@ -68,10 +68,18 @@ class ProximityDetector:
         cooldowns = spotter_config.get("cooldowns", {})
         self._proximity_cooldown = cooldowns.get("proximity_ms", 3000) / 1000.0
         self._clearance_cooldown = cooldowns.get("clearance_ms", 5000) / 1000.0
+        self._clear_delay = cooldowns.get("clear_delay_ms", 500) / 1000.0
 
         self._prev_left = False
         self._prev_right = False
         self._last_call_time: dict[str, float] = {}
+
+        # Pending clear tracking — debounce to avoid false "clear" calls
+        # from telemetry flicker (car momentarily reads as gone).
+        # Set to the monotonic time when the side first became clear;
+        # None means the side is occupied or no pending clear.
+        self._pending_clear_since_left: float | None = None
+        self._pending_clear_since_right: float | None = None
 
     def update(self, car_left_right: int, current_time: float) -> list[SpotterCall]:
         """Process a CarLeftRight value and return any calls to play.
@@ -88,11 +96,55 @@ class ProximityDetector:
 
         calls: list[SpotterCall] = []
 
-        # Detect transitions
+        # --- Debounced clear detection ---
+        # Instead of firing "clear" the instant telemetry reads the car as gone,
+        # we require the car to be gone for clear_delay seconds. This prevents
+        # false "clear" calls from telemetry flicker (1-2 frames of 0 when the
+        # car is actually still alongside).
+
+        if cur_left:
+            # Car is present on left — cancel any pending clear
+            self._pending_clear_since_left = None
+        elif self._prev_left:
+            # Car just disappeared from left — start pending clear timer
+            self._pending_clear_since_left = current_time
+
+        if cur_right:
+            # Car is present on right — cancel any pending clear
+            self._pending_clear_since_right = None
+        elif self._prev_right:
+            # Car just disappeared from right — start pending clear timer
+            self._pending_clear_since_right = current_time
+
+        # Check if any pending clears have matured past the delay threshold
+        left_clear_matured = (
+            self._pending_clear_since_left is not None
+            and (current_time - self._pending_clear_since_left) >= self._clear_delay
+        )
+        right_clear_matured = (
+            self._pending_clear_since_right is not None
+            and (current_time - self._pending_clear_since_right) >= self._clear_delay
+        )
+
+        # --- Appearance detection ---
+        # Detect transitions. A side "appears" if it was NOT present last tick
+        # AND there is no pending clear for that side (meaning the car truly
+        # left and came back, not just a flicker).
         left_appeared = cur_left and not self._prev_left
         right_appeared = cur_right and not self._prev_right
-        left_cleared = self._prev_left and not cur_left
-        right_cleared = self._prev_right and not cur_right
+
+        # If a car reappears while a clear was pending (flicker, not a real
+        # departure), cancel the pending clear and suppress the re-appearance
+        # call — the car never actually left.
+        if cur_left and self._pending_clear_since_left is not None:
+            # Car came back before "clear" was announced — it was a flicker.
+            # Cancel the pending clear and treat this as if the car never left.
+            self._pending_clear_since_left = None
+            left_appeared = False  # Don't announce re-appearance for a flicker
+
+        if cur_right and self._pending_clear_since_right is not None:
+            self._pending_clear_since_right = None
+            right_appeared = False
 
         # Appearance calls
         if left_appeared or right_appeared:
@@ -140,8 +192,8 @@ class ProximityDetector:
                         )
                         self._last_call_time["car_right"] = current_time
 
-        # Clearance calls — any side that was alongside and is now clear
-        if left_cleared or right_cleared:
+        # Clearance calls — only after the clear delay has elapsed
+        if left_clear_matured or right_clear_matured:
             if self._cooldown_elapsed("clear", current_time):
                 calls.append(
                     SpotterCall(
@@ -151,6 +203,11 @@ class ProximityDetector:
                     )
                 )
                 self._last_call_time["clear"] = current_time
+            # Clear the pending timers regardless — we only fire once
+            if left_clear_matured:
+                self._pending_clear_since_left = None
+            if right_clear_matured:
+                self._pending_clear_since_right = None
 
         # Update previous state
         self._prev_left = cur_left
@@ -180,6 +237,8 @@ class ProximityDetector:
         self._prev_left = False
         self._prev_right = False
         self._last_call_time.clear()
+        self._pending_clear_since_left = None
+        self._pending_clear_since_right = None
 
 
 class SpotterAudioPlayer:

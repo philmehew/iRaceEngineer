@@ -69,8 +69,8 @@ def test_fixed_duration(
         "voice": {
             "stt": {
                 "model": model,
-                "device": "cuda",
-                "compute_type": "float16",
+                "device": "cpu",
+                "compute_type": "int8",
                 "input_device": device,
                 "vad_filter": vad,
                 "language": language,
@@ -110,8 +110,8 @@ def test_push_to_talk(
         "voice": {
             "stt": {
                 "model": model,
-                "device": "cuda",
-                "compute_type": "float16",
+                "device": "cpu",
+                "compute_type": "int8",
                 "input_device": device,
                 "vad_filter": vad,
                 "language": language,

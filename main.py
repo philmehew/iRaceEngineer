@@ -37,6 +37,175 @@ from stt_client import STTClient
 from tts_client import TTSClient
 from spotter import Spotter
 
+
+class WheelButtonListener:
+    """Listen for joystick/wheel button presses using pygame.
+
+    Runs a background thread that polls pygame events and calls
+    on_press/on_release callbacks when the target button is triggered.
+
+    This is used for push-to-talk on a steering wheel — hold the button
+    to record, release to transcribe.
+
+    Config keys (under voice.trigger):
+        device_index: Joystick device index (use test_wheel.py to find)
+        button_index: Button index on the device
+    """
+
+    def __init__(
+        self,
+        device_index: int,
+        button_index: int,
+        on_press=None,
+        on_release=None,
+    ):
+        self.device_index = device_index
+        self.button_index = button_index
+        self.on_press = on_press
+        self.on_release = on_release
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._joystick = None
+        self._pygame_initialized = False
+
+    def start(self):
+        """Start listening for button events in a background thread."""
+        if self._running:
+            return
+
+        try:
+            import importlib.util
+
+            if not importlib.util.find_spec("pygame"):
+                raise ImportError
+        except (ImportError, ModuleNotFoundError):
+            logger.error("pygame not installed. Install with: uv sync --extra wheel")
+            return
+
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Stop listening and clean up pygame."""
+        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
+        if self._pygame_initialized:
+            try:
+                import pygame
+
+                if self._joystick is not None:
+                    self._joystick.quit()
+                pygame.joystick.quit()
+                pygame.quit()
+            except Exception:
+                pass
+            self._pygame_initialized = False
+
+    def _run(self):
+        """Background thread: init pygame, open joystick, poll button state.
+
+        Uses direct get_button() polling to detect press/release edges.
+        This approach is more reliable than pygame's event system because:
+        - It works in background threads on Windows
+        - It doesn't require a display window
+        - It doesn't depend on the Windows message pump
+
+        Falls back to event-based detection if polling reports stale state
+        (all buttons permanently pressed), which can happen if the event pump
+        isn't running.
+        """
+        try:
+            import pygame
+        except ImportError:
+            logger.error("pygame not installed — cannot use wheel button trigger")
+            self._running = False
+            return
+
+        pygame.init()
+        pygame.joystick.init()
+        self._pygame_initialized = True
+
+        count = pygame.joystick.get_count()
+        logger.info(f"Wheel button listener: pygame init, {count} joystick(s) found")
+
+        if self.device_index >= count:
+            logger.error(
+                f"Joystick device index {self.device_index} not found "
+                f"(only {count} device(s) available). "
+                f"Run test_wheel.py --list to see devices."
+            )
+            self._running = False
+            pygame.quit()
+            self._pygame_initialized = False
+            return
+
+        self._joystick = pygame.joystick.Joystick(self.device_index)
+        self._joystick.init()
+        js_name = self._joystick.get_name()
+        js_buttons = self._joystick.get_numbuttons()
+        logger.info(
+            f"Wheel button listener: device {self.device_index} "
+            f"({js_name}), button {self.button_index} of {js_buttons}"
+        )
+
+        # Track button state to detect press/release edges
+        was_pressed = False
+        last_log_time = 0
+
+        try:
+            while self._running:
+                # Pump pygame events so joystick state stays fresh.
+                # Even though we read state via get_button(), the internal
+                # joystick state only updates when the event pump runs.
+                pygame.event.pump()
+
+                try:
+                    is_pressed = bool(self._joystick.get_button(self.button_index))
+                except Exception:
+                    # Joystick may have disconnected — try to reconnect next tick
+                    time.sleep(1 / 30)
+                    continue
+
+                if is_pressed and not was_pressed:
+                    was_pressed = True
+                    logger.info(
+                        f"Wheel button {self.button_index} pressed "
+                        f"(device {self.device_index}: {js_name})"
+                    )
+                    if self.on_press:
+                        self.on_press()
+                elif not is_pressed and was_pressed:
+                    was_pressed = False
+                    logger.info(
+                        f"Wheel button {self.button_index} released "
+                        f"(device {self.device_index}: {js_name})"
+                    )
+                    if self.on_release:
+                        self.on_release()
+
+                # Periodic alive log (every 30s) to confirm thread is running
+                now = time.monotonic()
+                if now - last_log_time > 30:
+                    last_log_time = now
+                    logger.debug(
+                        f"Wheel button listener alive: device {self.device_index}, "
+                        f"button {self.button_index}, state={'pressed' if was_pressed else 'released'}"
+                    )
+
+                time.sleep(1 / 30)  # ~30Hz polling
+
+        except Exception as e:
+            logger.error(f"Wheel button listener error: {e}")
+        finally:
+            if self._joystick is not None:
+                self._joystick.quit()
+            pygame.joystick.quit()
+            pygame.quit()
+            self._pygame_initialized = False
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -224,7 +393,9 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
 
     # Set up keyboard trigger
     trigger_key = config.get("trigger", {}).get("key", "f9")
-    voice_key = voice_config.get("trigger", {}).get("voice_key", "f10")
+    voice_trigger_config = voice_config.get("trigger", {})
+    voice_trigger_method = voice_trigger_config.get("method", "keyboard")
+    voice_key = voice_trigger_config.get("voice_key", "f10")
     try:
         import keyboard  # noqa: F401 — testing availability
 
@@ -259,17 +430,22 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
         f"👥 Team detected: {len(team_indices)} cars — {', '.join(driver_names.get(i, f'Car #{i}') for i in team_indices)}\n"
     )
 
-    # Register keyboard hook
+    # Register triggers (keyboard for LLM query, keyboard or wheel for voice PTT)
+    wheel_listener = None
+
     if keyboard_available:
         import keyboard as kb
 
+        # F9 (or configured key) — LLM query trigger (always keyboard)
         kb.add_hotkey(
             trigger_key,
             lambda: handle_button_press(state, context_builder, llm, executor, tts=tts),
         )
         print(f"🎧 Listening for {trigger_key.upper()} key press...")
         print(f"   Press {trigger_key.upper()} to ask the race engineer a question.")
-        if stt is not None:
+
+        # Voice PTT — keyboard method
+        if stt is not None and voice_trigger_method == "keyboard":
             # Push-to-talk: record while key is held, transcribe on release
             _ptt_recording = threading.Event()
             _ptt_stop = threading.Event()
@@ -286,7 +462,7 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                     logger.info("Voice key pressed — recording...")
                     text = stt.listen_push_to_talk(
                         _ptt_stop,
-                        max_duration_s=voice_config.get("trigger", {}).get(
+                        max_duration_s=voice_trigger_config.get(
                             "max_record_seconds", 15
                         ),
                     )
@@ -314,9 +490,74 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
             kb.on_press_key(voice_key, lambda e: _on_voice_key_down())
             kb.on_release_key(voice_key, lambda e: _on_voice_key_up())
             print(f"   Hold {voice_key.upper()} to speak your question (push-to-talk).")
-        print("   Press Ctrl+C to exit.\n")
 
-    # Main poll loop
+    # Voice PTT — wheel button method
+    if stt is not None and voice_trigger_method == "wheel_button":
+        device_index = voice_trigger_config.get("device_index")
+        button_index = voice_trigger_config.get("button_index")
+        if device_index is None or button_index is None:
+            logger.error(
+                "Wheel button trigger configured but device_index or button_index "
+                "not set. Run test_wheel.py to discover your wheel button."
+            )
+            print(
+                "   ⚠️  Wheel button trigger misconfigured — missing device_index/button_index."
+            )
+            print("   Run: python test_wheel.py to discover button indices.")
+        else:
+            # Push-to-talk: record while button is held, transcribe on release
+            _ptt_recording = threading.Event()
+            _ptt_stop = threading.Event()
+
+            def _on_voice_button_down():
+                """Start recording when wheel button is pressed."""
+                if _ptt_recording.is_set():
+                    return  # Already recording
+                _ptt_recording.set()
+                _ptt_stop.clear()
+
+                def _record_and_query():
+                    """Record, transcribe, and query LLM."""
+                    logger.info("Wheel button pressed — recording...")
+                    text = stt.listen_push_to_talk(
+                        _ptt_stop,
+                        max_duration_s=voice_trigger_config.get(
+                            "max_record_seconds", 15
+                        ),
+                    )
+                    _ptt_recording.clear()
+                    if text.strip():
+                        logger.info(f"Transcribed: {text}")
+                        handle_button_press(
+                            state,
+                            context_builder,
+                            llm,
+                            executor,
+                            question=text,
+                            tts=tts,
+                        )
+                    else:
+                        logger.warning("No speech detected — skipping LLM query")
+
+                threading.Thread(target=_record_and_query, daemon=True).start()
+
+            def _on_voice_button_up():
+                """Stop recording when wheel button is released."""
+                _ptt_stop.set()
+
+            wheel_listener = WheelButtonListener(
+                device_index=device_index,
+                button_index=button_index,
+                on_press=_on_voice_button_down,
+                on_release=_on_voice_button_up,
+            )
+            wheel_listener.start()
+            print(
+                f"   Hold wheel button {button_index} (device {device_index}) "
+                f"to speak your question (push-to-talk)."
+            )
+
+    print("   Press Ctrl+C to exit.\n")
     tick_interval = 1.0 / tick_rate_hz
     try:
         while True:
@@ -351,6 +592,8 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
 
     except KeyboardInterrupt:
         print("\n\n👋 Shutting down...")
+        if wheel_listener is not None:
+            wheel_listener.stop()
         if keyboard_available:
             kb.unhook_all()
         iracing.shutdown()

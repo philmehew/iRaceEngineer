@@ -11,7 +11,7 @@ iRacing (shared memory) → iracing_client.py → race_state.py → context_buil
                                                  (local audio)                    ↓
                                                                         tts_client.py (Piper TTS → speakers)
 
-F10 key (hold) → stt_client.py (mic → Whisper) → transcribed text → context_builder → LLM
+F10 key or wheel button (hold) → stt_client.py (mic → Whisper) → transcribed text → context_builder → LLM
 ```
 
 - **iracing_client.py** — pyirsdk wrapper, reads 327 telemetry variables + session info, exposes pit commands
@@ -23,7 +23,7 @@ F10 key (hold) → stt_client.py (mic → Whisper) → transcribed text → cont
 - **stt_client.py** — speech-to-text via faster-whisper + sounddevice mic capture, push-to-talk
 - **tts_client.py** — text-to-speech via Piper TTS + sounddevice playback, configurable output device
 - **capture.py** — record/replay telemetry JSON for testing without iRacing
-- **main.py** — entry point with CLI: live, --capture, --replay, --generate-samples, --voice
+- **main.py** — entry point with CLI: live, --capture, --replay, --generate-samples, --voice; includes WheelButtonListener for steering wheel PTT
 
 ## Key Design Decisions
 
@@ -33,6 +33,7 @@ F10 key (hold) → stt_client.py (mic → Whisper) → transcribed text → cont
 - **Action directives** — LLM can include `[ACTION] pit_this_lap`, `[ACTION] add_fuel: 60` etc. v1 logs but doesn't execute
 - **Testable without iRacing** — `--generate-samples` creates fake data, `--replay <dir>` feeds it through the pipeline
 - **Voice is optional** — voice deps in `[voice]` extra (`uv sync --extra voice`), graceful degradation if not installed
+- **Wheel button is optional** — pygame in `[wheel]` extra (`uv sync --extra wheel`), for push-to-talk via steering wheel button instead of keyboard F10
 - **Voice tested independently** — `test_stt.py` and `test_tts.py` are standalone scripts for testing each component
 - **Spotter is local and deterministic** — reads CarLeftRight telemetry at 30Hz, plays pre-recorded WAV files on transitions (car appears/clears alongside). No LLM involved. Edge-detection with cooldown timers prevents repeated calls. Uses sounddevice.OutputStream (not sd.play) to avoid conflicting with TTS.
 
@@ -43,6 +44,7 @@ F10 key (hold) → stt_client.py (mic → Whisper) → transcribed text → cont
 - openai (2.x) — LLM API client
 - pyyaml — config
 - keyboard — F9/F10 trigger (needs admin on Windows)
+- pygame (2.6+) — steering wheel button trigger for push-to-talk (optional `[wheel]` extra)
 - faster-whisper (1.2+) — local speech-to-text via Whisper (optional `[voice]` extra)
 - piper-tts (1.4+) — local text-to-speech (optional `[voice]` extra)
 - sounddevice — mic capture + audio playback (optional `[voice]` extra)
@@ -61,6 +63,8 @@ python main.py --voice                  # Force-enable voice input/output
 python main.py --no-voice               # Force-disable voice input/output
 python test_tts.py "Box this lap"       # Test TTS standalone
 python test_stt.py --push-to-talk       # Test STT standalone
+python test_wheel.py                    # Discover wheel button device/index for push-to-talk
+python test_wheel.py --list             # List connected controllers
 ```
 
 ## Current LLM Config
@@ -82,6 +86,7 @@ Located in `tests/sample_data/` — 10 snapshots simulating a Spa 24h race stint
 ## File Locations
 
 - Config: `config.yaml`
+- Wheel button test: `test_wheel.py`
 - Spotter audio: `audio/` (carleft.wav, carright.wav, carthreewide.wav, carclear.wav)
 - Sample data: `tests/sample_data/session_*`
 - Tests: `tests/test_modules.py`, `tests/test_spotter.py`

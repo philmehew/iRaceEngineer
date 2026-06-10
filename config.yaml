@@ -61,15 +61,15 @@ voice:
   stt:
     enabled: true
     model: "small"                    # Whisper model: tiny, small, medium, large-v3, turbo, distil-large-v3
-    device: "cuda"                     # cuda or cpu
-    compute_type: "float16"           # float16 (GPU), int8 (CPU/GPU), int8_float16
+    device: "cpu"                     # cuda or cpu
+    compute_type: "int8"             # float16 (GPU), int8 (CPU/GPU), int8_float16
     input_device: null                # null = system default, or device name/index
     vad_filter: true                  # Use Silero VAD to trim silence from recordings
     language: "en"                     # Language hint for Whisper
 
   tts:
     enabled: true
-    model: "en_GB-alan-medium"         # Piper voice model name
+    model: "en_GB-northern_english_male-medium"         # Piper voice model name
     voice_dir: "voices"               # Where voice .onnx files are stored
     use_cuda: true                    # GPU acceleration for Piper (requires onnxruntime-gpu)
     output_device: null               # null = system default, or device name/index
@@ -77,9 +77,12 @@ voice:
     sentence_silence: 0.2             # Seconds of silence between sentences
 
   trigger:
-    voice_key: "f10"                  # Key for voice input (hold to speak, release to transcribe)
-    push_to_talk: true                # true = hold key to record, release to stop (like radio PTT)
+    method: "wheel_button"               # "keyboard" or "wheel_button"
+    voice_key: "f10"                  # Keyboard key for voice input (when method: keyboard)
+    push_to_talk: true                # true = hold key/button to record, release to stop (like radio PTT)
     max_record_seconds: 15           # Safety: auto-stop recording after this
+    device_index: 0                # Joystick device index (when method: wheel_button; use test_wheel.py to find)
+    button_index: 9                # Button index on device (when method: wheel_button; use test_wheel.py to find)
 
 # Spotter — real-time audio calls for car proximity and track events
 spotter:
@@ -92,6 +95,7 @@ spotter:
   cooldowns:
     proximity_ms: 3000                    # Don't repeat proximity calls within 3s
     clearance_ms: 5000                    # Don't repeat clearance calls within 5s
+    clear_delay_ms: 500                   # Debounce: car must be gone this long before "clear" fires
   output_device: null                     # null = system default, or device name/index
   volume: 1.0                             # Volume multiplier (independent of TTS)
 

@@ -310,14 +310,53 @@ python test_stt.py --model medium  # better accuracy, slower
 python test_stt.py --duration 10
 ```
 
+### Test Wheel Button Discovery
+
+Use `test_wheel.py` to identify your steering wheel's device and button indices for push-to-talk:
+
+```bash
+# List connected controllers
+python test_wheel.py --list
+
+# Watch for button presses (press buttons on your wheel to identify them)
+python test_wheel.py
+
+# Monitor only a specific device
+python test_wheel.py --device 0
+
+# Also show analog axis movements
+python test_wheel.py --watch-axes
+```
+
+When you press a button, the script prints the device index, button number, and a suggested `config.yaml` snippet.
+
 ### Voice in Live Mode
 
-In live mode, two keyboard keys are available:
+In live mode, two triggers are available:
 
-- **F9** — Text trigger (no question, general strategy query)
-- **F10** — Push-to-talk voice input (hold to speak, release to transcribe)
+- **F9** — Text trigger (no question, general strategy query) — always keyboard
+- **F10 or wheel button** — Push-to-talk voice input (hold to speak, release to transcribe)
 
-Hold F10, speak your question, release F10. Your speech is transcribed by Whisper and sent to the LLM. The response is both printed and spoken aloud through Piper TTS.
+By default, voice push-to-talk uses the F10 key. You can also use a button on your steering wheel:
+
+1. Install pygame: `uv sync --extra wheel`
+2. Discover your wheel's device and button indices:
+   ```bash
+   python test_wheel.py --list      # List connected controllers
+   python test_wheel.py              # Press buttons to see their indices
+   ```
+3. Configure in `config.yaml`:
+   ```yaml
+   voice:
+     trigger:
+       method: "wheel_button"
+       device_index: 0    # From test_wheel.py --list
+       button_index: 4    # From pressing buttons in test_wheel.py
+       push_to_talk: true
+       max_record_seconds: 15
+   ```
+
+Hold the wheel button to speak, release to transcribe. The response is both printed and spoken aloud through Piper TTS.
 
 ### Voice in Replay Mode
 
@@ -410,7 +449,7 @@ actions:
 
 # Button trigger
 trigger:
-  method: "keyboard"    # "keyboard" or "wheel_button" (future)
+  method: "keyboard"    # "keyboard" or "wheel_button"
   key: "f9"
 
 # Voice input/output (optional: uv sync --extra voice)
@@ -432,9 +471,12 @@ voice:
     volume: 1.0
     sentence_silence: 0.2
   trigger:
-    voice_key: "f10"
+    method: "keyboard"           # "keyboard" or "wheel_button"
+    voice_key: "f10"             # Keyboard key (when method: keyboard)
     push_to_talk: true
     max_record_seconds: 15
+    device_index: null           # Joystick device index (when method: wheel_button)
+    button_index: null           # Button index (when method: wheel_button)
 
 # Spotter — real-time audio calls for car proximity (local, no LLM)
 spotter:
@@ -612,6 +654,7 @@ Same as `--capture` but always saves to the `tests/sample_data/` folder (from co
 | `capture.py` | Record/replay telemetry JSON for testing |
 | `test_stt.py` | Standalone STT test — record + transcribe without iRacing |
 | `test_tts.py` | Standalone TTS test — speak text without iRacing |
+| `test_wheel.py` | Standalone wheel button discovery — find device/button indices for push-to-talk |
 | `tests/test_modules.py` | Unit tests — RaceState, ContextBuilder, ActionExecutor, TelemetryReplay |
 | `tests/test_spotter.py` | Unit tests — ProximityDetector state machine, SpotterAudioPlayer, Spotter coordinator |
 | `tests/eval_llm_responses.py` | Batch LLM evaluation — asks 50 questions against replay data, logs results |
