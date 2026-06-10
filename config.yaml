@@ -61,8 +61,8 @@ voice:
   stt:
     enabled: true
     model: "small"                    # Whisper model: tiny, small, medium, large-v3, turbo, distil-large-v3
-    device: "cpu"                     # cuda or cpu
-    compute_type: "int8"             # float16 (GPU), int8 (CPU/GPU), int8_float16
+    device: "cuda"                    # cuda or cpu
+    compute_type: "float16"          # float16 (GPU), int8 (CPU/GPU), int8_float16
     input_device: null                # null = system default, or device name/index
     vad_filter: true                  # Use Silero VAD to trim silence from recordings
     language: "en"                     # Language hint for Whisper

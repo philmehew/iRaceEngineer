@@ -8,6 +8,7 @@ inference. Model is loaded lazily on first use to avoid slow startup.
 
 import logging
 import threading
+import time
 
 import numpy as np
 
@@ -71,28 +72,49 @@ class STTClient:
             try:
                 from faster_whisper import WhisperModel
 
-                logger.info(
-                    f"Loading Whisper model: {self.model_name} (device={self.device})"
-                )
-                try:
-                    self._model = WhisperModel(
-                        self.model_name,
-                        device=self.device,
-                        compute_type=self.compute_type,
-                    )
-                except Exception as gpu_err:
-                    if self.device == "cuda":
-                        logger.warning(f"GPU failed ({gpu_err}), falling back to CPU")
+                device = self.device
+                compute_type = self.compute_type
+
+                # Try CUDA first; fall back to CPU if DLLs or GPU not available
+                if device == "cuda":
+                    try:
+                        logger.info(
+                            f"Loading Whisper model: {self.model_name} "
+                            f"(device=cuda, compute_type={compute_type})"
+                        )
+                        self._model = WhisperModel(
+                            self.model_name,
+                            device="cuda",
+                            compute_type=compute_type,
+                        )
+                    except Exception as gpu_err:
+                        logger.warning(
+                            f"CUDA unavailable ({gpu_err}), "
+                            f"falling back to CPU (int8) — transcription will be slower"
+                        )
+                        device = "cpu"
+                        compute_type = "int8"
                         self._model = WhisperModel(
                             self.model_name,
                             device="cpu",
                             compute_type="int8",
                         )
-                    else:
-                        raise
+                else:
+                    logger.info(
+                        f"Loading Whisper model: {self.model_name} "
+                        f"(device={device}, compute_type={compute_type})"
+                    )
+                    self._model = WhisperModel(
+                        self.model_name,
+                        device=device,
+                        compute_type=compute_type,
+                    )
 
                 self._model_loaded = True
-                logger.info(f"Whisper model loaded: {self.model_name}")
+                logger.info(
+                    f"Whisper model loaded: {self.model_name} "
+                    f"(device={device}, compute_type={compute_type})"
+                )
 
             except ImportError:
                 logger.error(
@@ -204,10 +226,17 @@ class STTClient:
             logger.warning("Empty audio — nothing to transcribe")
             return ""
 
+        t_start = time.monotonic()
+
         self._load_model()
         if self._model is None:
             logger.warning("Whisper model not loaded — cannot transcribe")
             return ""
+
+        t_model_loaded = time.monotonic()
+        model_load_time = t_model_loaded - t_start
+        if model_load_time > 0.1:
+            logger.info(f"STT model load: {model_load_time:.3f}s")
 
         logger.info(
             f"Transcribing {len(audio)} samples "
@@ -219,16 +248,19 @@ class STTClient:
                 audio,
                 language=self.language,
                 vad_filter=self.vad_filter,
-                beam_size=5,
+                beam_size=2,
             )
 
             # Force evaluation by consuming the generator
             segment_list = list(segments)
             text = " ".join(s.text.strip() for s in segment_list)
 
+            t_done = time.monotonic()
             logger.info(
-                f"Transcribed ({info.language}, {info.language_probability:.0%} "
-                f'confidence): "{text}"'
+                f"STT transcription: {t_done - t_model_loaded:.3f}s "
+                f"(total: {t_done - t_start:.3f}s) — "
+                f"{info.language}, {info.language_probability:.0%} "
+                f'confidence: "{text}"'
             )
 
             return text
@@ -307,3 +339,13 @@ class STTClient:
             return True
         except ImportError:
             return False
+
+    def preload(self):
+        """Pre-load the Whisper model to avoid cold-start latency on first use."""
+        logger.info("Pre-loading Whisper model...")
+        t0 = time.monotonic()
+        self._load_model()
+        if self._model_loaded:
+            logger.info(f"Whisper model pre-loaded in {time.monotonic() - t0:.3f}s")
+        else:
+            logger.warning("Whisper model pre-load failed")

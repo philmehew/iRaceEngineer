@@ -9,6 +9,7 @@ device selection. Model is loaded lazily on first use to avoid slow startup.
 import logging
 import os
 import threading
+import time
 
 import numpy as np
 
@@ -137,6 +138,8 @@ class TTSClient:
         logger.info(f"Speaking: {text[:80]}{'...' if len(text) > 80 else ''}")
 
         try:
+            t_start = time.monotonic()
+
             # Collect audio chunks from streaming synthesis
             audio_chunks = []
             sample_rate = None
@@ -152,6 +155,12 @@ class TTSClient:
                 logger.warning("Piper produced no audio")
                 return
 
+            t_synthesized = time.monotonic()
+            logger.info(
+                f"TTS synthesis: {t_synthesized - t_start:.3f}s "
+                f"({len(audio_chunks)} chunks)"
+            )
+
             audio = np.concatenate(audio_chunks).astype(np.float32) / 32768.0
 
             # Apply volume
@@ -162,7 +171,11 @@ class TTSClient:
             sd.play(audio, samplerate=sample_rate, device=device)
             sd.wait()
 
-            logger.info("TTS playback complete")
+            t_done = time.monotonic()
+            logger.info(
+                f"TTS playback: {t_done - t_synthesized:.3f}s, "
+                f"total speak: {t_done - t_start:.3f}s"
+            )
 
         except Exception as e:
             logger.error(f"TTS playback failed: {e}")
@@ -240,3 +253,13 @@ class TTSClient:
             return True
         except ImportError:
             return False
+
+    def preload(self):
+        """Pre-load the Piper voice model to avoid cold-start latency on first use."""
+        logger.info("Pre-loading Piper voice model...")
+        t0 = time.monotonic()
+        self._load_voice()
+        if self._voice_loaded:
+            logger.info(f"Piper voice pre-loaded in {time.monotonic() - t0:.3f}s")
+        else:
+            logger.warning("Piper voice pre-load failed")

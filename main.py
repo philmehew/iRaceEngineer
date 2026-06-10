@@ -38,6 +38,52 @@ from tts_client import TTSClient
 from spotter import Spotter
 
 
+def _ensure_cuda_dlls() -> bool:
+    """Register CUDA toolkit DLL directory on Windows.
+
+    The CUDA installer sometimes doesn't add itself to PATH, causing
+    "DLL not found" errors from ctranslate2/faster-whisper. This scans
+    for the toolkit and registers the bin directory so the DLLs are findable.
+
+    Must be called before any code that loads CUDA (e.g. stt_client preload).
+
+    Returns:
+        True if CUDA DLL directory was found and registered, False otherwise.
+    """
+    if sys.platform != "win32":
+        return False
+
+    # Try CUDA_PATH env var first (set by some installer versions)
+    cuda_base = os.path.join(os.environ.get("CUDA_PATH", ""), "bin")
+    if os.path.isdir(cuda_base):
+        os.add_dll_directory(cuda_base)
+        return True
+
+    # Fallback: scan the standard toolkit install location
+    toolkit_dir = os.path.join(
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        "NVIDIA GPU Computing Toolkit",
+        "CUDA",
+    )
+    if not os.path.isdir(toolkit_dir):
+        return False
+
+    # Pick the latest installed version
+    versions = sorted(
+        (d for d in os.listdir(toolkit_dir) if d.startswith("v")),
+        reverse=True,
+    )
+    if not versions:
+        return False
+
+    cuda_bin = os.path.join(toolkit_dir, versions[0], "bin")
+    if os.path.isdir(cuda_bin):
+        os.add_dll_directory(cuda_bin)
+        return True
+
+    return False
+
+
 class WheelButtonListener:
     """Listen for joystick/wheel button presses using pygame.
 
@@ -224,6 +270,24 @@ _state_lock = threading.Lock()
 _llm_in_progress = threading.Event()
 
 
+def _print_timing_summary(steps: list[tuple[str, float]], label: str = "Pipeline"):
+    """Print a timing breakdown for the voice/LLM pipeline.
+
+    Args:
+        steps: List of (step_name, duration_seconds) tuples.
+        label: Header label for the summary block.
+    """
+    if not steps:
+        return
+
+    total = sum(duration for _, duration in steps)
+    print(f"\n⏱  {label} timing:")
+    for name, duration in steps:
+        print(f"  {name:25s} {duration:.3f}s")
+    print(f"  {'─' * 35}")
+    print(f"  {'Total':25s} {total:.3f}s\n")
+
+
 def setup_llm_query_log(config: dict):
     """Set up the LLM query log file handler.
 
@@ -270,11 +334,17 @@ def handle_button_press(
     executor: ActionExecutor,
     question: str = "",
     tts: TTSClient | None = None,
+    timing_steps: list[tuple[str, float]] | None = None,
 ):
     """Handle a button press — build context, call LLM, process response.
 
     Thread-safe: acquires the state lock to read a consistent snapshot,
     and guards against double-press (skips if an LLM call is already in progress).
+
+    Args:
+        timing_steps: Optional list of (step_name, duration) tuples from
+            earlier pipeline steps (e.g. recording, transcription). Additional
+            timing will be appended and a summary printed at the end.
     """
     # Guard against double-press — skip if an LLM call is already running
     if _llm_in_progress.is_set():
@@ -282,14 +352,21 @@ def handle_button_press(
         return
     _llm_in_progress.set()
 
+    steps = list(timing_steps) if timing_steps else []
+
     try:
         logger.info("Button pressed — querying LLM...")
 
         # Get a consistent snapshot under the state lock
+        t0 = time.monotonic()
         with _state_lock:
             snapshot = state.get_snapshot()
+        steps.append(("State snapshot", time.monotonic() - t0))
 
+        # Build context
+        t0 = time.monotonic()
         messages = context_builder.build_prompt(snapshot, question=question)
+        steps.append(("Context build", time.monotonic() - t0))
 
         # Log the context being sent
         depth = context_builder.context_depth
@@ -298,7 +375,9 @@ def handle_button_press(
         )
 
         # Call LLM
+        t0 = time.monotonic()
         response_text = llm.ask(messages)
+        steps.append(("LLM call", time.monotonic() - t0))
 
         # Log the prompt and response to the LLM query log file
         llm_query_logger.info(
@@ -314,10 +393,13 @@ def handle_button_press(
 
         if not response_text:
             logger.warning("LLM returned empty response")
+            _print_timing_summary(steps)
             return
 
         # Parse actions from response
+        t0 = time.monotonic()
         clean_text, actions = executor.parse_response(response_text)
+        steps.append(("Action parse", time.monotonic() - t0))
 
         # Display response
         print("\n" + "=" * 60)
@@ -329,11 +411,14 @@ def handle_button_press(
             results = executor.execute(actions)
             for result in results:
                 print(f"  {result}")
-        print("=" * 60 + "\n")
+        print("=" * 60)
 
         # Speak the response if TTS is enabled
         if tts is not None:
             tts.speak_async(clean_text)
+
+        # Print timing summary
+        _print_timing_summary(steps)
 
     finally:
         _llm_in_progress.clear()
@@ -389,7 +474,20 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                 spotter = None
         except Exception as e:
             logger.warning(f"Spotter setup failed: {e}")
-            spotter = None
+
+    # Ensure CUDA DLLs are registered before loading voice models
+    cuda_dll_found = _ensure_cuda_dlls()
+
+    # Pre-load voice models to avoid cold-start latency on first PTT press
+    if stt is not None:
+        if stt.device == "cuda" and not cuda_dll_found:
+            logger.warning(
+                "CUDA toolkit DLLs not found — STT will fall back to CPU. "
+                "Install CUDA or add it to PATH for GPU acceleration."
+            )
+        stt.preload()
+    if tts is not None:
+        tts.preload()
 
     # Set up keyboard trigger
     trigger_key = config.get("trigger", {}).get("key", "f9")
@@ -458,14 +556,23 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                 _ptt_stop.clear()
 
                 def _record_and_query():
-                    """Record, transcribe, and query LLM."""
+                    """Record, transcribe, and query LLM with timing."""
+                    timing_steps = []
                     logger.info("Voice key pressed — recording...")
-                    text = stt.listen_push_to_talk(
+                    t0 = time.monotonic()
+                    audio = stt.record_until_release(
                         _ptt_stop,
                         max_duration_s=voice_trigger_config.get(
                             "max_record_seconds", 15
                         ),
                     )
+                    t1 = time.monotonic()
+                    timing_steps.append(("Recording", t1 - t0))
+
+                    text = stt.transcribe(audio)
+                    t2 = time.monotonic()
+                    timing_steps.append(("Transcription", t2 - t1))
+
                     _ptt_recording.clear()
                     if text.strip():
                         logger.info(f"Transcribed: {text}")
@@ -476,9 +583,11 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                             executor,
                             question=text,
                             tts=tts,
+                            timing_steps=timing_steps,
                         )
                     else:
                         logger.warning("No speech detected — skipping LLM query")
+                        _print_timing_summary(timing_steps, label="Voice (no speech)")
 
                 threading.Thread(target=_record_and_query, daemon=True).start()
 
@@ -517,14 +626,23 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                 _ptt_stop.clear()
 
                 def _record_and_query():
-                    """Record, transcribe, and query LLM."""
+                    """Record, transcribe, and query LLM with timing."""
+                    timing_steps = []
                     logger.info("Wheel button pressed — recording...")
-                    text = stt.listen_push_to_talk(
+                    t0 = time.monotonic()
+                    audio = stt.record_until_release(
                         _ptt_stop,
                         max_duration_s=voice_trigger_config.get(
                             "max_record_seconds", 15
                         ),
                     )
+                    t1 = time.monotonic()
+                    timing_steps.append(("Recording", t1 - t0))
+
+                    text = stt.transcribe(audio)
+                    t2 = time.monotonic()
+                    timing_steps.append(("Transcription", t2 - t1))
+
                     _ptt_recording.clear()
                     if text.strip():
                         logger.info(f"Transcribed: {text}")
@@ -535,9 +653,11 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                             executor,
                             question=text,
                             tts=tts,
+                            timing_steps=timing_steps,
                         )
                     else:
                         logger.warning("No speech detected — skipping LLM query")
+                        _print_timing_summary(timing_steps, label="Voice (no speech)")
 
                 threading.Thread(target=_record_and_query, daemon=True).start()
 

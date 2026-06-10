@@ -8,6 +8,7 @@ OpenAI-compatible API by changing base_url in config.
 
 import logging
 import os
+import time
 
 from openai import OpenAI
 
@@ -79,6 +80,7 @@ class LLMClient:
             messages = messages + [{"role": "user", "content": question}]
 
         try:
+            t_start = time.monotonic()
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
@@ -86,16 +88,20 @@ class LLMClient:
                 temperature=self.temperature,
                 timeout=self.timeout,
             )
+            t_done = time.monotonic()
 
             content = response.choices[0].message.content.strip()
 
-            # Log token usage
+            # Log token usage and timing
             if hasattr(response, "usage") and response.usage:
                 logger.info(
                     f"LLM response: {response.usage.total_tokens} tokens "
                     f"({response.usage.prompt_tokens} prompt, "
-                    f"{response.usage.completion_tokens} completion)"
+                    f"{response.usage.completion_tokens} completion) "
+                    f"in {t_done - t_start:.3f}s"
                 )
+            else:
+                logger.info(f"LLM response in {t_done - t_start:.3f}s")
 
             return content
 
