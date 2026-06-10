@@ -1,14 +1,15 @@
 # iRaceEngineer
 
-Real-time iRacing data collection with on-demand LLM race engineering. Collects telemetry from iRacing via shared memory, maintains an in-memory model of the current race state, and sends a condensed snapshot to an OpenAI-compatible LLM when you press a button — getting back concise, actionable strategy advice.
+Real-time iRacing data collection with on-demand LLM race engineering. Collects telemetry from iRacing via shared memory, maintains an in-memory model of the current race state, and sends a condensed snapshot to an OpenAI-compatible LLM when you press F9 — or speak your question via push-to-talk (F10) and hear the response spoken aloud.
 
 ## What It Does
 
 - **Collects** real-time telemetry from iRacing at ~30Hz via pyirsdk (323+ telemetry variables + YAML session info)
 - **Maintains** an in-memory race state model — positions, gaps, fuel, tyres, lap trends, weather, engine health, damage, push-to-pass
 - **Condenses** that state into a ~1-2KB context prompt, filtered by configurable depth (minimal / medium / full)
-- **Sends** the prompt to any OpenAI-compatible LLM endpoint when you press a button
+- **Sends** the prompt to any OpenAI-compatible LLM endpoint when you press F9 (text query) or hold F10 (voice query)
 - **Parses** optional `[ACTION]` directives in the LLM response (pit this lap, add fuel, change tyres) — logged in dry-run mode, executable when enabled
+- **Speaks** LLM responses aloud via Piper TTS, and **listens** for voice questions via Whisper STT (optional, fully local)
 - **Records** and **replays** telemetry snapshots for testing without iRacing running
 
 ## Architecture
@@ -71,7 +72,7 @@ set OLLAMA_API_KEY=your-api-key-here
 ### Run
 
 ```bash
-# Normal mode — connect to iRacing, press F9 to query LLM
+# Normal mode — connect to iRacing, F9 for text query, F10 for voice query
 python main.py
 
 # Replay mode — test with captured data, no iRacing needed
