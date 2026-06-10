@@ -7,6 +7,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Corner abbreviation → display name (data keys stay as abbreviations)
+CORNER_NAMES = {
+    "LF": "Left Front",
+    "RF": "Right Front",
+    "LR": "Left Rear",
+    "RR": "Right Rear",
+}
+
 
 def format_lap_time(seconds: float) -> str:
     """Format a lap time in seconds to M:SS.mmm format."""
@@ -126,11 +134,17 @@ class ContextBuilder:
             "Rules:\n"
             "- Only respond when asked. Don't promise to monitor or call pit later.\n"
             "- Don't suggest setup changes (pressures, brake bias) without known reference ranges.\n"
-            "- Don't assess temps or pressures as high/low without knowing the car's normal range — just report values.\n"
+            "- Don't assess temps or pressures as high/low/normal/stable without knowing the car's normal range — just report values.\n"
             "- Don't name track corners unless that data is in the context.\n"
-            "- 'Incidents' are safety points (0x per off-track), NOT car damage.\n"
-            "- If tyre data is marked unreliable, don't comment on degradation, trends, or whether values are changing.\n"
-            "- [ACTION] add_fuel amounts: whole litres, min 1L, max = tank capacity - current fuel.\n\n"
+            "- 'Incidents' are safety points (0x per off-track), NOT car damage. Always report the count when it's in the context.\n"
+            "- If tyre data is marked unreliable, still report the values but don't comment on degradation, trends, or whether they're changing. Say 'last known: Left Front 79C...' rather than skipping them.\n"
+            "- [ACTION] add_fuel amounts: whole litres only (integers, never decimals), min 1L, max = tank capacity minus current fuel. Never exceed tank capacity.\n"
+            "- Weather data is current conditions only — never predict future weather.\n"
+            "- Lap times in the 'Pace' line are the driver's own times. Lap times in the 'Nearby' section are other cars' times.\n"
+            "- When fuel burn says 'unknown', do NOT invent a specific L/lap figure. Say 'fuel burn unknown' or estimate from race structure only.\n"
+            "- Never say 'monitor' or 'keep an eye on' — you give one-shot advice, not continuous tracking.\n"
+            "- Only include [ACTION] when the driver asks about pitting, fuel, tyres, or strategy. Do not add actions to unrelated questions.\n"
+            "- When 'Fuel to add' is shown in context, use that exact amount in [ACTION] add_fuel. Do not invent different amounts.\n\n"
             "Optional actions: [ACTION] pit_this_lap | add_fuel: <litres> | change_tyres | clear_penalty"
         )
 
@@ -227,8 +241,9 @@ class ContextBuilder:
 
         # Session header
         track = session.get("track_name", "Unknown")
-        config = session.get("track_config", "")
-        track_str = f"{track} {config}".strip() if config else track
+        track_config = session.get("track_config", "")
+        track_str = f"{track} {track_config}".strip() if track_config else track
+        session_config = session.get("config", {})
         laps_remain = session.get("laps_remain", "?")
         race_laps = session.get("race_laps", "?")
         estimated_total = state.get("estimated_total_laps")
@@ -278,10 +293,23 @@ class ContextBuilder:
         fuel_laps = player.get("fuel_laps_remaining", 0)
         fuel_pct = player.get("fuel_pct", 0)
         fuel_level = player.get("fuel_level", 0)
+        fuel_est_quality = player.get("fuel_est_quality", "unreliable")
+        fuel_max = session_config.get("fuel_max_litres", 0)
         lines.append("\nYour car:")
-        lines.append(
-            f"  Fuel: {fuel_level:.2f}L ({format_pct(fuel_pct)}), ~{fuel_laps:.2f} laps remaining"
-        )
+        # Build fuel line with max add if tank capacity is known
+        if fuel_max and fuel_level > 0:
+            max_add = fuel_max - fuel_level
+            fuel_str = f"  Fuel: {fuel_level:.2f}L/{fuel_max:.0f}L (max add: {max_add:.0f}L, {format_pct(fuel_pct)}"
+        else:
+            fuel_str = f"  Fuel: {fuel_level:.2f}L ({format_pct(fuel_pct)}"
+        if fuel_laps > 0 and fuel_est_quality == "good":
+            lines.append(f"{fuel_str}), ~{fuel_laps:.1f} laps")
+        elif fuel_laps > 0 and fuel_est_quality == "rough":
+            lines.append(f"{fuel_str}), ~{fuel_laps:.1f} laps (approx)")
+        elif fuel_pct > 0:
+            lines.append(f"{fuel_str}), laps remaining: unreliable")
+        else:
+            lines.append(f"{fuel_str})")
 
         # Engine warnings (critical for race engineering)
         engine_warnings = player.get("engine_warnings", 0)
@@ -297,7 +325,7 @@ class ContextBuilder:
                 ts = tyres.get(corner, {})
                 avg_temp = ts.get("temp_center", 0)
                 if avg_temp > 0:
-                    tyre_strs.append(f"{corner} {format_temp(avg_temp)}")
+                    tyre_strs.append(f"{CORNER_NAMES[corner]} {format_temp(avg_temp)}")
             if tyre_strs:
                 lines.append(f"  Tyres: {' / '.join(tyre_strs)}")
 
@@ -326,6 +354,18 @@ class ContextBuilder:
         is_time_race = (
             isinstance(laps_remain_raw, int) and laps_remain_raw >= LAPS_REMAIN_SENTINEL
         )
+
+        # Compute laps remaining for fuel calculations
+        if is_time_race and estimated_total and isinstance(race_laps, int):
+            race_laps_remain = max(0, estimated_total - race_laps)
+        elif (
+            not is_time_race
+            and isinstance(laps_remain_raw, int)
+            and laps_remain_raw < LAPS_REMAIN_SENTINEL
+        ):
+            race_laps_remain = max(0, laps_remain_raw)
+        else:
+            race_laps_remain = 0
 
         # Determine total laps display
         if is_time_race and estimated_total:
@@ -371,7 +411,12 @@ class ContextBuilder:
             if is_fixed:
                 cfg_parts.append("FIXED SETUP")
             if incident_limit:
-                cfg_parts.append(f"incidents: {incident_limit}")
+                label = (
+                    "no limit"
+                    if str(incident_limit).lower() in ("unlimited", "-1", "0")
+                    else str(incident_limit)
+                )
+                cfg_parts.append(f"incidents: {label}")
             if fast_repairs:
                 cfg_parts.append(f"fast repairs: {fast_repairs}")
             if fuel_max:
@@ -405,7 +450,10 @@ class ContextBuilder:
             if wind_vel > 0.5:
                 weather_parts.append(f"wind {wind_vel:.2f}m/s")
             if weather_parts:
-                lines.append(f"Weather: {' | '.join(weather_parts)}")
+                weather_str = f"Weather: {' | '.join(weather_parts)}"
+                # Make it clear this is current conditions only — no forecast data
+                weather_str += " (current conditions only — NO forecast data, cannot predict future weather)"
+                lines.append(weather_str)
 
         # === Engine health ===
         oil_temp = player.get("oil_temp", 0)
@@ -414,20 +462,54 @@ class ContextBuilder:
         voltage = player.get("voltage", 0)
         engine_warnings = player.get("engine_warnings", 0)
         manifold_press = player.get("manifold_press", 0)
+        engine_baseline = player.get("engine_baseline")
+
+        # Helper: format a value with delta from baseline if available
+        def _engine_part(
+            label: str, value: float, unit: str, bl_key: str
+        ) -> str | None:
+            if value <= 0:
+                return None
+            base_val = (
+                f"{label} {format_temp(value)}"
+                if unit == "C"
+                else f"{label} {value:.2f}{unit}"
+            )
+            if engine_baseline and bl_key in engine_baseline:
+                bl = engine_baseline[bl_key]
+                if bl > 0:
+                    delta = value - bl
+                    pct = abs(delta) / bl if bl > 0 else 0
+                    if pct > 0.15:  # ±15% threshold
+                        arrow = "↑" if delta > 0 else "↓"
+                        delta_unit = "°C" if unit == "C" else unit
+                        base_val += f" ({arrow}{abs(delta):.1f}{delta_unit} from avg)"
+            return base_val
 
         engine_parts = []
-        if oil_temp > 0:
-            engine_parts.append(f"Oil {format_temp(oil_temp)}")
-        if oil_press > 0:
-            engine_parts.append(f"OilP {oil_press:.2f}bar")
-        if water_temp > 0:
-            engine_parts.append(f"Water {format_temp(water_temp)}")
-        if voltage > 0:
-            engine_parts.append(f"{voltage:.2f}V")
-        if manifold_press > 0 and manifold_press < 5:  # Only show if not default-ish
-            engine_parts.append(f"Manifold {manifold_press:.2f}bar")
+        part = _engine_part("Oil", oil_temp, "C", "oil_temp")
+        if part:
+            engine_parts.append(part)
+        part = _engine_part("OilP", oil_press, "bar", "oil_press")
+        if part:
+            engine_parts.append(part)
+        part = _engine_part("Water", water_temp, "C", "water_temp")
+        if part:
+            engine_parts.append(part)
+        part = _engine_part("Volt", voltage, "V", "voltage")
+        if part:
+            engine_parts.append(part)
+        if manifold_press > 0 and manifold_press < 5:
+            part = _engine_part("Manifold", manifold_press, "bar", "manifold_press")
+            if part:
+                engine_parts.append(part)
         if engine_parts:
-            lines.append(f"Engine: {' | '.join(engine_parts)}")
+            if engine_baseline:
+                lines.append(f"Engine: {' | '.join(engine_parts)}")
+            else:
+                lines.append(
+                    f"Engine: {' | '.join(engine_parts)} (reference ranges not available — report values only)"
+                )
 
         if engine_warnings:
             warning_str = format_engine_warnings(engine_warnings)
@@ -469,34 +551,105 @@ class ContextBuilder:
         fuel_line = f"  Fuel: {fuel_level:.2f}L"
         if fuel_max and fuel_level > 0:
             fuel_line += f"/{fuel_max:.0f}L"
-        fuel_line += f" ({format_pct(fuel_pct)}, {fuel_desc})"
+            # Show max fuel add so the LLM can't suggest more than the tank holds
+            max_add = fuel_max - fuel_level
+            if max_add > 0:
+                fuel_line += f" (max add: {max_add:.0f}L,"
+            else:
+                fuel_line += " ("
+        else:
+            fuel_line += " ("
+        fuel_line += f"{format_pct(fuel_pct)}, {fuel_desc})"
 
-        # Laps remaining — show quality indicator
-        # When quality is "unreliable" (no lap history), the number can be wildly
-        # wrong (e.g. 815 laps). Don't show the number — just say N/A.
-        if fuel_laps > 0 and fuel_est_quality == "good":
-            fuel_line += f" — ~{fuel_laps:.1f} laps"
-        elif fuel_laps > 0 and fuel_est_quality == "rough":
-            fuel_line += f" — ~{fuel_laps:.1f} laps (approx)"
-        elif fuel_pct > 0:
-            fuel_line += " — laps remaining: unreliable"
-
-        # Fuel urgency warning
+        # Fuel urgency warning (shown on the same line for visibility)
         if 0 < fuel_pct < 0.2 and fuel_laps > 0:
             fuel_line += " ⚠ FUEL WARNING"
 
         lines.append(fuel_line)
 
-        # Per-lap burn rate (from lap history) — much more reliable than instantaneous
-        # Only show burn rate when we have reliable data. When quality is "unreliable"
-        # (no lap history), the instantaneous rate is wildly variable and misleading —
-        # the LLM will do math with it despite the "unreliable" label.
-        if avg_fuel_per_lap > 0:
+        # Per-lap burn rate and laps remaining — shown on a separate line
+        # to avoid the LLM confusing "laps remaining: unreliable" with
+        # "the fuel level is unreliable". The fuel level (e.g. 15.12L, 69%)
+        # IS accurate — only the laps estimate depends on having burn rate data.
+        if avg_fuel_per_lap > 0 and fuel_est_quality == "good":
             lines.append(
                 f"  Fuel burn: ~{avg_fuel_per_lap:.2f} L/lap (avg over recent laps)"
             )
-        # Don't show instantaneous rate when unreliable — it causes the LLM to
-        # estimate fuel laps from a single throttle position snapshot
+            if fuel_laps > 0:
+                lines.append(
+                    f"  Fuel range: ~{fuel_laps:.1f} laps at current burn rate"
+                )
+                # Critical: fuel range vs race laps remaining comparison
+                if race_laps_remain > 0:
+                    if fuel_laps < race_laps_remain:
+                        deficit_laps = race_laps_remain - fuel_laps
+                        lines.append(
+                            f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.1f} laps short — cannot finish without pit stop"
+                        )
+                    elif fuel_laps < race_laps_remain + 1:
+                        # Within 1 lap of shortage — margins are too thin to be safe
+                        margin = fuel_laps - race_laps_remain
+                        if margin < 0.3:
+                            lines.append(
+                                f"  ⚠ FUEL TIGHT: ~{margin:.1f} laps margin — will NOT finish if burn rate varies. Pit recommended."
+                            )
+                        else:
+                            lines.append(
+                                f"  ⚠ FUEL TIGHT: only ~{margin:.1f} laps margin — pit if safety car or incident possible"
+                            )
+        elif avg_fuel_per_lap > 0 and fuel_est_quality == "rough":
+            lines.append(
+                f"  Fuel burn: ~{avg_fuel_per_lap:.2f} L/lap (approx, based on 1-2 laps)"
+            )
+            if fuel_laps > 0:
+                lines.append(f"  Fuel range: ~{fuel_laps:.1f} laps (approx)")
+                if race_laps_remain > 0:
+                    if fuel_laps < race_laps_remain:
+                        deficit_laps = race_laps_remain - fuel_laps
+                        lines.append(
+                            f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.1f} laps short (approx) — cannot finish without pit stop"
+                        )
+                    elif fuel_laps < race_laps_remain + 1:
+                        margin = fuel_laps - race_laps_remain
+                        if margin < 0.3:
+                            lines.append(
+                                f"  ⚠ FUEL TIGHT: ~{margin:.1f} laps margin (approx) — will NOT finish if burn rate varies. Pit recommended."
+                            )
+                        else:
+                            lines.append(
+                                f"  ⚠ FUEL TIGHT: only ~{margin:.1f} laps margin (approx) — pit if safety car or incident possible"
+                            )
+        else:
+            # No burn rate data yet — make it clear the LLM must NOT invent
+            # a specific L/lap figure. "calculating" was misread as "almost ready"
+            # by the LLM, causing it to fabricate burn rates like "1.3L/lap".
+            lines.append("  Fuel burn: unknown — per-lap rate not yet available")
+
+        # Fuel recommendation — calculate how much fuel to add at next pit stop.
+        # Do the math here so the LLM doesn't invent wrong amounts.
+        # Only shown when we have burn rate data AND know how many laps are left.
+        if (
+            avg_fuel_per_lap > 0
+            and race_laps_remain > 0
+            and fuel_max > 0
+            and fuel_level > 0
+        ):
+            fuel_needed = avg_fuel_per_lap * race_laps_remain
+            fuel_deficit = fuel_needed - fuel_level
+            if fuel_deficit > 0:
+                # Add 1-lap safety margin to avoid running dry on the last lap,
+                # then round up to whole litres (add_fuel only accepts integers).
+                add_litres = min(
+                    int(fuel_deficit + avg_fuel_per_lap)
+                    + 1,  # deficit + 1 lap margin, ceil
+                    int(fuel_max - fuel_level),  # tank capacity
+                )
+                add_litres = max(1, add_litres)  # at least 1L
+                quality_note = "" if fuel_est_quality == "good" else " (approx)"
+                lines.append(
+                    f"  Fuel to finish: ~{fuel_needed:.1f}L for {race_laps_remain} laps{quality_note}"
+                )
+                lines.append(f"  Fuel to add: {add_litres}L")
 
         # Race duration and time remaining (for time-based races)
         # Show both time and laps — the LLM needs to know the race is e.g. 30 min
@@ -514,11 +667,20 @@ class ContextBuilder:
                     lines.append(f"  Time remaining: {int(time_remain_sec)}s")
                 else:
                     lines.append(f"  Time remaining: ~{remain_min:.1f} min")
-            if estimated_total and isinstance(race_laps, int):
-                race_laps_remain = max(0, estimated_total - race_laps)
+            if race_laps_remain > 0:
                 if race_laps_remain <= 1:
                     lines.append(
                         f"  Race laps remaining: ~{race_laps_remain} — RACE ENDING SOON"
+                    )
+                    lines.append(
+                        "  ⚠ Pit stop costs ~30s+ — do not pit unless car cannot finish"
+                    )
+                elif race_laps_remain <= 3:
+                    lines.append(
+                        f"  Race laps remaining: ~{race_laps_remain} laps (estimated) — RACE ENDING SOON"
+                    )
+                    lines.append(
+                        "  ⚠ Pit stop costs ~30s+ — only pit if absolutely necessary (e.g. fuel shortage)"
                     )
                 else:
                     lines.append(
@@ -531,7 +693,23 @@ class ContextBuilder:
         tyres = player.get("tyres", {})
         tyre_odometers = player.get("tyre_odometers", {})
         tyre_staleness = player.get("tyre_staleness", "unknown")
+        tyre_baseline = player.get("tyre_baseline")
+
+        # Helper: format tyre temp with delta from baseline
+        def _tyre_temp_str(corner: str, temp: float) -> str:
+            base = format_temp(temp)
+            if tyre_baseline and corner in tyre_baseline and temp > 0:
+                bl = tyre_baseline[corner]
+                if bl > 0:
+                    delta = temp - bl
+                    pct = abs(delta) / bl if bl > 0 else 0
+                    if pct > 0.15:  # ±15% threshold
+                        arrow = "↑" if delta > 0 else "↓"
+                        base += f" ({arrow}{abs(delta):.1f}°C from avg)"
+            return base
+
         if tyres:
+            is_stale = tyre_staleness != "live"
             if tyre_staleness == "stale":
                 lines.append("  Tyres: unreliable (on track, data not updating)")
             elif tyre_staleness == "live":
@@ -540,22 +718,62 @@ class ContextBuilder:
                 lines.append(
                     "  Tyres: unreliable (status unknown, data may not be updating)"
                 )
+
+            # When tyre data is stale/frozen, check if all pressures are identical
+            # and collapse them into one line to avoid the LLM saying "pressures stable"
+            pressures = []
             for corner in ["LF", "RF", "LR", "RR"]:
                 ts = tyres.get(corner, {})
-                if not ts:
-                    continue
-                avg_temp = ts.get("temp_center", 0)
-                pressure = ts.get("cold_pressure", 0)
-                wear_center = ts.get("wear_center", 0)
-                odo = tyre_odometers.get(corner, 0)
-                parts = [f"{format_temp(avg_temp)}"]
-                if pressure > 0:
-                    parts.append(f"{pressure:.2f}PSI")
-                if wear_center > 0:
-                    parts.append(f"{format_wear(wear_center)}")
-                if odo > 0:
-                    parts.append(f"{odo:.0f}km")
-                lines.append(f"    {corner}: {' | '.join(parts)}")
+                p = ts.get("cold_pressure", 0)
+                if p > 0:
+                    pressures.append(p)
+
+            all_pressures_same = (
+                len(pressures) == 4 and len(set(f"{p:.2f}" for p in pressures)) == 1
+            )
+
+            if is_stale and all_pressures_same and pressures:
+                # Collapse identical stale pressures into one line
+                stale_label = (
+                    "not updating"
+                    if tyre_staleness == "stale"
+                    else "may not be updating"
+                )
+                lines.append(
+                    f"    All pressures: {pressures[0]:.2f}PSI ({stale_label} — normal for iRacing cars on track)"
+                )
+                # Show per-corner data without pressure
+                for corner in ["LF", "RF", "LR", "RR"]:
+                    ts = tyres.get(corner, {})
+                    if not ts:
+                        continue
+                    avg_temp = ts.get("temp_center", 0)
+                    wear_center = ts.get("wear_center", 0)
+                    odo = tyre_odometers.get(corner, 0)
+                    parts = [_tyre_temp_str(corner, avg_temp)]
+                    if wear_center > 0:
+                        parts.append(f"{format_wear(wear_center)}")
+                    if odo > 0:
+                        parts.append(f"{odo:.0f}km")
+                    lines.append(f"    {CORNER_NAMES[corner]}: {' | '.join(parts)}")
+            else:
+                # Show full per-corner data including pressure
+                for corner in ["LF", "RF", "LR", "RR"]:
+                    ts = tyres.get(corner, {})
+                    if not ts:
+                        continue
+                    avg_temp = ts.get("temp_center", 0)
+                    pressure = ts.get("cold_pressure", 0)
+                    wear_center = ts.get("wear_center", 0)
+                    odo = tyre_odometers.get(corner, 0)
+                    parts = [_tyre_temp_str(corner, avg_temp)]
+                    if pressure > 0:
+                        parts.append(f"{pressure:.2f}PSI")
+                    if wear_center > 0:
+                        parts.append(f"{format_wear(wear_center)}")
+                    if odo > 0:
+                        parts.append(f"{odo:.0f}km")
+                    lines.append(f"    {CORNER_NAMES[corner]}: {' | '.join(parts)}")
 
         # Brakes + brake bias
         brake_pressures = player.get("brake_pressures", {})
@@ -563,7 +781,7 @@ class ContextBuilder:
         for corner in ["LF", "RF", "LR", "RR"]:
             bp = brake_pressures.get(corner, 0)
             if bp > 0:
-                brake_temps.append(f"{corner} {bp:.0f}")
+                brake_temps.append(f"{CORNER_NAMES[corner]} {bp:.0f}")
         if brake_temps:
             lines.append(f"  Brakes: {' / '.join(brake_temps)}")
         brake_bias = player.get("brake_bias", 0)
@@ -580,7 +798,9 @@ class ContextBuilder:
 
         incident_parts = []
         if incidents > 0 or team_incidents > 0:
-            incident_parts.append(f"incidents {incidents}x (team {team_incidents}x)")
+            incident_parts.append(
+                f"⚠ {incidents}x incidents (team {team_incidents}x) — safety-rating points, not car damage"
+            )
         damage_parts = []
         if weight_penalty > 0:
             damage_parts.append(f"+{weight_penalty:.2f}kg damage weight")
@@ -594,6 +814,12 @@ class ContextBuilder:
             lines.append(f"  Incidents: {' | '.join(incident_parts)}")
         if damage_parts:
             lines.append(f"  Damage: {' | '.join(damage_parts)}")
+        elif not weight_penalty and not repair_time and not opt_repair_time:
+            # Only show this when there's no damage data at all — prevents the
+            # LLM from saying "no damage reported" when it simply doesn't have data
+            lines.append(
+                "  Body/aero damage: not available (only incident points tracked)"
+            )
 
         # Push-to-pass
         p2p_remaining = player.get("p2p_remaining", 0)
@@ -614,6 +840,18 @@ class ContextBuilder:
                 shift_str.append(f"{shift_pct:.0%} throttle")
             lines.append(f"  Shift: {' | '.join(shift_str)}")
 
+        # Player lap times — shown even without lap history so the LLM
+        # knows the driver's own pace (not just nearby cars' times)
+        last_lap = player.get("last_lap_time", 0)
+        best_lap = player.get("best_lap_time", 0)
+        lap_time_parts = []
+        if last_lap > 0:
+            lap_time_parts.append(f"last {format_lap_time(last_lap)}")
+        if best_lap > 0:
+            lap_time_parts.append(f"best {format_lap_time(best_lap)}")
+        if lap_time_parts:
+            lines.append(f"  Pace: {' | '.join(lap_time_parts)}")
+
         # Proximity — filter out iRacing sentinel values (e.g. 500000.0 = no car nearby)
         car_prox = player.get("car_left_right", 0)
         dist_ahead = player.get("car_dist_ahead", 0)
@@ -626,9 +864,9 @@ class ContextBuilder:
             if prox_str:
                 prox_parts.append(prox_str)
         if 0 < dist_ahead < PROXIMITY_SENTINEL:
-            prox_parts.append(f"+{dist_ahead:.2f}s ahead")
+            prox_parts.append(f"nearest ahead: +{dist_ahead:.2f}s")
         if 0 < dist_behind < PROXIMITY_SENTINEL:
-            prox_parts.append(f"-{dist_behind:.2f}s behind")
+            prox_parts.append(f"nearest behind: -{dist_behind:.2f}s")
         if tow_time > 0:
             prox_parts.append(f"tow {tow_time:.2f}s")
         if prox_parts:

@@ -8,9 +8,11 @@ iracing:
 llm:
   base_url: "https://ollama.com/v1"         # Ollama Cloud endpoint
   api_key_env: "2d037788fae94179ba526b56ec4f1dea.J6EUKATFFsHZMzykGG_cVfog"            # Reads from environment variable
-  model: "ministral-3:14b-cloud"
+  #model: "ministral-3:14b-cloud"
+  model: "gemma4:31b-cloud"
   max_tokens: 300
   temperature: 0.3
+  timeout: 5.0                              # Seconds to wait for LLM response before giving up
 
 # Action execution (v1: dry_run only — actions are logged but not sent to iRacing)
 actions:
@@ -64,11 +66,17 @@ prompt:
     Rules:
     - Only respond when asked. Don't promise to monitor or call pit later.
     - Don't suggest setup changes (pressures, brake bias) without known reference ranges.
-    - Don't assess temps or pressures as high/low without knowing the car's normal range — just report values.
+    - Don't assess temps or pressures as high/low/normal/stable without knowing the car's normal range — just report values.
     - Don't name track corners unless that data is in the context.
-    - 'Incidents' are safety points (0x per off-track), NOT car damage.
-    - If tyre data is marked unreliable, don't comment on degradation, trends, or whether values are changing.
-    - [ACTION] add_fuel amounts: whole litres, min 1L, max = tank capacity - current fuel.
+    - 'Incidents' are safety points (0x per off-track), NOT car damage. Always report the count when it's in the context.
+    - If tyre data is marked unreliable, still report the values but don't comment on degradation, trends, or whether they're changing. Say 'last known: Left Front 79C...' rather than skipping them.
+    - [ACTION] add_fuel amounts: whole litres only (integers, never decimals), min 1L, max = tank capacity minus current fuel. Never exceed tank capacity.
+    - Weather data is current conditions only — never predict future weather.
+    - Lap times in the 'Pace' line are the driver's own times. Lap times in the 'Nearby' section are other cars' times.
+    - When fuel burn says 'unknown', do NOT invent a specific L/lap figure. Say 'fuel burn unknown' or estimate from race structure only.
+    - Never say 'monitor' or 'keep an eye on' — you give one-shot advice, not continuous tracking.
+    - Only include [ACTION] when the driver asks about pitting, fuel, tyres, or strategy. Do not add actions to unrelated questions.
+    - When 'Fuel to add' is shown in context, use that exact amount in [ACTION] add_fuel. Do not invent different amounts.
 
     Optional actions: [ACTION] pit_this_lap | add_fuel: <litres> | change_tyres | clear_penalty
   context_depth: "full"       # "minimal", "medium", or "full"
@@ -83,6 +91,19 @@ state:
   track_lap_times: true       # Store per-lap data for trend analysis
   track_fuel: true             # Track fuel consumption per lap
   track_tyre_temps: true       # Track tyre temperature trends
+  calibration_laps: 5          # Laps to average for auto-baseline (engine & tyre temps)
+  # Optional: manual reference ranges override auto-calibration for listed fields
+  # Remove or leave empty to use auto-calibration instead.
+  # reference_ranges:
+  #   oil_temp:
+  #     normal_low: 80
+  #     normal_high: 110
+  #   water_temp:
+  #     normal_low: 75
+  #     normal_high: 105
+  #   oil_press:
+  #     normal_low: 3.0
+  #     normal_high: 5.0
 
 # Capture/replay test mode
 capture:

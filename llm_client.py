@@ -54,6 +54,7 @@ class LLMClient:
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.timeout = llm_config.get("timeout", 5.0)
         self.base_url = base_url
         self._api_key = api_key
 
@@ -83,6 +84,7 @@ class LLMClient:
                 messages=messages,
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
+                timeout=self.timeout,
             )
 
             content = response.choices[0].message.content.strip()
@@ -98,6 +100,11 @@ class LLMClient:
             return content
 
         except Exception as e:
+            # If the call timed out, give a user-friendly message
+            err_str = str(e)
+            if "timeout" in err_str.lower() or "timed out" in err_str.lower():
+                logger.warning("LLM call timed out")
+                return "I'm busy, try again in a minute."
             error_msg = f"LLM call failed: {e}"
             logger.error(error_msg)
             return f"[Error] {error_msg}"

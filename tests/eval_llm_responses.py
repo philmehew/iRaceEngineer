@@ -108,22 +108,62 @@ def load_snapshots(session_dir: str, count: int):
     return snapshots
 
 
+def load_all_snapshots(session_dir: str):
+    """Load ALL snapshots from a session directory (in order)."""
+    all_files = sorted(
+        f
+        for f in os.listdir(session_dir)
+        if f.startswith("snapshot_") and f.endswith(".json")
+    )
+    snapshots = []
+    for filepath_str in all_files:
+        filepath = os.path.join(session_dir, filepath_str)
+        with open(filepath) as f:
+            data = json.load(f)
+        snapshots.append(data)
+    return snapshots
+
+
 def run_eval(session_dir: str, count: int, output_file: str, config: dict):
-    """Run the evaluation: load snapshots, ask questions, log responses."""
+    """Run the evaluation: load snapshots, ask questions, log responses.
+
+    Feeds ALL snapshots into a single persistent RaceState so that
+    lap history accumulates and fuel burn calculations work properly.
+    Only queries the LLM at evenly-spaced intervals.
+    """
     llm = LLMClient(config)
     context_builder = ContextBuilder(config)
 
-    snapshots = load_snapshots(session_dir, count)
-    print(f"Loaded {len(snapshots)} snapshots from {session_dir}")
+    all_data = load_all_snapshots(session_dir)
+    total_snaps = len(all_data)
+    print(f"Loaded {total_snaps} snapshots from {session_dir}")
 
+    # Pick evenly-spaced query indices into the full snapshot list
+    if count >= total_snaps:
+        query_indices = list(range(total_snaps))
+    else:
+        query_indices = [int(i * (total_snaps - 1) / (count - 1)) for i in range(count)]
+    query_set = set(query_indices)
+
+    # Team setup (done once, reused for every snapshot)
+    team_config = config.get("team", {})
+    teammate_list = team_config.get("teammates", [])
+    driver_aliases = {}
+    for entry in teammate_list:
+        if isinstance(entry, str) and ":" in entry:
+            iracing_name, real_name = entry.split(":", 1)
+            driver_aliases[iracing_name.strip()] = real_name.strip()
+        elif isinstance(entry, dict):
+            for k, v in entry.items():
+                driver_aliases[str(k)] = str(v)
+
+    # Single persistent state — feed every snapshot so lap transitions
+    # are detected and fuel_used per lap is recorded properly.
+    state = RaceState(config)
     results = []
     question_idx = 0
 
-    for i, (snap_num, data) in enumerate(snapshots):
-        # Build race state
-        state = RaceState(config)
-        # Feed all snapshots up to this point for best state
-        # (but for speed, just use the single snapshot)
+    for snap_idx, data in enumerate(all_data):
         telemetry = data.get("telemetry", {})
         session_info = data.get("session_info", {})
         driver_names = data.get("driver_names", {})
@@ -131,31 +171,19 @@ def run_eval(session_dir: str, count: int, output_file: str, config: dict):
             driver_names = {int(k): v for k, v in driver_names.items()}
         state.update(telemetry, session_info, driver_names)
 
-        # Populate team indices and driver aliases from config
-        # (mimics what main.py does with IRacingClient.detect_team_indices)
-        team_config = config.get("team", {})
-        teammate_list = team_config.get("teammates", [])
-        auto_detect = team_config.get("auto_detect", True)
-        driver_aliases = {}
-
-        # Parse teammate entries (supports "Nickname: RealName" mappings)
-        for entry in teammate_list:
-            if isinstance(entry, str) and ":" in entry:
-                iracing_name, real_name = entry.split(":", 1)
-                driver_aliases[iracing_name.strip()] = real_name.strip()
-            elif isinstance(entry, dict):
-                for k, v in entry.items():
-                    driver_aliases[str(k)] = str(v)
-
-        # Match teammates by name against driver_names
-        team_indices = set()
-        if driver_names and (auto_detect or teammate_list):
+        # Set team info on first snapshot (driver names available then)
+        if snap_idx == 0 and driver_names:
+            team_indices = set()
             for car_idx, name in driver_names.items():
                 if name in driver_aliases:
                     team_indices.add(car_idx)
+            state.set_team_indices(team_indices, driver_aliases)
+            state.set_driver_names(driver_names)
 
-        state.set_team_indices(team_indices, driver_aliases)
-        state.set_driver_names(driver_names)
+        # Only query the LLM at selected intervals
+        if snap_idx not in query_set:
+            continue
+
         snapshot = state.get_snapshot()
 
         # Pick question (cycle through)
@@ -186,7 +214,7 @@ def run_eval(session_dir: str, count: int, output_file: str, config: dict):
 
         results.append(
             {
-                "snapshot": snap_num,
+                "snapshot": snap_idx + 1,
                 "question": question or "(general strategy)",
                 "context": context,
                 "response": response or "(empty)",
@@ -194,7 +222,8 @@ def run_eval(session_dir: str, count: int, output_file: str, config: dict):
             }
         )
 
-        print(f"  [{i + 1}/{len(snapshots)}] Snap {snap_num}: {summary}")
+        done = len(results)
+        print(f"  [{done}/{count}] Snap {snap_idx + 1}: {summary}")
         print(f"    Q: {question or '(general strategy)'}")
         print(f"    A: {(response or '(empty)')[:120]}...")
         print()

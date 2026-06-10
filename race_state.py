@@ -17,6 +17,17 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class EngineSnapshot:
+    """Engine health readings captured at a point in time."""
+
+    oil_temp: float = 0.0
+    oil_press: float = 0.0
+    water_temp: float = 0.0
+    voltage: float = 0.0
+    manifold_press: float = 0.0
+
+
+@dataclass
 class TyreState:
     """Tyre data for one corner."""
 
@@ -39,6 +50,7 @@ class LapRecord:
     fuel_at_end: float = 0.0
     fuel_used: float = 0.0
     tyre_temps: dict[str, TyreState] = field(default_factory=dict)
+    engine: EngineSnapshot = field(default_factory=EngineSnapshot)
     was_personal_best: bool = False
     was_fastest: bool = False
 
@@ -239,7 +251,9 @@ class RaceState:
 
         # Internal tracking for lap detection
         self._last_lap_completed: int = -1
+        self._last_lap: int = -1  # Track Lap counter to detect new laps
         self._fuel_at_lap_start: float = 0.0
+        self._was_on_pit_road: bool = False  # Track pit road transitions
 
         # Tyre staleness tracking: store previous tick's tyre values
         self._prev_tyre_values: dict[str, TyreState] | None = None
@@ -304,6 +318,15 @@ class RaceState:
 
         self._tick_count += 1
         self._last_update_time = time.time()
+
+        # Detect iRacing session reset: Lap drops to 0 after we've been
+        # racing (e.g. session ends, new session loads). When this happens,
+        # preserve the last known state instead of overwriting with zeros.
+        new_lap = int(telemetry.get("Lap", 0))
+        if new_lap == 0 and self._last_lap > 0:
+            # Session ended / reset — keep last known state, don't process
+            # the zeroed-out telemetry that iRacing sends after the chequered.
+            return
 
         # Update session state
         self._update_session(telemetry, session_info)
@@ -648,23 +671,49 @@ class RaceState:
         )[: max_nearby * 2]
 
     def _check_lap_completion(self, telemetry: dict):
-        """Detect lap completions and record lap history for the player."""
-        current_lap_completed = self.player.lap_completed
+        """Detect lap completions and record lap history for the player.
 
+        Fuel tracking: _fuel_at_lap_start is captured once when a new lap
+        begins (Lap counter increments) and held until that lap completes.
+        This gives accurate per-lap fuel consumption instead of the tiny
+        tick-to-tick delta that the old code produced (~0.01L instead of ~1.3L).
+        """
+        current_lap_completed = self.player.lap_completed
+        current_lap = self.player.lap
+
+        # Record the completed lap FIRST (using the old _fuel_at_lap_start
+        # from when this lap began), before we update it for the new lap.
         if (
             current_lap_completed > self._last_lap_completed
             and self._last_lap_completed >= 0
         ):
             lap_time = self.player.last_lap_time
+            # iRacing sometimes clears LapLastLapTime to 0 at the instant
+            # LapCompleted increments. Fall back to CarIdxLastLapTime.
+            if lap_time <= 0 and telemetry:
+                idx_lap_times = telemetry.get("CarIdxLastLapTime", [])
+                car_idx = self.player.car_idx
+                if (
+                    car_idx >= 0
+                    and car_idx < len(idx_lap_times)
+                    and idx_lap_times[car_idx] > 0
+                ):
+                    lap_time = float(idx_lap_times[car_idx])
             if lap_time > 0:
+                # Fuel used this lap: start - end. Clamp to 0 — negative
+                # means the car refuelled (pit stop), which isn't "fuel saved".
+                fuel_used = max(
+                    0.0,
+                    self._fuel_at_lap_start - self.player.fuel_level
+                    if self._fuel_at_lap_start > 0
+                    else 0.0,
+                )
                 record = LapRecord(
                     lap_number=current_lap_completed,
                     lap_time=lap_time,
                     fuel_at_start=self._fuel_at_lap_start,
                     fuel_at_end=self.player.fuel_level,
-                    fuel_used=self._fuel_at_lap_start - self.player.fuel_level
-                    if self._fuel_at_lap_start > 0
-                    else 0.0,
+                    fuel_used=fuel_used,
                     tyre_temps={
                         corner: TyreState(
                             temp_left=self.player.tyres[corner].temp_left,
@@ -674,6 +723,13 @@ class RaceState:
                         for corner in ["LF", "RF", "LR", "RR"]
                         if corner in self.player.tyres
                     },
+                    engine=EngineSnapshot(
+                        oil_temp=self.player.oil_temp,
+                        oil_press=self.player.oil_press,
+                        water_temp=self.player.water_temp,
+                        voltage=self.player.voltage,
+                        manifold_press=self.player.manifold_press,
+                    ),
                     was_personal_best=lap_time
                     <= (
                         self.player.best_lap_time
@@ -690,8 +746,21 @@ class RaceState:
                 if len(self.player.lap_history) > max_history:
                     self.player.lap_history = self.player.lap_history[-max_history:]
 
+        # After recording the lap, capture fuel for the START of the new lap.
+        # When Lap increments (new lap begins), the current fuel_level is the
+        # fuel at the start of this new lap (= fuel at end of previous lap).
+        if current_lap > self._last_lap and self._last_lap >= 0:
+            self._fuel_at_lap_start = self.player.fuel_level
+
+        # Detect pit exit: when the car leaves pit road, reset the fuel
+        # baseline so the next lap's fuel_used calculation isn't skewed by
+        # the refuel (e.g. fuel going from 0.22L to 1.73L mid-lap).
+        if self._was_on_pit_road and not self.player.on_pit_road:
+            self._fuel_at_lap_start = self.player.fuel_level
+        self._was_on_pit_road = self.player.on_pit_road
+
         self._last_lap_completed = current_lap_completed
-        self._fuel_at_lap_start = self.player.fuel_level
+        self._last_lap = current_lap
 
     # --- Derived values ---
 
@@ -729,18 +798,82 @@ class RaceState:
         return "unreliable"
 
     @property
+    def engine_baseline(self) -> EngineSnapshot | None:
+        """Auto-calibrated engine baseline from the first N completed laps.
+
+        Returns averaged engine values from the calibration period, or None
+        if not enough laps have been completed yet. Used by the context
+        builder to flag values that deviate from early-race norms.
+
+        N is configured via config.state.calibration_laps (default 5).
+        """
+        if not self.player.lap_history:
+            return None
+
+        cal_laps = self.config.get("state", {}).get("calibration_laps", 5)
+        calibration = self.player.lap_history[:cal_laps]
+
+        # Only use laps that have non-zero engine data
+        valid = [r for r in calibration if r.engine.oil_temp > 0]
+        if len(valid) < 2:  # Need at least 2 laps for a meaningful average
+            return None
+
+        n = len(valid)
+        return EngineSnapshot(
+            oil_temp=sum(r.engine.oil_temp for r in valid) / n,
+            oil_press=sum(r.engine.oil_press for r in valid) / n,
+            water_temp=sum(r.engine.water_temp for r in valid) / n,
+            voltage=sum(r.engine.voltage for r in valid) / n,
+            manifold_press=sum(r.engine.manifold_press for r in valid) / n,
+        )
+
+    @property
+    def tyre_baseline(self) -> dict[str, float] | None:
+        """Auto-calibrated tyre temp baseline from the first N completed laps.
+
+        Returns {corner: avg_center_temp} from the calibration period, or None
+        if not enough laps have been completed yet.
+
+        N is configured via config.state.calibration_laps (default 5).
+        """
+        if not self.player.lap_history:
+            return None
+
+        cal_laps = self.config.get("state", {}).get("calibration_laps", 5)
+        calibration = self.player.lap_history[:cal_laps]
+
+        # Collect per-corner temps from laps that have tyre data
+        corner_sums: dict[str, float] = {}
+        corner_counts: dict[str, int] = {}
+        for r in calibration:
+            for corner, ts in r.tyre_temps.items():
+                if ts.temp_center > 0:
+                    corner_sums[corner] = corner_sums.get(corner, 0) + ts.temp_center
+                    corner_counts[corner] = corner_counts.get(corner, 0) + 1
+
+        # Need at least 2 laps with data for each corner
+        if not corner_counts or min(corner_counts.values()) < 2:
+            return None
+
+        return {c: corner_sums[c] / corner_counts[c] for c in corner_sums}
+
+    @property
     def fuel_laps_remaining(self) -> float:
         """Estimate how many laps of fuel remain for the player.
 
-        Uses lap history when available, falls back to burn rate + estimated
-        lap time when no history exists yet (e.g. early race).
+        Uses lap history when available. Falls back to burn rate + estimated
+        lap time when no history exists yet (e.g. early race or mid-race restart).
+        The fallback is unreliable — fuel_est_quality will be "unreliable" and
+        the context builder will hide the number.
         """
         # Primary method: use per-lap average from lap history
         avg = self.avg_fuel_per_lap
         if avg > 0:
             return self.player.fuel_level / avg
 
-        # Fallback: estimate from burn rate and best/current lap time
+        # Fallback: estimate from instantaneous burn rate and lap time.
+        # This is wildly unreliable (varies with throttle position) — the
+        # context builder will not show the resulting number to the LLM.
         fuel_rate = self.player.fuel_use_per_hour  # L/hr
         if fuel_rate <= 0:
             return 0.0
@@ -969,6 +1102,19 @@ class RaceState:
                 "engine_warnings": self.player.engine_warnings,
                 "manifold_press": self.player.manifold_press,
                 "voltage": self.player.voltage,
+                # Baselines (auto-calibrated from first N laps)
+                "engine_baseline": (
+                    {
+                        "oil_temp": self.engine_baseline.oil_temp,
+                        "oil_press": self.engine_baseline.oil_press,
+                        "water_temp": self.engine_baseline.water_temp,
+                        "voltage": self.engine_baseline.voltage,
+                        "manifold_press": self.engine_baseline.manifold_press,
+                    }
+                    if self.engine_baseline
+                    else None
+                ),
+                "tyre_baseline": self.tyre_baseline,
                 # Damage and penalties
                 "weight_penalty": self.player.weight_penalty,
                 "fast_repairs_used": self.player.fast_repairs_used,
