@@ -130,6 +130,32 @@ def run_eval(session_dir: str, count: int, output_file: str, config: dict):
         if driver_names:
             driver_names = {int(k): v for k, v in driver_names.items()}
         state.update(telemetry, session_info, driver_names)
+
+        # Populate team indices and driver aliases from config
+        # (mimics what main.py does with IRacingClient.detect_team_indices)
+        team_config = config.get("team", {})
+        teammate_list = team_config.get("teammates", [])
+        auto_detect = team_config.get("auto_detect", True)
+        driver_aliases = {}
+
+        # Parse teammate entries (supports "Nickname: RealName" mappings)
+        for entry in teammate_list:
+            if isinstance(entry, str) and ":" in entry:
+                iracing_name, real_name = entry.split(":", 1)
+                driver_aliases[iracing_name.strip()] = real_name.strip()
+            elif isinstance(entry, dict):
+                for k, v in entry.items():
+                    driver_aliases[str(k)] = str(v)
+
+        # Match teammates by name against driver_names
+        team_indices = set()
+        if driver_names and (auto_detect or teammate_list):
+            for car_idx, name in driver_names.items():
+                if name in driver_aliases:
+                    team_indices.add(car_idx)
+
+        state.set_team_indices(team_indices, driver_aliases)
+        state.set_driver_names(driver_names)
         snapshot = state.get_snapshot()
 
         # Pick question (cycle through)

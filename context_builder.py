@@ -126,10 +126,10 @@ class ContextBuilder:
             "Rules:\n"
             "- Only respond when asked. Don't promise to monitor or call pit later.\n"
             "- Don't suggest setup changes (pressures, brake bias) without known reference ranges.\n"
-            "- Don't assess temps as high/low without knowing the car's normal range — just report values.\n"
+            "- Don't assess temps or pressures as high/low without knowing the car's normal range — just report values.\n"
             "- Don't name track corners unless that data is in the context.\n"
             "- 'Incidents' are safety points (0x per off-track), NOT car damage.\n"
-            "- If tyre data is marked FROZEN, it hasn't changed since pit exit — don't comment on degradation.\n"
+            "- If tyre data is marked unreliable, don't comment on degradation, trends, or whether values are changing.\n"
             "- [ACTION] add_fuel amounts: whole litres, min 1L, max = tank capacity - current fuel.\n\n"
             "Optional actions: [ACTION] pit_this_lap | add_fuel: <litres> | change_tyres | clear_penalty"
         )
@@ -202,15 +202,14 @@ class ContextBuilder:
         fuel_laps = player.get("fuel_laps_remaining", 0)
         fuel_pct = player.get("fuel_pct", 0)
         fuel_est_quality = player.get("fuel_est_quality", "unreliable")
-        quality_tag = ""
-        if fuel_laps > 0:
-            if fuel_est_quality == "unreliable":
-                quality_tag = " (rough estimate)"
-            elif fuel_est_quality == "rough":
-                quality_tag = " (approx)"
+        if fuel_laps > 0 and fuel_est_quality == "good":
+            lines.append(f"Fuel: {format_pct(fuel_pct)} (~{fuel_laps:.1f} laps)")
+        elif fuel_laps > 0 and fuel_est_quality == "rough":
             lines.append(
-                f"Fuel: {format_pct(fuel_pct)} (~{fuel_laps:.1f} laps{quality_tag})"
+                f"Fuel: {format_pct(fuel_pct)} (~{fuel_laps:.1f} laps, approx)"
             )
+        elif fuel_pct > 0:
+            lines.append(f"Fuel: {format_pct(fuel_pct)} (laps remaining: unreliable)")
         else:
             lines.append(f"Fuel: {format_pct(fuel_pct)}")
         lines.append(f"Laps remaining: {laps_remain}")
@@ -438,7 +437,6 @@ class ContextBuilder:
         fuel_laps = player.get("fuel_laps_remaining", 0)
         fuel_pct = player.get("fuel_pct", 0)
         fuel_level = player.get("fuel_level", 0)
-        fuel_rate = player.get("fuel_use_per_hour", 0)
         fuel_est_quality = player.get("fuel_est_quality", "unreliable")
         avg_fuel_per_lap = player.get("avg_fuel_per_lap", 0)
 
@@ -474,15 +472,14 @@ class ContextBuilder:
         fuel_line += f" ({format_pct(fuel_pct)}, {fuel_desc})"
 
         # Laps remaining — show quality indicator
-        if fuel_laps > 0:
-            quality_tag = ""
-            if fuel_est_quality == "unreliable":
-                quality_tag = " (rough estimate)"
-            elif fuel_est_quality == "rough":
-                quality_tag = " (approx)"
-            fuel_line += f" — ~{fuel_laps:.1f} laps{quality_tag}"
-        elif fuel_pct > 0 and fuel_est_quality == "unreliable":
-            fuel_line += " — laps remaining: N/A (no lap history yet)"
+        # When quality is "unreliable" (no lap history), the number can be wildly
+        # wrong (e.g. 815 laps). Don't show the number — just say N/A.
+        if fuel_laps > 0 and fuel_est_quality == "good":
+            fuel_line += f" — ~{fuel_laps:.1f} laps"
+        elif fuel_laps > 0 and fuel_est_quality == "rough":
+            fuel_line += f" — ~{fuel_laps:.1f} laps (approx)"
+        elif fuel_pct > 0:
+            fuel_line += " — laps remaining: unreliable"
 
         # Fuel urgency warning
         if 0 < fuel_pct < 0.2 and fuel_laps > 0:
@@ -491,21 +488,42 @@ class ContextBuilder:
         lines.append(fuel_line)
 
         # Per-lap burn rate (from lap history) — much more reliable than instantaneous
+        # Only show burn rate when we have reliable data. When quality is "unreliable"
+        # (no lap history), the instantaneous rate is wildly variable and misleading —
+        # the LLM will do math with it despite the "unreliable" label.
         if avg_fuel_per_lap > 0:
             lines.append(
                 f"  Fuel burn: ~{avg_fuel_per_lap:.2f} L/lap (avg over recent laps)"
             )
-        elif fuel_rate > 0:
-            lines.append(
-                f"  Fuel burn rate: {fuel_rate:.2f} L/hr (instantaneous, unreliable)"
-            )
+        # Don't show instantaneous rate when unreliable — it causes the LLM to
+        # estimate fuel laps from a single throttle position snapshot
 
-        # Race laps remaining (estimated for time-based races)
-        if is_time_race and estimated_total and isinstance(race_laps, int):
-            race_laps_remain = max(0, estimated_total - race_laps)
-            lines.append(
-                f"  Race laps remaining: ~{race_laps_remain} (estimated from session time)"
-            )
+        # Race duration and time remaining (for time-based races)
+        # Show both time and laps — the LLM needs to know the race is e.g. 30 min
+        # so it can reason about fuel needs even without lap-by-lap history.
+        session_time = session.get("session_time", 0)
+        time_remain_sec = session.get("time_remain", 0)
+        if is_time_race:
+            # Time-based race (e.g. 30 min sprint)
+            if session_time > 0:
+                session_min = int(session_time / 60)
+                lines.append(f"  Race duration: {session_min} min")
+            if time_remain_sec > 0:
+                remain_min = time_remain_sec / 60
+                if remain_min < 1:
+                    lines.append(f"  Time remaining: {int(time_remain_sec)}s")
+                else:
+                    lines.append(f"  Time remaining: ~{remain_min:.1f} min")
+            if estimated_total and isinstance(race_laps, int):
+                race_laps_remain = max(0, estimated_total - race_laps)
+                if race_laps_remain <= 1:
+                    lines.append(
+                        f"  Race laps remaining: ~{race_laps_remain} — RACE ENDING SOON"
+                    )
+                else:
+                    lines.append(
+                        f"  Race laps remaining: ~{race_laps_remain} laps (estimated)"
+                    )
 
         # Tyres — show staleness indicator
         # iRacing freezes tyre data on track for most cars — only updates in pits.
@@ -515,13 +533,13 @@ class ContextBuilder:
         tyre_staleness = player.get("tyre_staleness", "unknown")
         if tyres:
             if tyre_staleness == "stale":
-                lines.append(
-                    "  Tyres: ⚠ FROZEN — on track, data unchanged since pit exit"
-                )
+                lines.append("  Tyres: unreliable (on track, data not updating)")
             elif tyre_staleness == "live":
-                lines.append("  Tyres: (live data — values updating)")
+                lines.append("  Tyres: (data updating — fresh from pit stop)")
             else:
-                lines.append("  Tyres: (status unknown — may be frozen on track)")
+                lines.append(
+                    "  Tyres: unreliable (status unknown, data may not be updating)"
+                )
             for corner in ["LF", "RF", "LR", "RR"]:
                 ts = tyres.get(corner, {})
                 if not ts:

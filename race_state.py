@@ -172,7 +172,8 @@ class SessionState:
     session_num: int = 0
     laps_total: int = 0
     laps_remain: int = 0
-    time_remain: float = 0.0  # Seconds
+    time_remain: float = 0.0  # Seconds remaining in session
+    session_time: float = 0.0  # Total session duration in seconds (e.g. 1800 = 30 min)
     flags: int = 0  # SessionFlags bitmask
     session_state: int = 0
     race_laps: int = 0
@@ -382,6 +383,15 @@ class RaceState:
                     self.session.session_name = s.get(
                         "SessionName", self.session.session_name
                     )
+                    # Parse total session time (e.g. "1800.0000 sec" or float seconds)
+                    session_time_raw = s.get("SessionTime", 0)
+                    if isinstance(session_time_raw, str):
+                        # "1800.0000 sec" -> 1800.0
+                        session_time_raw = session_time_raw.replace(" sec", "").strip()
+                    try:
+                        self.session.session_time = float(session_time_raw or 0)
+                    except (ValueError, TypeError):
+                        self.session.session_time = 0.0
                     break
 
             # Driver info — car spec and shift RPMs
@@ -900,6 +910,7 @@ class RaceState:
                 "laps_total": self.session.laps_total,
                 "laps_remain": self.session.laps_remain,
                 "time_remain": self.session.time_remain,
+                "session_time": self.session.session_time,
                 "flags": self.flags_list,
                 "race_laps": self.session.race_laps,
                 "weather": {
