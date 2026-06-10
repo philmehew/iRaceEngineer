@@ -42,12 +42,12 @@ team:
   auto_detect: true              # Match drivers with the same TeamName as the player
   teammates:
     - Evolution: Patrik Farsang
-    - Wayne Smith8
-    - Andre Groove
-    - Dan Golden
-    - Dave Cartnerdobbs
-    - Liam Biggs
-    - David Barlow
+    - Wayne: Wayne Smith8
+    - Groove: Andre Groove
+    - Dan: Dan Golden
+    - Dangerous: Dave Cartnerdobbs
+    - Liam: Liam Biggs
+    - Dave2: David Barlow
     - Mayhem: Phil Mehew
   car_numbers: []                # Alternative: identify by car number
 
