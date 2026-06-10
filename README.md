@@ -10,6 +10,7 @@ Real-time iRacing data collection with on-demand LLM race engineering. Collects 
 - **Sends** the prompt to any OpenAI-compatible LLM endpoint when you press F9 (text query) or hold F10 (voice query)
 - **Parses** optional `[ACTION]` directives in the LLM response (pit this lap, add fuel, change tyres) — logged in dry-run mode, executable when enabled
 - **Speaks** LLM responses aloud via Piper TTS, and **listens** for voice questions via Whisper STT (optional, fully local)
+- **Spotter** — real-time audio calls for car proximity using pre-recorded WAV files (car left, car right, three wide, clear). Deterministic local logic, no LLM involved
 - **Records** and **replays** telemetry snapshots for testing without iRacing running
 
 ## Architecture
@@ -23,11 +24,13 @@ iRacing (shared memory)
         ▼
  race_state.py        ← in-memory model: positions, fuel, tyres, laps, trends
         │
-        ▼ (on button press)
- context_builder.py   ← condenses state → configurable depth prompt
-        │
-        ▼
- llm_client.py        ← OpenAI-compatible API call (Ollama Cloud, OpenAI, LM Studio, etc.)
+        ├──────────────────────────┐
+        │                          │
+        ▼ (on button press)       ▼ (every tick)
+ context_builder.py   ← condenses     spotter.py ← deterministic audio calls
+        │              state →         │            (car left/right, three wide, clear)
+        ▼              configurable    ▼
+ llm_client.py        depth prompt   Pre-recorded WAV files (audio/)
         │
         ▼
  action_executor.py   ← parses [ACTION] directives (dry_run by default)
@@ -347,6 +350,40 @@ voice:
 
 Set to `null` (or omit) to use the system default.
 
+## Spotter (Car Proximity Audio)
+
+iRaceEngineer includes a **local, deterministic spotter** that plays pre-recorded audio calls when cars appear alongside you. No LLM is involved — this is pure edge-detection logic running at the telemetry poll rate (~30Hz).
+
+### How It Works
+
+The spotter reads iRacing's `CarLeftRight` telemetry value every tick:
+- **0** = no car alongside
+- **1** = car on your left
+- **2** = car on your right
+- **3** = car on both sides (three wide)
+
+It detects **transitions** (not steady state), so you only hear a call when a car appears or clears — not every tick. Cooldown timers prevent repeated calls.
+
+| Transition | Call | Audio File |
+|------------|------|------------|
+| Car appears on left (0→1, 2→3) | `car_left` | `audio/carleft.wav` |
+| Car appears on right (0→2, 1→3) | `car_right` | `audio/carright.wav` |
+| Both sides appear from none (0→3) | `three_wide` | `audio/carthreewide.wav` |
+| Any side clears (1→0, 2→0, 3→0, 3→1, 3→2) | `clear` | `audio/carclear.wav` |
+
+### Audio Files
+
+Place WAV files (mono, any sample rate) in the `audio/` directory and configure paths in `config.yaml`. Audio is loaded into memory at startup for low-latency playback. Missing files are logged as warnings but don't crash the app.
+
+### Cooldowns
+
+- **Proximity calls** (car left, car right, three wide): 3 second cooldown between repeat calls
+- **Clearance calls** (clear): 5 second cooldown between repeat calls
+
+### Disabling the Spotter
+
+Set `spotter.enabled: false` in `config.yaml`, or the spotter won't activate.
+
 ## Configuration
 
 ```yaml
@@ -398,6 +435,20 @@ voice:
     voice_key: "f10"
     push_to_talk: true
     max_record_seconds: 15
+
+# Spotter — real-time audio calls for car proximity (local, no LLM)
+spotter:
+  enabled: true
+  audio_paths:
+    car_left: "audio/carleft.wav"           # Car appears on left
+    car_right: "audio/carright.wav"          # Car appears on right
+    three_wide: "audio/carthreewide.wav"     # Cars on both sides simultaneously
+    clear: "audio/carclear.wav"              # Car clears from alongside
+  cooldowns:
+    proximity_ms: 3000                        # Don't repeat car left/right within 3s
+    clearance_ms: 5000                        # Don't repeat clear calls within 5s
+  output_device: null                         # null = system default
+  volume: 1.0                                 # Volume multiplier (independent of TTS)
 
 # Prompt configuration
 prompt:
@@ -555,11 +606,14 @@ Same as `--capture` but always saves to the `tests/sample_data/` folder (from co
 | `context_builder.py` | Condenses state → LLM prompt (3 depth levels, format helpers) |
 | `llm_client.py` | OpenAI-compatible API caller (works with any `/v1` endpoint) |
 | `action_executor.py` | Parses `[ACTION]` directives from LLM responses |
+| `spotter.py` | Deterministic car proximity calls — edge-detect CarLeftRight transitions, play WAV files |
 | `stt_client.py` | Speech-to-text — Whisper (faster-whisper) + mic capture (sounddevice) |
 | `tts_client.py` | Text-to-speech — Piper TTS + audio playback (sounddevice) |
 | `capture.py` | Record/replay telemetry JSON for testing |
 | `test_stt.py` | Standalone STT test — record + transcribe without iRacing |
 | `test_tts.py` | Standalone TTS test — speak text without iRacing |
+| `tests/test_modules.py` | Unit tests — RaceState, ContextBuilder, ActionExecutor, TelemetryReplay |
+| `tests/test_spotter.py` | Unit tests — ProximityDetector state machine, SpotterAudioPlayer, Spotter coordinator |
 | `tests/eval_llm_responses.py` | Batch LLM evaluation — asks 50 questions against replay data, logs results |
 
 ## Roadmap
@@ -567,11 +621,11 @@ Same as `--capture` but always saves to the `tests/sample_data/` folder (from co
 This is the first working slice of the iRaceEngineer spotter system. Planned next steps from the [spec notes](specnotes.md):
 
 - [ ] **SQLite persistence** — store per-lap data for historical queries
-- [ ] **Pre-recorded audio** — spotter calls for flags, proximity, clearance
+- [ ] **Pre-recorded audio** — spotter calls for flags, more clearance phrases
 - [x] **TTS output** — Piper TTS for spoken LLM responses (local, offline)
 - [x] **Mic input / STT** — faster-whisper for push-to-talk voice questions
 - [ ] **Multi-driver audio** — name-prefixed calls for 7 drivers
-- [ ] **Spotter proximity logic** — deterministic 30Hz calls for safety-critical alerts
+- [x] **Spotter proximity logic** — deterministic 30Hz calls for car proximity (car left/right, three wide, clear)
 - [ ] **Action execution** — enable real `[ACTION]` commands to iRacing
 - [ ] **Team-aware prompts** — label teammates explicitly in nearby cars section, show per-teammate data, separate team section in full depth
 

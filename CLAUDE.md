@@ -6,10 +6,10 @@ Real-time iRacing data collection with on-demand LLM race engineering. Reads tel
 
 ```
 iRacing (shared memory) → iracing_client.py → race_state.py → context_builder.py → llm_client.py → response
-                                                                                ↓
-                                                                         action_executor.py (dry_run by default)
-                                                                                ↓
-                                                                         tts_client.py (Piper TTS → speakers)
+                                                        ↓                      ↓
+                                                  spotter.py             action_executor.py (dry_run by default)
+                                                 (local audio)                    ↓
+                                                                        tts_client.py (Piper TTS → speakers)
 
 F10 key (hold) → stt_client.py (mic → Whisper) → transcribed text → context_builder → LLM
 ```
@@ -19,6 +19,7 @@ F10 key (hold) → stt_client.py (mic → Whisper) → transcribed text → cont
 - **context_builder.py** — condenses state into ~0.2-2KB prompt at 3 depth levels (minimal/medium/full)
 - **llm_client.py** — OpenAI-compatible API caller, works with Ollama Cloud, OpenAI, LM Studio, etc.
 - **action_executor.py** — parses [ACTION] directives from LLM responses, dry_run by default (v1)
+- **spotter.py** — deterministic real-time audio calls for car proximity (car left/right, three wide, clear) using pre-recorded WAV files; no LLM involved
 - **stt_client.py** — speech-to-text via faster-whisper + sounddevice mic capture, push-to-talk
 - **tts_client.py** — text-to-speech via Piper TTS + sounddevice playback, configurable output device
 - **capture.py** — record/replay telemetry JSON for testing without iRacing
@@ -33,6 +34,7 @@ F10 key (hold) → stt_client.py (mic → Whisper) → transcribed text → cont
 - **Testable without iRacing** — `--generate-samples` creates fake data, `--replay <dir>` feeds it through the pipeline
 - **Voice is optional** — voice deps in `[voice]` extra (`uv sync --extra voice`), graceful degradation if not installed
 - **Voice tested independently** — `test_stt.py` and `test_tts.py` are standalone scripts for testing each component
+- **Spotter is local and deterministic** — reads CarLeftRight telemetry at 30Hz, plays pre-recorded WAV files on transitions (car appears/clears alongside). No LLM involved. Edge-detection with cooldown timers prevents repeated calls. Uses sounddevice.OutputStream (not sd.play) to avoid conflicting with TTS.
 
 ## Tech Stack
 
@@ -80,6 +82,8 @@ Located in `tests/sample_data/` — 10 snapshots simulating a Spa 24h race stint
 ## File Locations
 
 - Config: `config.yaml`
+- Spotter audio: `audio/` (carleft.wav, carright.wav, carthreewide.wav, carclear.wav)
 - Sample data: `tests/sample_data/session_*`
+- Tests: `tests/test_modules.py`, `tests/test_spotter.py`
 - Plan file: `C:\Users\phil\.claude\plans\can-you-review-these-pure-crayon.md`
 - Spec notes: `specnotes.md`

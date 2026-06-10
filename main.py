@@ -35,6 +35,7 @@ from action_executor import ActionExecutor
 from capture import TelemetryCapture, TelemetryReplay, create_sample_data
 from stt_client import STTClient
 from tts_client import TTSClient
+from spotter import Spotter
 
 # Configure logging
 logging.basicConfig(
@@ -207,6 +208,20 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
             logger.warning(f"STT setup failed: {e}")
             stt = None
 
+    # Set up spotter (real-time audio calls for car proximity)
+    spotter = None
+    spotter_config = config.get("spotter", {})
+    if spotter_config.get("enabled", False):
+        try:
+            spotter = Spotter(config)
+            if spotter.enabled:
+                logger.info("Spotter enabled — car proximity calls active")
+            else:
+                spotter = None
+        except Exception as e:
+            logger.warning(f"Spotter setup failed: {e}")
+            spotter = None
+
     # Set up keyboard trigger
     trigger_key = config.get("trigger", {}).get("key", "f9")
     voice_key = voice_config.get("trigger", {}).get("voice_key", "f10")
@@ -315,6 +330,12 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                 with _state_lock:
                     state.update(telemetry, session_info, driver_names)
 
+                # Spotter tick — car proximity audio calls
+                if spotter is not None:
+                    car_lr = state.player.car_left_right
+                    on_track = state.player.is_on_track
+                    spotter.update(car_lr, is_on_track=on_track)
+
             else:
                 # iRacing disconnected — try to reconnect
                 logger.warning("iRacing disconnected, attempting reconnect...")
@@ -322,6 +343,9 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                     time.sleep(2)
                     continue
                 print("✅ Reconnected to iRacing")
+                # Reset spotter state on reconnect to avoid stale transitions
+                if spotter is not None:
+                    spotter.reset()
 
             time.sleep(tick_interval)
 
