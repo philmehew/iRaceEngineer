@@ -8,13 +8,27 @@ Usage:
     python test_tts.py "Box this lap, tyres are gone"     # Speak the text
     python test_tts.py --list-devices                      # List output devices
     python test_tts.py --device 5 "Hello"                  # Use output device 5
+    python test_tts.py --voice alan "Hello"                   # Use --voice shortcut
     python test_tts.py --model en_GB-alan-medium "Hello"   # Use specific model
     python test_tts.py --download en_GB-alan-medium        # Download a voice model
     python test_tts.py --file response.txt                 # Speak contents of file
+    python test_tts.py --wav out.wav "Box this lap"        # Write to WAV (no playback)
 """
 
 import argparse
 import sys
+
+import numpy as np
+
+# Short voice name aliases — use with --voice alan, --voice cori, etc.
+VOICE_ALIASES: dict[str, str] = {
+    "alan": "en_GB-alan-medium",
+    "alba": "en_GB-alba-medium",
+    "cori": "en_GB-cori-medium",
+    "cori-high": "en_GB-cori-high",
+    "northern": "en_GB-northern_english_male-medium",
+    "northern_english_male": "en_GB-northern_english_male-medium",
+}
 
 # Fix Windows console encoding for emoji/special characters
 if sys.platform == "win32":
@@ -57,6 +71,29 @@ def list_devices():
     print()
 
 
+def list_voices(voice_dir: str = "voices"):
+    """List available voice models and their aliases."""
+    import os
+
+    print("\n🗣️  Voice Aliases (use with --voice):\n")
+    for alias, model in VOICE_ALIASES.items():
+        onnx = os.path.join(voice_dir, f"{model}.onnx")
+        status = "✅ downloaded" if os.path.exists(onnx) else "❌ not downloaded"
+        print(f"  {alias:<25} → {model:<40} {status}")
+
+    print("\n📁 All models in voice directory:\n")
+    if os.path.isdir(voice_dir):
+        models = sorted(f for f in os.listdir(voice_dir) if f.endswith(".onnx"))
+        if models:
+            for m in models:
+                print(f"  {m}")
+        else:
+            print("  (none found)")
+    else:
+        print(f"  Directory '{voice_dir}' not found")
+    print()
+
+
 def download_voice(model_name: str, voice_dir: str):
     """Download a Piper voice model."""
     print(f"Downloading Piper voice model: {model_name}")
@@ -91,8 +128,12 @@ def speak_text(
     device: int | None = None,
     use_cuda: bool = True,
     volume: float = 1.0,
+    wav_path: str | None = None,
 ):
-    """Synthesize and speak text using Piper TTS."""
+    """Synthesize and speak text using Piper TTS.
+
+    If wav_path is set, writes audio to a WAV file instead of playing it.
+    """
     config = {
         "voice": {
             "tts": {
@@ -115,13 +156,31 @@ def speak_text(
         )
         return
 
-    print(f'🗣️  Speaking: "{text}"')
-    print(f"   Model: {model}")
-    if device is not None:
-        print(f"   Device: {device}")
+    if wav_path:
+        audio, sample_rate = tts.synthesize(text)
+        if audio.size == 0:
+            print("ERROR: Piper produced no audio")
+            return
+        import wave
 
-    tts.speak(text)
-    print("✅ Done")
+        # Convert float32 [-1, 1] to int16 for WAV
+        audio_int16 = np.clip(audio * 32768, -32768, 32767).astype(np.int16)
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(sample_rate)
+            wf.writeframes(audio_int16.tobytes())
+        print(
+            f'✅ Wrote "{text}" to {wav_path} ({sample_rate} Hz, {len(audio) / sample_rate:.1f}s)'
+        )
+    else:
+        print(f'🗣️  Speaking: "{text}"')
+        print(f"   Model: {model}")
+        if device is not None:
+            print(f"   Device: {device}")
+
+        tts.speak(text)
+        print("✅ Done")
 
 
 def main():
@@ -141,9 +200,19 @@ def main():
         help="Audio output device index (use --list-devices to see options)",
     )
     parser.add_argument(
+        "--voice",
+        metavar="ALIAS",
+        help="Voice shortcut (alan, cori, cori-high, northern). Overrides --model.",
+    )
+    parser.add_argument(
         "--model",
         default="en_GB-alan-medium",
-        help="Piper voice model name (default: en_GB-alan-medium)",
+        help="Full Piper voice model name (default: en_GB-alan-medium)",
+    )
+    parser.add_argument(
+        "--list-voices",
+        action="store_true",
+        help="List available voice aliases and downloaded models",
     )
     parser.add_argument(
         "--voice-dir",
@@ -166,6 +235,11 @@ def main():
         help="Disable GPU acceleration (use CPU only)",
     )
     parser.add_argument(
+        "--wav",
+        metavar="PATH",
+        help="Write audio to a WAV file instead of playing (useful over SSH)",
+    )
+    parser.add_argument(
         "--volume",
         type=float,
         default=1.0,
@@ -178,9 +252,23 @@ def main():
         list_devices()
         return
 
+    if args.list_voices:
+        list_voices(args.voice_dir)
+        return
+
     if args.download:
         download_voice(args.download, args.voice_dir)
         return
+
+    # Resolve --voice alias to full model name
+    model = args.model
+    if args.voice:
+        if args.voice in VOICE_ALIASES:
+            model = VOICE_ALIASES[args.voice]
+        else:
+            print(f"ERROR: Unknown voice alias '{args.voice}'")
+            print(f"Available: {', '.join(VOICE_ALIASES)}")
+            return
 
     # Get text to speak
     text = ""
@@ -191,17 +279,20 @@ def main():
         text = " ".join(args.text)
 
     if not text:
-        print("ERROR: Provide text to speak, or use --list-devices / --download")
+        print(
+            "ERROR: Provide text to speak, or use --list-devices / --list-voices / --download"
+        )
         parser.print_help()
         return
 
     speak_text(
         text=text,
-        model=args.model,
+        model=model,
         voice_dir=args.voice_dir,
         device=args.device,
         use_cuda=not args.no_cuda,
         volume=args.volume,
+        wav_path=args.wav,
     )
 
 

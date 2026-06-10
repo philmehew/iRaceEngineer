@@ -258,11 +258,24 @@ python test_tts.py "Box this lap, tyres are gone. Add sixty litres."
 # List available audio output devices
 python test_tts.py --list-devices
 
+# List available voice aliases and downloaded models
+python test_tts.py --list-voices
+
 # Play through a specific device (use index from --list-devices)
 python test_tts.py --device 5 "Hello"
 
-# Use a different voice model
+# Use a voice alias (short name)
+python test_tts.py --voice alan "Box this lap"
+python test_tts.py --voice cori "Box this lap"
+python test_tts.py --voice cori-high "Box this lap"
+python test_tts.py --voice northern "Box this lap"
+
+# Use a full model name
 python test_tts.py --model en_US-lessac-medium "Hello"
+
+# Write to WAV file instead of playing (useful over SSH)
+python test_tts.py --wav out.wav "Box this lap, tyres are gone"
+python test_tts.py --voice northern --wav out.wav "Box this lap"
 
 # Read text from a file
 python test_tts.py --file response.txt
