@@ -74,6 +74,11 @@ class ProximityDetector:
         self._prev_right = False
         self._last_call_time: dict[str, float] = {}
 
+        # Whether a car has been alongside since the last "clear" call.
+        # Prevents "clear" from firing before any proximity call was made
+        # (e.g. at session start) or while a car is still alongside.
+        self._car_alongside: bool = False
+
         # Pending clear tracking — debounce to avoid false "clear" calls
         # from telemetry flicker (car momentarily reads as gone).
         # Set to the monotonic time when the side first became clear;
@@ -164,6 +169,7 @@ class ProximityDetector:
                         )
                     )
                     self._last_call_time["three_wide"] = current_time
+                    self._car_alongside = True
                     # Reset proximity cooldowns for individual sides too, so
                     # a rapid 0→3→0→1 sequence doesn't re-trigger left immediately
                     self._last_call_time["car_left"] = current_time
@@ -180,6 +186,7 @@ class ProximityDetector:
                             )
                         )
                         self._last_call_time["car_left"] = current_time
+                        self._car_alongside = True
 
                 if right_appeared:
                     if self._cooldown_elapsed("car_right", current_time):
@@ -191,10 +198,23 @@ class ProximityDetector:
                             )
                         )
                         self._last_call_time["car_right"] = current_time
+                        self._car_alongside = True
 
-        # Clearance calls — only after the clear delay has elapsed
+        # Clearance calls — only after the clear delay has elapsed.
+        # Additional guards:
+        #   1. A car must have been alongside since the last "clear" call
+        #      (_car_alongside) — prevents "clear" at session start or
+        #      repeating "clear" when no car was ever there.
+        #   2. No car can be alongside right now (cur_left/cur_right) —
+        #      prevents "clear" playing simultaneously with a proximity call
+        #      (e.g. car leaves one side but appears on the other).
         if left_clear_matured or right_clear_matured:
-            if self._cooldown_elapsed("clear", current_time):
+            if (
+                self._car_alongside
+                and not cur_left
+                and not cur_right
+                and self._cooldown_elapsed("clear", current_time)
+            ):
                 calls.append(
                     SpotterCall(
                         call_type="clear",
@@ -203,7 +223,10 @@ class ProximityDetector:
                     )
                 )
                 self._last_call_time["clear"] = current_time
-            # Clear the pending timers regardless — we only fire once
+                self._car_alongside = False
+            # Clear the pending timers regardless — we only fire once.
+            # If we suppressed "clear" because a car is alongside on the
+            # other side, we'll get a new pending clear when that car leaves.
             if left_clear_matured:
                 self._pending_clear_since_left = None
             if right_clear_matured:
@@ -237,6 +260,7 @@ class ProximityDetector:
         self._prev_left = False
         self._prev_right = False
         self._last_call_time.clear()
+        self._car_alongside = False
         self._pending_clear_since_left = None
         self._pending_clear_since_right = None
 

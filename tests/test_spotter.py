@@ -136,24 +136,27 @@ class TestProximityDetectorTransitions:
         assert self._call_types(calls) == ["clear"]
 
     def test_clear_right_while_left_stays(self):
-        """3→1 should emit clear after the clear delay (right side cleared)."""
+        """3→1 should NOT emit clear while car still alongside on left."""
         self._tick(3)
         # Right clears, left stays — start debounce
         calls = self._tick(1)
         assert self._call_types(calls) == []
-        # After clear_delay, still at 1 (right gone) — clear fires
+        # After clear_delay, still at 1 (right gone, left still there) —
+        # "clear" must NOT fire because a car is still alongside on the left
         self.t += 0.2
         calls = self.detector.update(1, self.t)
-        assert self._call_types(calls) == ["clear"]
+        assert self._call_types(calls) == []
 
     def test_clear_left_while_right_stays(self):
-        """3→2 should emit clear after the clear delay (left side cleared)."""
+        """3→2 should NOT emit clear while car still alongside on right."""
         self._tick(3)
         calls = self._tick(2)
         assert self._call_types(calls) == []
+        # After clear_delay, still at 2 (left gone, right still there) —
+        # "clear" must NOT fire because a car is still alongside on the right
         self.t += 0.2
         calls = self.detector.update(2, self.t)
-        assert self._call_types(calls) == ["clear"]
+        assert self._call_types(calls) == []
 
     # --- Combined appearance + clearance ---
 
@@ -168,6 +171,48 @@ class TestProximityDetectorTransitions:
         self.t += 0.2
         calls = self.detector.update(0, self.t)
         assert self._call_types(calls) == ["clear"]
+
+    def test_clear_does_not_fire_without_prior_proximity(self):
+        """Clear should never fire if no car was ever alongside."""
+        # Starting from 0, staying at 0 — no car ever alongside
+        self._tick(0)
+        self._tick(0)
+        self.t += 1.0
+        calls = self.detector.update(0, self.t)
+        assert self._call_types(calls) == []
+
+    def test_clear_after_three_wide_then_one_side_clears_then_both_clear(self):
+        """3→1→0: clear only fires when ALL cars are gone, not when one side clears."""
+        calls = self._tick(3)
+        assert self._call_types(calls) == ["three_wide"]
+        # Right clears, left stays (3→1) — no "clear" yet
+        calls = self._tick(1)
+        assert self._call_types(calls) == []
+        # After clear_delay, still at 1 — still no "clear" (car on left)
+        self.t += 0.2
+        calls = self.detector.update(1, self.t)
+        assert self._call_types(calls) == []
+        # Now left also clears (1→0) — pending clear starts for left
+        calls = self._tick(0)
+        assert self._call_types(calls) == []
+        # After clear_delay, clear fires because all cars are gone
+        self.t += 0.2
+        calls = self.detector.update(0, self.t)
+        assert self._call_types(calls) == ["clear"]
+
+    def test_clear_not_fire_after_proximity_if_car_reappears(self):
+        """Clear should not fire if a car reappears before clear matures."""
+        calls = self._tick(1)
+        assert self._call_types(calls) == ["car_left"]
+        # Car disappears (1→0)
+        calls = self._tick(0)
+        assert self._call_types(calls) == []
+        # Car reappears on right before clear matures (0→2)
+        self.t += 0.2
+        calls = self.detector.update(2, self.t)
+        # Should get car_right, NOT clear
+        assert "clear" not in self._call_types(calls)
+        assert "car_right" in self._call_types(calls)
 
     def test_three_wide_then_clear(self):
         """3→0 after three_wide should emit clear after delay."""
@@ -465,9 +510,25 @@ class TestProximityDetectorReset:
 
         # Advance time past what would have been the clear delay
         self.t += 0.5
-        # Should NOT fire clear — the pending clear was cancelled
+        # Should NOT fire clear — the pending clear was cancelled AND
+        # _car_alongside was reset so clear has no basis to fire
         calls = self.detector.update(0, self.t)
         assert calls == []
+
+    def test_reset_clears_car_alongside_flag(self):
+        """After reset, _car_alongside is cleared so clear won't fire
+        even if a pending clear timer had matured before reset."""
+        self._tick(1)  # car appears — sets _car_alongside
+        self._tick(0)  # start clear debounce
+        self.t += 0.5  # advance past clear_delay (timer matures)
+
+        # Reset BEFORE the matured timer is processed
+        self.detector.reset()
+
+        # Even though time has passed, clear should not fire because
+        # _car_alongside was reset and no car was seen after reset
+        calls = self.detector.update(0, self.t)
+        assert self._call_types(calls) == []
 
 
 class TestProximityDetectorEdgeCases:

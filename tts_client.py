@@ -8,12 +8,48 @@ device selection. Model is loaded lazily on first use to avoid slow startup.
 
 import logging
 import os
+import re
 import threading
 import time
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def preprocess_for_tts(text: str) -> str:
+    """Preprocess text before sending to TTS to improve pronunciation.
+
+    Converts lap time patterns like "1:23.456" to natural language so the
+    TTS engine reads them naturally instead of saying "colon" or pausing
+    awkwardly at the colon.
+
+    Examples:
+        "1:23.456" → "1 minute 23.456"
+        "2:05.1" → "2 minutes 5.1"
+        "0:59.123" → "59.123" (under a minute, no minute part)
+    """
+
+    def _format_lap_time(m: re.Match) -> str:
+        minutes = int(m.group(1))
+        secs = int(m.group(2))
+        millis = m.group(3)
+        if minutes == 0:
+            # Under a minute: just say "59.123" (TTS reads "fifty nine point one two three")
+            return f"{secs}.{millis}"
+        else:
+            min_word = "minute" if minutes == 1 else "minutes"
+            return f"{minutes} {min_word} {secs}.{millis}"
+
+    # Convert lap times: M:SS.mmm → natural language
+    # Matches patterns like 1:23.456, 2:05.1, 0:59.123
+    text = re.sub(
+        r"(\d+):(\d{1,2})\.(\d+)",
+        _format_lap_time,
+        text,
+    )
+
+    return text
 
 
 class TTSClient:
@@ -121,6 +157,7 @@ class TTSClient:
         if not text.strip():
             return
 
+        text = preprocess_for_tts(text)
         self._load_voice()
         if self._voice is None:
             logger.warning("TTS voice not loaded — skipping speech")
@@ -184,7 +221,9 @@ class TTSClient:
         """Synthesize and play audio in a background thread.
 
         Non-blocking — returns immediately while audio plays.
+        Text is preprocessed for TTS before synthesis.
         """
+        text = preprocess_for_tts(text)
         thread = threading.Thread(target=self.speak, args=(text,), daemon=True)
         thread.start()
 
