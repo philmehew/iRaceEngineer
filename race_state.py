@@ -259,6 +259,7 @@ class DriverState:
     # Player-only: car status
     is_on_track: bool = False
     is_in_garage: bool = False
+    player_track_surface: int = 0  # iRacing PlayerTrackSurface: -1=not in world, 0=garage, 1=pit stall, 2=pit road, 3=on track
 
     # Player-only: proximity
     car_left_right: int = 0  # 0=none, 1=car left, 2=car right, 3=both
@@ -677,6 +678,7 @@ class RaceState:
         # Car status
         p.is_on_track = bool(telemetry.get("IsOnTrack", False))
         p.is_in_garage = bool(telemetry.get("IsInGarage", False))
+        p.player_track_surface = int(telemetry.get("PlayerTrackSurface", 0))
 
         # G-forces (player only)
         p.lat_accel = float(telemetry.get("LatAccel", 0.0))
@@ -1326,6 +1328,7 @@ class RaceState:
                 "speed": self.player.speed,
                 "is_on_track": self.player.is_on_track,
                 "is_in_garage": self.player.is_in_garage,
+                "player_track_surface": self.player.player_track_surface,
                 "fuel_level": self.player.fuel_level,
                 "fuel_pct": self.player.fuel_pct,
                 "fuel_use_per_hour": self.player.fuel_use_per_hour,

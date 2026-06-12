@@ -93,10 +93,23 @@ spotter:
     car_right: "audio/carright.wav"       # Car appears on right
     three_wide: "audio/carthreewide.wav"  # Cars on both sides simultaneously
     clear: "audio/carclear.wav"            # Car clears from alongside
+    fuel_five_laps: "audio/fuelfivelaps.wav"  # Fuel below 5 laps remaining
+    fuel_two_laps: "audio/fueltwolaps.wav"    # Fuel below 2 laps remaining
+    fuel_one_lap: "audio/fuelonelap.wav"      # Fuel below 1 lap remaining
+    flag_yellow: "audio/flagyellow.wav"        # Yellow flag
+    flag_blue: "audio/flagblue.wav"            # Blue flag (faster car behind)
+    flag_black: "audio/flagblack.wav"          # Black flag
+    flag_white: "audio/flagwhite.wav"          # White flag (slow car ahead)
+    flag_red: "audio/flagred.wav"              # Red flag
+    flag_checkered: "audio/flagchequered.wav"  # Checkered flag
+    flag_slippery: "audio/flagslippery.wav"    # Track surface slippery (wet)
+    pit_entry: "audio/pitentry.wav"            # Entered pit road
+    pit_exit: "audio/pitexit.wav"              # Exited pit road
   cooldowns:
     proximity_ms: 3000                    # Don't repeat proximity calls within 3s
     clearance_ms: 5000                    # Don't repeat clearance calls within 5s
     clear_delay_ms: 500                   # Debounce: car must be gone this long before "clear" fires
+    appear_delay_ms: 200                  # Debounce: car must be alongside this long before proximity fires
   output_device: null                     # null = system default, or device name/index
   volume: 1.0                             # Volume multiplier (independent of TTS)
 

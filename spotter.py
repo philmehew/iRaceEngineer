@@ -20,7 +20,12 @@ Key design decisions:
 - Uses sounddevice.OutputStream (not sd.play) to avoid killing TTS playback.
 - Edge detection, not level detection — fires only on transitions, not every tick.
 - Cooldown timers prevent repeated calls within a configurable window.
-- Guard: only processes CarLeftRight when the player is on track.
+- Appearance debounce: delays proximity calls by appear_delay_ms to suppress
+  telemetry flicker (e.g. iRacing briefly reporting the wrong side).
+- Guard: only processes CarLeftRight when the player is on the racing surface
+  (PlayerTrackSurface >= 3), suppressing false calls in the pit lane.
+- Fuel alert: plays "fuel_two_laps" when estimated laps remaining drops below
+  a configurable threshold (default 2.0 laps).
 """
 
 import logging
@@ -39,7 +44,9 @@ logger = logging.getLogger(__name__)
 class SpotterCall:
     """A single spotter call event to be played as audio."""
 
-    call_type: str  # e.g. "car_left", "car_right", "three_wide", "clear"
+    call_type: (
+        str  # e.g. "car_left", "car_right", "three_wide", "clear", "fuel_two_laps"
+    )
     priority: int  # 0=safety_critical, 1=team_wide, 2=driver_specific, 3=on_demand
     audio_key: str  # key into the pre-loaded audio samples dict
 
@@ -55,8 +62,17 @@ class ProximityDetector:
 
     The detector tracks the previous state per direction and fires events
     only on transitions (rising edges for appearance, falling edges for
-    clearance). A cooldown timer prevents repeated calls within a
+    clearance). Cooldown timers prevent repeated calls within a
     configurable window.
+
+    Appearance debounce: when a car first appears on a side, the call is
+    delayed by appear_delay_ms. If the reading changes during this window
+    (telemetry flicker reporting the wrong side), the pending call is
+    updated or cancelled. Only stable readings produce audio calls.
+
+    Clearance debounce: when a car disappears, the "clear" call is delayed
+    by clear_delay_ms to suppress telemetry flicker where the car momentarily
+    reads as gone.
 
     Special case: when transitioning from 0→3 (both sides at once from
     none), a single "three_wide" call is emitted instead of separate
@@ -69,6 +85,7 @@ class ProximityDetector:
         self._proximity_cooldown = cooldowns.get("proximity_ms", 3000) / 1000.0
         self._clearance_cooldown = cooldowns.get("clearance_ms", 5000) / 1000.0
         self._clear_delay = cooldowns.get("clear_delay_ms", 500) / 1000.0
+        self._appear_delay = cooldowns.get("appear_delay_ms", 200) / 1000.0
 
         self._prev_left = False
         self._prev_right = False
@@ -86,6 +103,13 @@ class ProximityDetector:
         self._pending_clear_since_left: float | None = None
         self._pending_clear_since_right: float | None = None
 
+        # Pending appearance tracking — debounce to avoid false proximity
+        # calls from telemetry flicker (car momentarily reads on wrong side).
+        # Set to the monotonic time when the side first appeared;
+        # None means the side is not pending an appearance.
+        self._pending_appear_since_left: float | None = None
+        self._pending_appear_since_right: float | None = None
+
     def update(self, car_left_right: int, current_time: float) -> list[SpotterCall]:
         """Process a CarLeftRight value and return any calls to play.
 
@@ -101,64 +125,63 @@ class ProximityDetector:
 
         calls: list[SpotterCall] = []
 
-        # --- Debounced clear detection ---
-        # Instead of firing "clear" the instant telemetry reads the car as gone,
-        # we require the car to be gone for clear_delay seconds. This prevents
-        # false "clear" calls from telemetry flicker (1-2 frames of 0 when the
-        # car is actually still alongside).
+        # === Phase 1: Update pending appearance timers ===
+        # When a car first appears on a side, start a pending appear timer
+        # instead of firing immediately. If the car disappears or changes
+        # side during the appear_delay window, we cancel the pending call.
 
-        if cur_left:
-            # Car is present on left — cancel any pending clear
-            self._pending_clear_since_left = None
-        elif self._prev_left:
-            # Car just disappeared from left — start pending clear timer
-            self._pending_clear_since_left = current_time
+        if cur_left and not self._prev_left:
+            # Car just appeared on left — start pending appear timer
+            self._pending_appear_since_left = current_time
+        elif not cur_left:
+            # Car is not on left — cancel any pending appearance
+            self._pending_appear_since_left = None
 
-        if cur_right:
-            # Car is present on right — cancel any pending clear
-            self._pending_clear_since_right = None
-        elif self._prev_right:
-            # Car just disappeared from right — start pending clear timer
-            self._pending_clear_since_right = current_time
+        if cur_right and not self._prev_right:
+            # Car just appeared on right — start pending appear timer
+            self._pending_appear_since_right = current_time
+        elif not cur_right:
+            # Car is not on right — cancel any pending appearance
+            self._pending_appear_since_right = None
 
-        # Check if any pending clears have matured past the delay threshold
-        left_clear_matured = (
-            self._pending_clear_since_left is not None
-            and (current_time - self._pending_clear_since_left) >= self._clear_delay
-        )
-        right_clear_matured = (
-            self._pending_clear_since_right is not None
-            and (current_time - self._pending_clear_since_right) >= self._clear_delay
-        )
+        # === Phase 2: Check for matured appearance calls ===
+        # If a pending appearance has been stable for appear_delay seconds,
+        # fire the call. We save the start time before clearing so we can
+        # detect three_wide (both sides started pending at the same instant).
 
-        # --- Appearance detection ---
-        # Detect transitions. A side "appears" if it was NOT present last tick
-        # AND there is no pending clear for that side (meaning the car truly
-        # left and came back, not just a flicker).
-        left_appeared = cur_left and not self._prev_left
-        right_appeared = cur_right and not self._prev_right
+        left_appeared = False
+        right_appeared = False
+        left_appear_start_time: float | None = None
+        right_appear_start_time: float | None = None
 
-        # If a car reappears while a clear was pending (flicker, not a real
-        # departure), cancel the pending clear and suppress the re-appearance
-        # call — the car never actually left.
-        if cur_left and self._pending_clear_since_left is not None:
-            # Car came back before "clear" was announced — it was a flicker.
-            # Cancel the pending clear and treat this as if the car never left.
-            self._pending_clear_since_left = None
-            left_appeared = False  # Don't announce re-appearance for a flicker
+        if (
+            self._pending_appear_since_left is not None
+            and cur_left
+            and (current_time - self._pending_appear_since_left) >= self._appear_delay
+        ):
+            # Left appearance has matured — fire it
+            left_appeared = True
+            left_appear_start_time = self._pending_appear_since_left
+            self._pending_appear_since_left = None
 
-        if cur_right and self._pending_clear_since_right is not None:
-            self._pending_clear_since_right = None
-            right_appeared = False
+        if (
+            self._pending_appear_since_right is not None
+            and cur_right
+            and (current_time - self._pending_appear_since_right) >= self._appear_delay
+        ):
+            # Right appearance has matured — fire it
+            right_appeared = True
+            right_appear_start_time = self._pending_appear_since_right
+            self._pending_appear_since_right = None
 
-        # Appearance calls
+        # === Phase 3: Appearance calls ===
         if left_appeared or right_appeared:
-            # Special case: both sides appeared simultaneously from none → three_wide
+            # Special case: both sides appeared simultaneously from none → three_wide.
+            # Detect by checking if both pending timers started at the same instant.
             if (
                 left_appeared
                 and right_appeared
-                and not self._prev_left
-                and not self._prev_right
+                and left_appear_start_time == right_appear_start_time
             ):
                 if self._cooldown_elapsed("three_wide", current_time):
                     calls.append(
@@ -199,6 +222,35 @@ class ProximityDetector:
                         )
                         self._last_call_time["car_right"] = current_time
                         self._car_alongside = True
+
+        # === Phase 4: Debounced clear detection ===
+        # Instead of firing "clear" the instant telemetry reads the car as gone,
+        # we require the car to be gone for clear_delay seconds. This prevents
+        # false "clear" calls from telemetry flicker.
+
+        if cur_left:
+            # Car is present on left — cancel any pending clear
+            self._pending_clear_since_left = None
+        elif self._prev_left:
+            # Car just disappeared from left — start pending clear timer
+            self._pending_clear_since_left = current_time
+
+        if cur_right:
+            # Car is present on right — cancel any pending clear
+            self._pending_clear_since_right = None
+        elif self._prev_right:
+            # Car just disappeared from right — start pending clear timer
+            self._pending_clear_since_right = current_time
+
+        # Check if any pending clears have matured past the delay threshold
+        left_clear_matured = (
+            self._pending_clear_since_left is not None
+            and (current_time - self._pending_clear_since_left) >= self._clear_delay
+        )
+        right_clear_matured = (
+            self._pending_clear_since_right is not None
+            and (current_time - self._pending_clear_since_right) >= self._clear_delay
+        )
 
         # Clearance calls — only after the clear delay has elapsed.
         # Additional guards:
@@ -263,6 +315,8 @@ class ProximityDetector:
         self._car_alongside = False
         self._pending_clear_since_left = None
         self._pending_clear_since_right = None
+        self._pending_appear_since_left = None
+        self._pending_appear_since_right = None
 
 
 class SpotterAudioPlayer:
@@ -274,6 +328,26 @@ class SpotterAudioPlayer:
     TTS responses.
     """
 
+    # Default audio paths — can be overridden via config spotter.audio_paths
+    DEFAULT_AUDIO_PATHS = {
+        "car_left": "audio/carleft.wav",
+        "car_right": "audio/carright.wav",
+        "three_wide": "audio/carthreewide.wav",
+        "clear": "audio/carclear.wav",
+        "fuel_five_laps": "audio/fuelfivelaps.wav",
+        "fuel_two_laps": "audio/fueltwolaps.wav",
+        "fuel_one_lap": "audio/fuelonelap.wav",
+        "flag_yellow": "audio/flagyellow.wav",
+        "flag_blue": "audio/flagblue.wav",
+        "flag_black": "audio/flagblack.wav",
+        "flag_white": "audio/flagwhite.wav",
+        "flag_red": "audio/flagred.wav",
+        "flag_checkered": "audio/flagchequered.wav",
+        "flag_slippery": "audio/flagslippery.wav",
+        "pit_entry": "audio/pitentry.wav",
+        "pit_exit": "audio/pitexit.wav",
+    }
+
     def __init__(self, config: dict):
         spotter_config = config.get("spotter", {})
         self._output_device = spotter_config.get("output_device", None)
@@ -282,8 +356,11 @@ class SpotterAudioPlayer:
             str, tuple[np.ndarray, int]
         ] = {}  # key -> (float32_array, sample_rate)
 
-        # Load configured audio files
-        audio_paths = spotter_config.get("audio_paths", {})
+        # Load configured audio files (overriding defaults where specified)
+        audio_paths = {
+            **self.DEFAULT_AUDIO_PATHS,
+            **spotter_config.get("audio_paths", {}),
+        }
         for key, path in audio_paths.items():
             self._load_wav(key, path)
 
@@ -421,13 +498,39 @@ class Spotter:
     from the main loop with the current CarLeftRight value. Decides what
     audio to play based on state transitions.
 
+    Also monitors:
+    - Fuel laps remaining (alerts at 5, 2, and 1 lap thresholds)
+    - Session flag transitions (yellow, blue, black, white, red, checkered)
+    - Track wetness transitions (slippery surface alert)
+    - Pit road transitions (pit entry and pit exit)
+
     Usage:
         spotter = Spotter(config)
         # Each tick:
-        spotter.update(car_left_right=1, is_on_track=True)
+        spotter.update(car_left_right=1, is_on_track=True, track_surface=3,
+                       fuel_laps_remaining=5.2, session_flags=0x01,
+                       track_wetness=0.0, on_pit_road=False)
         # On reconnect:
         spotter.reset()
     """
+
+    # iRacing SessionFlags bitmasks (from iRacing SDK Flags class)
+    FLAG_CHECKERED = 0x00000001
+    FLAG_WHITE = 0x00000010
+    FLAG_YELLOW = 0x00000002
+    FLAG_RED = 0x00000004
+    FLAG_BLACK = 0x00000020
+    FLAG_BLUE = 0x00008000
+
+    # Fuel alert thresholds (laps remaining): (threshold, audio_key, reset_threshold)
+    # Each alert fires once when laps drop below threshold, resets when laps
+    # rise back above reset_threshold (which equals the threshold — simple
+    # on/off with no hysteresis).
+    FUEL_ALERTS = [
+        (5.0, "fuel_five_laps"),
+        (2.0, "fuel_two_laps"),
+        (1.0, "fuel_one_lap"),
+    ]
 
     def __init__(self, config: dict):
         spotter_config = config.get("spotter", {})
@@ -436,13 +539,38 @@ class Spotter:
         self._player = SpotterAudioPlayer(config)
         self._config = config
 
+        # Fuel alert state: track which alerts have been fired
+        # Key is the threshold value, value is whether it's been fired this stint
+        self._fuel_alerts_fired: dict[float, bool] = {
+            threshold: False for threshold, _ in self.FUEL_ALERTS
+        }
+
+        # Flag state: track previous flags for transition detection
+        self._prev_flags: int = 0
+
+        # Track wetness state: previous wetness value for transition detection
+        self._prev_track_wetness: float = 0.0
+        self._slippery_alert_fired: bool = False
+
+        # Pit road state: track transitions for pit entry/exit alerts
+        self._prev_on_pit_road: bool = False
+
         if self._enabled:
             logger.info("Spotter enabled — car proximity calls active")
             logger.info(f"Available audio samples: {self._player.available_samples}")
         else:
             logger.info("Spotter disabled in config")
 
-    def update(self, car_left_right: int, is_on_track: bool = True):
+    def update(
+        self,
+        car_left_right: int,
+        is_on_track: bool = True,
+        track_surface: int = 0,
+        fuel_laps_remaining: float = 0.0,
+        session_flags: int = 0,
+        track_wetness: float = 0.0,
+        on_pit_road: bool = False,
+    ):
         """Process a telemetry tick.
 
         Called once per tick from the main loop. Reads CarLeftRight,
@@ -450,26 +578,106 @@ class Spotter:
 
         Args:
             car_left_right: iRacing CarLeftRight value (0=none, 1=left, 2=right, 3=both)
-            is_on_track: If False, skip processing (car is in garage/pit stall)
+            is_on_track: If False, skip processing (car is in garage)
+            track_surface: iRacing PlayerTrackSurface value.
+                -1=not in world, 0=garage, 1=pit stall, 2=pit road, 3=on racing surface.
+                Proximity calls are only processed when >= 3 (on racing surface).
+            fuel_laps_remaining: Estimated laps of fuel remaining (0 = unknown).
+            session_flags: iRacing SessionFlags bitmask for flag transition detection.
+            track_wetness: iRacing TrackWetness value (0-1). Alert fires when
+                wetness transitions from 0 to >0 (surface becomes slippery).
+            on_pit_road: iRacing OnPitRoad boolean. Alert fires on transitions
+                (entering or exiting pit road).
         """
         if not self._enabled:
             return
 
-        # Don't process when not on track (garage, between sessions, etc.)
-        if not is_on_track:
-            return
+        # --- Proximity calls (only on racing surface) ---
+        if is_on_track and track_surface >= 3 and 0 <= car_left_right <= 3:
+            calls = self._detector.update(car_left_right, time.monotonic())
+            for call in calls:
+                self._player.play(call.audio_key)
 
-        # Guard against invalid values
-        if car_left_right < 0 or car_left_right > 3:
-            return
+        # --- Fuel alerts (always active when on track) ---
+        # Fire once when laps remaining drops below each threshold.
+        # Reset when laps go back above the threshold (e.g. after pit stop).
+        # Don't fire or reset when fuel_laps_remaining is 0 (unknown/unreliable).
+        if fuel_laps_remaining > 0:
+            for threshold, audio_key in self.FUEL_ALERTS:
+                if (
+                    fuel_laps_remaining < threshold
+                    and not self._fuel_alerts_fired[threshold]
+                ):
+                    self._player.play(audio_key)
+                    self._fuel_alerts_fired[threshold] = True
+                    logger.info(
+                        f"Fuel alert: {fuel_laps_remaining:.1f} laps remaining ({audio_key})"
+                    )
+                elif fuel_laps_remaining >= threshold:
+                    self._fuel_alerts_fired[threshold] = False
 
-        calls = self._detector.update(car_left_right, time.monotonic())
-        for call in calls:
-            self._player.play(call.audio_key)
+        # --- Flag transition alerts ---
+        # Detect rising edges (flag transitions from off to on).
+        # Only fire when the player is on track.
+        if is_on_track:
+            rising = session_flags & ~self._prev_flags  # flags that just turned on
+            if rising & self.FLAG_YELLOW:
+                self._player.play("flag_yellow")
+                logger.info("Flag alert: yellow flag")
+            if rising & self.FLAG_BLUE:
+                self._player.play("flag_blue")
+                logger.info("Flag alert: blue flag")
+            if rising & self.FLAG_BLACK:
+                self._player.play("flag_black")
+                logger.info("Flag alert: black flag")
+            if rising & self.FLAG_WHITE:
+                self._player.play("flag_white")
+                logger.info("Flag alert: white flag")
+            if rising & self.FLAG_RED:
+                self._player.play("flag_red")
+                logger.info("Flag alert: red flag")
+            if rising & self.FLAG_CHECKERED:
+                self._player.play("flag_checkered")
+                logger.info("Flag alert: checkered flag")
+            self._prev_flags = session_flags
+
+        # --- Track wetness (slippery surface) alert ---
+        # Fire when track wetness transitions from dry (0) to wet (>0).
+        # Reset when track dries out (wetness returns to 0).
+        # Only fire when on track.
+        if is_on_track:
+            if (
+                track_wetness > 0
+                and self._prev_track_wetness == 0
+                and not self._slippery_alert_fired
+            ):
+                self._player.play("flag_slippery")
+                self._slippery_alert_fired = True
+                logger.info("Track alert: slippery surface (wet)")
+            elif track_wetness == 0:
+                self._slippery_alert_fired = False
+            self._prev_track_wetness = track_wetness
+
+        # --- Pit road transition alerts ---
+        # Fire on entering pit road (False→True) and exiting (True→False).
+        # Useful for confirming pit entry/exit to the driver.
+        if on_pit_road and not self._prev_on_pit_road:
+            self._player.play("pit_entry")
+            logger.info("Pit road: entered pit road")
+        elif not on_pit_road and self._prev_on_pit_road:
+            self._player.play("pit_exit")
+            logger.info("Pit road: exited pit road")
+        self._prev_on_pit_road = on_pit_road
 
     def reset(self):
         """Reset spotter state (on session start/reconnect)."""
         self._detector.reset()
+        for threshold in self._fuel_alerts_fired:
+            self._fuel_alerts_fired[threshold] = False
+        self._prev_flags = 0
+        self._prev_track_wetness = 0.0
+        self._slippery_alert_fired = False
+        self._prev_on_pit_road = False
         logger.debug("Spotter state reset")
 
     @property

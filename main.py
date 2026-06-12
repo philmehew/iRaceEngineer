@@ -698,11 +698,24 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                 with _state_lock:
                     state.update(telemetry, session_info, driver_names, units=units)
 
-                # Spotter tick — car proximity audio calls
+                # Spotter tick — car proximity audio calls + fuel/flag/pit alerts
                 if spotter is not None:
                     car_lr = state.player.car_left_right
                     on_track = state.player.is_on_track
-                    spotter.update(car_lr, is_on_track=on_track)
+                    track_surface = state.player.player_track_surface
+                    fuel_laps = state.fuel_laps_remaining
+                    flags = state.session.flags
+                    wetness = state.session.track_wetness
+                    on_pit_road = state.player.on_pit_road
+                    spotter.update(
+                        car_lr,
+                        is_on_track=on_track,
+                        track_surface=track_surface,
+                        fuel_laps_remaining=fuel_laps,
+                        session_flags=flags,
+                        track_wetness=wetness,
+                        on_pit_road=on_pit_road,
+                    )
 
             else:
                 # iRacing disconnected — try to reconnect
