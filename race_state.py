@@ -262,7 +262,9 @@ class DriverState:
     player_track_surface: int = 0  # iRacing PlayerTrackSurface: -1=not in world, 0=garage, 1=pit stall, 2=pit road, 3=on track
 
     # Player-only: proximity
-    car_left_right: int = 0  # 0=none, 1=car left, 2=car right, 3=both
+    car_left_right: int = (
+        0  # 0=off, 1=clear, 2=car left, 3=car right, 4=both, 5=two left, 6=two right
+    )
     car_dist_ahead: float = 0.0  # metres (iRacing CarDistAhead)
     car_dist_behind: float = 0.0  # metres (iRacing CarDistBehind)
     tow_time: float = 0.0  # seconds of tow available
@@ -282,7 +284,7 @@ class DriverState:
     lap_history: list[LapRecord] = field(default_factory=list)
 
     # Damage/Incidents (player only)
-    incidents: int = 0
+    incidents: int = 0  # Incident points (1x, 2x, 4x)
     team_incidents: int = 0
 
     # Pit status
@@ -300,7 +302,7 @@ class DriverState:
     tire_sets_available: int = 0
     tire_sets_used: int = 0
 
-    # Gap to player (derived, for nearby cars)
+    # Gap to player in seconds (derived from lap distance difference)
     gap_seconds: float = 0.0  # Positive = ahead of player, negative = behind
 
     # Track surface
@@ -359,16 +361,29 @@ class SessionState:
     est_lap_time: float = 0.0  # DriverCarEstLapTime from session info
 
 
-# Session flag constants (from iRacing SDK)
-FLAG_GREEN = 0x00000001
-FLAG_YELLOW = 0x00000002
-FLAG_RED = 0x00000004
-FLAG_CHECKERED = 0x00000008
-FLAG_WHITE = 0x00000010
-FLAG_BLACK = 0x00000020
-FLAG_DISQUALIFIED = 0x00000040
-FLAG_BLUE = 0x00008000
-FLAG_RESTART = 0x00080000
+# Session flag constants (from iRacing SDK / irsdk.Flags)
+FLAG_CHECKERED = 0x0001
+FLAG_WHITE = 0x0002
+FLAG_GREEN = 0x0004
+FLAG_YELLOW = 0x0008
+FLAG_RED = 0x0010
+FLAG_BLUE = 0x0020
+FLAG_DEBRIS = 0x0040
+FLAG_CROSSED = 0x0080
+FLAG_YELLOW_WAVING = 0x0100
+FLAG_ONE_LAP_TO_GREEN = 0x0200
+FLAG_GREEN_HELD = 0x0400
+FLAG_TEN_TO_GO = 0x0800
+FLAG_FIVE_TO_GO = 0x1000
+FLAG_RANDOM_WAVING = 0x2000
+FLAG_CAUTION = 0x4000
+FLAG_CAUTION_WAVING = 0x8000
+# Driver-specific flags (higher bits)
+FLAG_BLACK = 0x010000
+FLAG_DISQUALIFY = 0x020000
+FLAG_SERVICABLE = 0x040000
+FLAG_FURLED = 0x080000
+FLAG_REPAIR = 0x100000
 
 
 class RaceState:
@@ -496,6 +511,11 @@ class RaceState:
     def _update_session(self, telemetry: dict, session_info: dict):
         """Update session-level state from telemetry and parsed session info."""
         self.session.flags = int(telemetry.get("SessionFlags", 0))
+        # Merge per-driver flags (black, disqualify, repair) from CarIdxSessionFlags
+        player_idx = telemetry.get("PlayerCarIdx", 0)
+        car_idx_flags = telemetry.get("CarIdxSessionFlags", [])
+        if isinstance(car_idx_flags, list) and 0 <= player_idx < len(car_idx_flags):
+            self.session.flags |= int(car_idx_flags[player_idx])
         self.session.laps_remain = int(telemetry.get("SessionLapsRemain", 0))
         self.session.time_remain = float(telemetry.get("SessionTimeRemain", 0.0))
         self.session.session_num = int(telemetry.get("SessionNum", 0))
@@ -868,10 +888,18 @@ class RaceState:
             if idx == player_idx:
                 continue
 
-            # Compute gap (rough — based on lap distance difference)
+            # Compute gap in seconds (based on lap distance difference)
+            # Lap distance difference gives a fraction of a lap; convert to
+            # seconds using the player's best lap time as the reference.
             other_lap_dist = entry["lap_dist_pct"]
             other_lap = entry["lap"]
-            gap = (other_lap + other_lap_dist) - (self.player.lap + player_lap_dist_pct)
+            gap_laps = (other_lap + other_lap_dist) - (
+                self.player.lap + player_lap_dist_pct
+            )
+            ref_lap_time = (
+                self.player.best_lap_time if self.player.best_lap_time > 0 else 90.0
+            )
+            gap = gap_laps * ref_lap_time
 
             if abs(entry["position"] - self.player.position) <= max_nearby:
                 car = DriverState(
@@ -1161,19 +1189,21 @@ class RaceState:
     def tyre_staleness(self) -> str:
         """Determine if tyre data is stale (frozen on track) or live.
 
-        Uses two signals:
+        Uses three signals:
         1. Primary: whether the car is on track or in pits. Most iRacing cars
            freeze tyre data (temps, pressures, wear) while on track — it only
            updates during pit stops. So on-track data is presumed stale unless
            proven otherwise.
-        2. Secondary: tick-to-tick comparison. If tyre values are actively
-           changing between updates, they're definitely live regardless of
-           car location.
+        2. Tick-to-tick comparison. If tyre values are actively changing between
+           updates, they're definitely live regardless of car location.
+        3. Variation heuristic: if all four corners show different temps, the
+           data is likely live (frozen/stale data typically shows identical or
+           very similar values across all corners).
 
         Returns:
             'live' — tyre values are actively changing (real-time data)
-            'stale' — car is on track and data is likely frozen
-            'unknown' — not enough info (car off track, no data, or first tick)
+            'stale' — car is on track and data is confirmed frozen (not changing)
+            'unknown' — on track but not enough info yet (first tick, no prev data)
         """
         # If car is in pits, tyre data is likely live (just updated)
         if self.player.on_pit_road:
@@ -1183,8 +1213,7 @@ class RaceState:
         if not self.player.is_on_track:
             return "unknown"
 
-        # Car is on track — tyre data is likely frozen for most iRacing cars.
-        # But check tick-to-tick: if values ARE actively changing, they're live.
+        # Car is on track — check if values are actively changing (tick-to-tick).
         if hasattr(self, "_prev_tyre_values") and self._prev_tyre_values:
             curr = self.player.tyres
             prev = self._prev_tyre_values
@@ -1200,9 +1229,54 @@ class RaceState:
                 if abs(c.wear_center - p.wear_center) > 0.0001:
                     return "live"
 
-        # On track and values aren't changing (or no previous tick to compare)
-        # → presume stale (frozen data, iRacing limitation for most cars)
-        return "stale"
+        # Tick-to-tick didn't detect changes. Check variation heuristic:
+        # If all four corners have different temps, the data is likely live.
+        # Frozen data (typical for most iRacing cars on track) shows identical
+        # or very similar values across all corners.
+        temps = []
+        for corner in ["LF", "RF", "LR", "RR"]:
+            ts = self.player.tyres.get(corner)
+            if ts and ts.temp_center > 0:
+                temps.append(ts.temp_center)
+        if len(temps) == 4:
+            # If the spread of temps is significant, data is likely live.
+            # Frozen data tends to show all corners at exactly the same temp.
+            temp_spread = max(temps) - min(temps)
+            if temp_spread > 2.0:  # More than 2°C spread suggests live data
+                return "live"
+
+        # On track, values not changing, and no significant temp variation.
+        # Return 'unknown' if no previous tick data (first tick on track),
+        # 'stale' if we've confirmed values aren't changing.
+        if hasattr(self, "_prev_tyre_values") and self._prev_tyre_values:
+            return "stale"
+        return "unknown"
+
+    @property
+    def race_fastest_lap(self) -> dict | None:
+        """Find the fastest lap of the race across all cars.
+
+        Returns a dict with 'time', 'driver_name', and 'car_idx', or None
+        if no valid lap times exist yet.
+        """
+        fastest = None
+        # Check player
+        if self.player.best_lap_time > 0:
+            fastest = {
+                "time": self.player.best_lap_time,
+                "driver_name": self.player.driver_name,
+                "car_idx": self.player.car_idx,
+            }
+        # Check nearby cars
+        for car in self.nearby_cars:
+            if car.best_lap_time > 0:
+                if fastest is None or car.best_lap_time < fastest["time"]:  # type: ignore[operator]
+                    fastest = {
+                        "time": car.best_lap_time,
+                        "driver_name": car.driver_name,
+                        "car_idx": car.car_idx,
+                    }
+        return fastest
 
     @property
     def estimated_total_laps(self) -> int | None:
@@ -1266,8 +1340,20 @@ class RaceState:
             result.append("White (slow car)")
         if flags & FLAG_BLUE:
             result.append("Blue (faster car)")
-        if flags & FLAG_RESTART:
-            result.append("Restart")
+        if flags & FLAG_DEBRIS:
+            result.append("Debris")
+        if flags & FLAG_CROSSED:
+            result.append("Crossed")
+        if flags & FLAG_CAUTION:
+            result.append("Caution")
+        if flags & FLAG_CAUTION_WAVING:
+            result.append("Caution (waving)")
+        if flags & FLAG_BLACK:
+            result.append("Black")
+        if flags & FLAG_DISQUALIFY:
+            result.append("Disqualified")
+        if flags & FLAG_REPAIR:
+            result.append("Meatball (repair)")
         if not result:
             result.append("Green")  # Default to green if no flags set
         return result
@@ -1335,6 +1421,7 @@ class RaceState:
                 "fuel_laps_remaining": self.fuel_laps_remaining,
                 "fuel_est_quality": self.fuel_est_quality,
                 "avg_fuel_per_lap": self.avg_fuel_per_lap,
+                "race_fastest_lap": self.race_fastest_lap,
                 "tyre_staleness": self.tyre_staleness,
                 "current_lap_time": self.player.current_lap_time,
                 "best_lap_time": self.player.best_lap_time,

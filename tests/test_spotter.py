@@ -13,6 +13,15 @@ import pytest
 
 from spotter import ProximityDetector, Spotter, SpotterCall
 
+# iRacing CarLeftRight enum values (from irsdk.CarLeftRight — ordinal, NOT bitmask)
+CLR_OFF = 0
+CLR_CLEAR = 1
+CLR_CAR_LEFT = 2
+CLR_CAR_RIGHT = 3
+CLR_BOTH = 4
+CLR_TWO_LEFT = 5
+CLR_TWO_RIGHT = 6
+
 # Default test config with short delays for fast tests
 DEFAULT_CONFIG = {
     "spotter": {
@@ -39,14 +48,24 @@ def make_detector(config=None):
 class TestProximityDetectorTransitions:
     """Test CarLeftRight transition detection."""
 
+    # Map from old bitmask-style values to iRacing enum values:
+    #   old 0 (none) → CLR_CLEAR (1), old 1 (left) → CLR_CAR_LEFT (2),
+    #   old 2 (right) → CLR_CAR_RIGHT (3), old 3 (both) → CLR_BOTH (4)
+    _CLR_MAP = {0: CLR_CLEAR, 1: CLR_CAR_LEFT, 2: CLR_CAR_RIGHT, 3: CLR_BOTH}
+
     def setup_method(self):
         self.detector = make_detector()
         self.t = 0.0
 
     def _tick(self, car_lr: int, dt: float = 0.1) -> list[SpotterCall]:
-        """Advance time by dt and process a CarLeftRight value."""
+        """Advance time by dt and process a CarLeftRight value.
+
+        Accepts old-style values (0=none, 1=left, 2=right, 3=both) and
+        translates them to iRacing enum values automatically.
+        """
         self.t += dt
-        return self.detector.update(car_lr, self.t)
+        mapped = self._CLR_MAP.get(car_lr, car_lr)
+        return self.detector.update(mapped, self.t)
 
     def _call_types(self, calls: list[SpotterCall]) -> list[str]:
         """Extract call_type strings from a list of SpotterCalls."""
@@ -116,7 +135,7 @@ class TestProximityDetectorTransitions:
         assert self._call_types(calls) == []
         # After clear_delay elapses, still at 0, clear fires
         self.t += 0.2  # Past the 100ms clear_delay
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert self._call_types(calls) == ["clear"]
 
     def test_clear_from_right(self):
@@ -125,7 +144,7 @@ class TestProximityDetectorTransitions:
         calls = self._tick(0)
         assert self._call_types(calls) == []
         self.t += 0.2
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert self._call_types(calls) == ["clear"]
 
     def test_clear_from_both(self):
@@ -134,7 +153,7 @@ class TestProximityDetectorTransitions:
         calls = self._tick(0)
         assert self._call_types(calls) == []
         self.t += 0.2
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert self._call_types(calls) == ["clear"]
 
     def test_clear_right_while_left_stays(self):
@@ -146,7 +165,7 @@ class TestProximityDetectorTransitions:
         # After clear_delay, still at 1 (right gone, left still there) —
         # "clear" must NOT fire because a car is still alongside on the left
         self.t += 0.2
-        calls = self.detector.update(1, self.t)
+        calls = self.detector.update(CLR_CAR_LEFT, self.t)
         assert self._call_types(calls) == []
 
     def test_clear_left_while_right_stays(self):
@@ -157,7 +176,7 @@ class TestProximityDetectorTransitions:
         # After clear_delay, still at 2 (left gone, right still there) —
         # "clear" must NOT fire because a car is still alongside on the right
         self.t += 0.2
-        calls = self.detector.update(2, self.t)
+        calls = self.detector.update(CLR_CAR_RIGHT, self.t)
         assert self._call_types(calls) == []
 
     # --- Combined appearance + clearance ---
@@ -171,7 +190,7 @@ class TestProximityDetectorTransitions:
         assert self._call_types(calls) == []
         # Clear matures
         self.t += 0.2
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert self._call_types(calls) == ["clear"]
 
     def test_clear_does_not_fire_without_prior_proximity(self):
@@ -180,7 +199,7 @@ class TestProximityDetectorTransitions:
         self._tick(0)
         self._tick(0)
         self.t += 1.0
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert self._call_types(calls) == []
 
     def test_clear_after_three_wide_then_one_side_clears_then_both_clear(self):
@@ -192,14 +211,14 @@ class TestProximityDetectorTransitions:
         assert self._call_types(calls) == []
         # After clear_delay, still at 1 — still no "clear" (car on left)
         self.t += 0.2
-        calls = self.detector.update(1, self.t)
+        calls = self.detector.update(CLR_CAR_LEFT, self.t)
         assert self._call_types(calls) == []
         # Now left also clears (1→0) — pending clear starts for left
         calls = self._tick(0)
         assert self._call_types(calls) == []
         # After clear_delay, clear fires because all cars are gone
         self.t += 0.2
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert self._call_types(calls) == ["clear"]
 
     def test_clear_not_fire_after_proximity_if_car_reappears(self):
@@ -211,7 +230,7 @@ class TestProximityDetectorTransitions:
         assert self._call_types(calls) == []
         # Car reappears on right before clear matures (0→2)
         self.t += 0.2
-        calls = self.detector.update(2, self.t)
+        calls = self.detector.update(CLR_CAR_RIGHT, self.t)
         # Should get car_right, NOT clear
         assert "clear" not in self._call_types(calls)
         assert "car_right" in self._call_types(calls)
@@ -223,7 +242,7 @@ class TestProximityDetectorTransitions:
         calls = self._tick(0)
         assert self._call_types(calls) == []
         self.t += 0.2
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert self._call_types(calls) == ["clear"]
 
 
@@ -246,7 +265,10 @@ class TestProximityDetectorClearDelay:
 
     def _tick(self, car_lr: int, dt: float = 0.1) -> list[SpotterCall]:
         self.t += dt
-        return self.detector.update(car_lr, self.t)
+        mapped = {0: CLR_CLEAR, 1: CLR_CAR_LEFT, 2: CLR_CAR_RIGHT, 3: CLR_BOTH}.get(
+            car_lr, car_lr
+        )
+        return self.detector.update(mapped, self.t)
 
     def _call_types(self, calls: list[SpotterCall]) -> list[str]:
         return [c.call_type for c in calls]
@@ -258,7 +280,7 @@ class TestProximityDetectorClearDelay:
         self._tick(0)  # car flickers away for 1 tick (~100ms, at edge of debounce)
         # Car comes back before clear_delay truly elapsed — flicker suppressed
         self.t += 0.05  # Only 50ms, well within 100ms delay
-        calls = self.detector.update(1, self.t)
+        calls = self.detector.update(CLR_CAR_LEFT, self.t)
         # Should be no calls at all — flicker was suppressed
         assert self._call_types(calls) == []
 
@@ -268,7 +290,7 @@ class TestProximityDetectorClearDelay:
         self._tick(0)  # Start debounce timer
         # Advance past clear_delay (100ms)
         self.t += 0.15
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert self._call_types(calls) == ["clear"]
 
     def test_clear_does_not_fire_before_delay(self):
@@ -287,7 +309,7 @@ class TestProximityDetectorClearDelay:
         self._tick(0)
         # At t=0.2, 100ms has elapsed since debounce started at t=0.1
         self.t += 0.1
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert self._call_types(calls) == ["clear"]
 
     def test_flicker_suppresses_both_clear_and_reappearance(self):
@@ -301,7 +323,7 @@ class TestProximityDetectorClearDelay:
         assert self._call_types(calls) == []  # debounce, no clear yet
         # Car comes back — this is a flicker, not a real reappearance
         self.t += 0.05
-        calls = self.detector.update(1, self.t)
+        calls = self.detector.update(CLR_CAR_LEFT, self.t)
         assert self._call_types(calls) == []  # suppressed as flicker
 
     def test_flicker_then_genuine_clear(self):
@@ -312,13 +334,13 @@ class TestProximityDetectorClearDelay:
         self._tick(0)  # flicker away (start debounce)
         # Car comes back within delay — flicker suppressed
         self.t += 0.05
-        self.detector.update(1, self.t)
+        self.detector.update(CLR_CAR_LEFT, self.t)
         # Now car genuinely leaves
         calls = self._tick(0)  # new debounce starts
         assert self._call_types(calls) == []
         # Wait for clear delay
         self.t += 0.15
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert self._call_types(calls) == ["clear"]
 
     def test_no_double_clear_after_flicker(self):
@@ -327,10 +349,10 @@ class TestProximityDetectorClearDelay:
         self._tick(1)  # car appears
         self._tick(0)  # flicker away — debounce starts
         self.t += 0.05
-        self.detector.update(1, self.t)  # back — flicker suppressed
+        self.detector.update(CLR_CAR_LEFT, self.t)  # back — flicker suppressed
         self._tick(0)  # genuinely gone again — new debounce
         self.t += 0.15
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         # Exactly one clear, not two
         assert self._call_types(calls) == ["clear"]
         assert len(calls) == 1
@@ -352,16 +374,16 @@ class TestProximityDetectorClearDelay:
         t = 0.0
 
         t += 0.1
-        detector.update(1, t)  # car appears
+        detector.update(CLR_CAR_LEFT, t)  # car appears
         t += 0.1
-        detector.update(0, t)  # car gone — debounce starts
+        detector.update(CLR_CLEAR, t)  # car gone — debounce starts
         # At 150ms, not yet past 200ms delay
         t += 0.15
-        calls = detector.update(0, t)
+        calls = detector.update(CLR_CLEAR, t)
         assert [c.call_type for c in calls] == []
         # At 210ms past debounce start, clear should fire
         t += 0.06
-        calls = detector.update(0, t)
+        calls = detector.update(CLR_CLEAR, t)
         assert [c.call_type for c in calls] == ["clear"]
 
 
@@ -384,7 +406,10 @@ class TestProximityDetectorAppearDelay:
 
     def _tick(self, car_lr: int, dt: float = 0.1) -> list[SpotterCall]:
         self.t += dt
-        return self.detector.update(car_lr, self.t)
+        mapped = {0: CLR_CLEAR, 1: CLR_CAR_LEFT, 2: CLR_CAR_RIGHT, 3: CLR_BOTH}.get(
+            car_lr, car_lr
+        )
+        return self.detector.update(mapped, self.t)
 
     def _call_types(self, calls: list[SpotterCall]) -> list[str]:
         return [c.call_type for c in calls]
@@ -442,17 +467,17 @@ class TestProximityDetectorAppearDelay:
         t = 0.0
 
         t += 0.1
-        detector.update(0, t)  # no car
+        detector.update(CLR_CLEAR, t)  # no car
         t += 0.1
-        calls = detector.update(1, t)  # car left appears — pending
+        calls = detector.update(CLR_CAR_LEFT, t)  # car left appears — pending
         assert [c.call_type for c in calls] == []
 
         t += 0.15  # 150ms since appearance — not yet 200ms
-        calls = detector.update(1, t)
+        calls = detector.update(CLR_CAR_LEFT, t)
         assert [c.call_type for c in calls] == []
 
         t += 0.10  # 250ms since appearance — past 200ms
-        calls = detector.update(1, t)
+        calls = detector.update(CLR_CAR_LEFT, t)
         assert [c.call_type for c in calls] == ["car_left"]
 
     def test_three_wide_appearance_delayed(self):
@@ -478,7 +503,7 @@ class TestProximityDetectorAppearDelay:
 
         # No pending appear, no car alongside, no clear should fire
         self.t += 0.5  # well past any delay
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         # No clear either, since _car_alongside was never set
         assert self._call_types(calls) == []
 
@@ -498,7 +523,7 @@ class TestProximityDetectorAppearDelay:
         assert self._call_types(calls) == []
         # Advance well past appear_delay (150ms past the pending start)
         self.t += 0.15
-        calls = self.detector.update(1, self.t)
+        calls = self.detector.update(CLR_CAR_LEFT, self.t)
         assert self._call_types(calls) == ["car_left"]
 
 
@@ -511,7 +536,10 @@ class TestProximityDetectorCooldowns:
 
     def _tick(self, car_lr: int, dt: float = 0.1) -> list[SpotterCall]:
         self.t += dt
-        return self.detector.update(car_lr, self.t)
+        mapped = {0: CLR_CLEAR, 1: CLR_CAR_LEFT, 2: CLR_CAR_RIGHT, 3: CLR_BOTH}.get(
+            car_lr, car_lr
+        )
+        return self.detector.update(mapped, self.t)
 
     def _call_types(self, calls: list[SpotterCall]) -> list[str]:
         return [c.call_type for c in calls]
@@ -525,7 +553,7 @@ class TestProximityDetectorCooldowns:
         # Car clears (with debounce)
         self._tick(0)
         self.t += 0.2
-        self.detector.update(0, self.t)  # clear fires
+        self.detector.update(CLR_CLEAR, self.t)  # clear fires
 
         # Immediately reappear — within 3s cooldown
         calls = self._tick(1)
@@ -539,11 +567,11 @@ class TestProximityDetectorCooldowns:
 
         # Wait for both clear_delay and proximity cooldown to expire
         self.t += 0.2  # past clear_delay
-        self.detector.update(0, self.t)  # start clear debounce
+        self.detector.update(CLR_CLEAR, self.t)  # start clear debounce
         self.t += 3.5  # past proximity cooldown
 
         # Reappear — should fire again
-        calls = self.detector.update(1, self.t)
+        calls = self.detector.update(CLR_CAR_LEFT, self.t)
         assert "car_left" in self._call_types(calls)
 
     def test_clearance_cooldown_suppresses_rapid_repeat(self):
@@ -552,15 +580,15 @@ class TestProximityDetectorCooldowns:
         # First clear (with debounce)
         self._tick(0)
         self.t += 0.2
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert "clear" in self._call_types(calls)
 
         # Reappear (may be suppressed by proximity cooldown)
-        self.detector.update(1, self.t)
+        self.detector.update(CLR_CAR_LEFT, self.t)
         # Second clear attempt (within 5s clearance cooldown)
         self._tick(0)
         self.t += 0.2
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert "clear" not in self._call_types(calls)
 
     def test_clearance_cooldown_expires(self):
@@ -569,15 +597,15 @@ class TestProximityDetectorCooldowns:
         # First clear (with debounce)
         self._tick(0)
         self.t += 0.2
-        self.detector.update(0, self.t)
+        self.detector.update(CLR_CLEAR, self.t)
 
         # Wait for clearance cooldown to expire (>5s)
         self.t += 5.5
 
-        self.detector.update(1, self.t)
+        self.detector.update(CLR_CAR_LEFT, self.t)
         self._tick(0)
         self.t += 0.2
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert "clear" in self._call_types(calls)
 
     def test_three_wide_resets_individual_cooldowns(self):
@@ -587,10 +615,10 @@ class TestProximityDetectorCooldowns:
         # Clear all sides (with debounce)
         self._tick(0)
         self.t += 0.2
-        self.detector.update(0, self.t)  # clear fires
+        self.detector.update(CLR_CLEAR, self.t)  # clear fires
 
         # Immediately reappear on left — should be suppressed by three_wide's cooldown
-        calls = self.detector.update(1, self.t)
+        calls = self.detector.update(CLR_CAR_LEFT, self.t)
         assert "car_left" not in self._call_types(calls)
 
     def test_independent_cooldowns_for_left_and_right(self):
@@ -611,7 +639,10 @@ class TestProximityDetectorReset:
 
     def _tick(self, car_lr: int, dt: float = 0.1) -> list[SpotterCall]:
         self.t += dt
-        return self.detector.update(car_lr, self.t)
+        mapped = {0: CLR_CLEAR, 1: CLR_CAR_LEFT, 2: CLR_CAR_RIGHT, 3: CLR_BOTH}.get(
+            car_lr, car_lr
+        )
+        return self.detector.update(mapped, self.t)
 
     def _call_types(self, calls: list[SpotterCall]) -> list[str]:
         return [c.call_type for c in calls]
@@ -653,7 +684,7 @@ class TestProximityDetectorReset:
         self.t += 0.5
         # Should NOT fire clear — the pending clear was cancelled AND
         # _car_alongside was reset so clear has no basis to fire
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert calls == []
 
     def test_reset_clears_car_alongside_flag(self):
@@ -668,7 +699,7 @@ class TestProximityDetectorReset:
 
         # Even though time has passed, clear should not fire because
         # _car_alongside was reset and no car was seen after reset
-        calls = self.detector.update(0, self.t)
+        calls = self.detector.update(CLR_CLEAR, self.t)
         assert self._call_types(calls) == []
 
     def test_reset_clears_pending_appear(self):
@@ -690,7 +721,10 @@ class TestProximityDetectorEdgeCases:
 
     def _tick(self, car_lr: int, dt: float = 0.1) -> list[SpotterCall]:
         self.t += dt
-        return self.detector.update(car_lr, self.t)
+        mapped = {0: CLR_CLEAR, 1: CLR_CAR_LEFT, 2: CLR_CAR_RIGHT, 3: CLR_BOTH}.get(
+            car_lr, car_lr
+        )
+        return self.detector.update(mapped, self.t)
 
     def _call_types(self, calls: list[SpotterCall]) -> list[str]:
         return [c.call_type for c in calls]
@@ -712,12 +746,12 @@ class TestProximityDetectorEdgeCases:
         assert calls3 == []
 
     def test_clear_delay_default(self):
-        """Default clear_delay_ms should be 500ms when not specified in config."""
+        """Default clear_delay_ms should be 0ms (immediate) when not specified in config."""
         config = {
             "spotter": {"cooldowns": {"proximity_ms": 3000, "clearance_ms": 5000}}
         }
         detector = ProximityDetector(config)
-        assert detector._clear_delay == 0.5  # 500ms default
+        assert detector._clear_delay == 0.0  # 0ms default — fire immediately
 
     def test_appear_delay_default(self):
         """Default appear_delay_ms should be 200ms when not specified in config."""
@@ -764,7 +798,7 @@ class TestSpotterIntegration:
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        spotter.update(1, is_on_track=False)
+        spotter.update(CLR_CAR_LEFT, is_on_track=False)
         assert played_keys == []
 
     def test_spotter_skips_when_track_surface_below_3(self):
@@ -776,20 +810,20 @@ class TestSpotterIntegration:
         spotter._player.play = lambda key: played_keys.append(key)
 
         # Surface 0 (garage) — should suppress
-        spotter.update(1, is_on_track=True, track_surface=0)
+        spotter.update(CLR_CAR_LEFT, is_on_track=True, track_surface=0)
         assert played_keys == []
 
         # Surface 1 (pit stall) — should suppress
-        spotter.update(1, is_on_track=True, track_surface=1)
+        spotter.update(CLR_CAR_LEFT, is_on_track=True, track_surface=1)
         assert played_keys == []
 
         # Surface 2 (pit road) — should suppress
-        spotter.update(1, is_on_track=True, track_surface=2)
+        spotter.update(CLR_CAR_LEFT, is_on_track=True, track_surface=2)
         assert played_keys == []
 
         # Surface 3 (on track) — should fire
-        spotter.update(0, is_on_track=True, track_surface=3)  # reset state
-        spotter.update(1, is_on_track=True, track_surface=3)
+        spotter.update(CLR_CLEAR, is_on_track=True, track_surface=3)  # reset state
+        spotter.update(CLR_CAR_LEFT, is_on_track=True, track_surface=3)
         assert "car_left" in played_keys
 
     def test_spotter_skips_when_disabled(self):
@@ -799,7 +833,7 @@ class TestSpotterIntegration:
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        spotter.update(1, is_on_track=True)
+        spotter.update(CLR_CAR_LEFT, is_on_track=True)
         assert played_keys == []
 
     def test_spotter_fires_on_appearance(self):
@@ -808,8 +842,8 @@ class TestSpotterIntegration:
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        spotter.update(0, is_on_track=True, track_surface=3)
-        spotter.update(1, is_on_track=True, track_surface=3)
+        spotter.update(CLR_CLEAR, is_on_track=True, track_surface=3)
+        spotter.update(CLR_CAR_LEFT, is_on_track=True, track_surface=3)
         assert "car_left" in played_keys
 
     def test_spotter_reset_clears_state(self):
@@ -818,15 +852,15 @@ class TestSpotterIntegration:
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        spotter.update(0, is_on_track=True, track_surface=3)
-        spotter.update(1, is_on_track=True, track_surface=3)
+        spotter.update(CLR_CLEAR, is_on_track=True, track_surface=3)
+        spotter.update(CLR_CAR_LEFT, is_on_track=True, track_surface=3)
         assert "car_left" in played_keys
 
         spotter.reset()
 
         played_keys.clear()
-        spotter.update(0, is_on_track=True, track_surface=3)
-        spotter.update(1, is_on_track=True, track_surface=3)
+        spotter.update(CLR_CLEAR, is_on_track=True, track_surface=3)
+        spotter.update(CLR_CAR_LEFT, is_on_track=True, track_surface=3)
         assert "car_left" in played_keys
 
     def test_spotter_negative_car_left_right(self):
@@ -865,11 +899,15 @@ class TestSpotterFuelAlert:
         spotter._player.play = lambda key: played_keys.append(key)
 
         # Start with plenty of fuel
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=10.0)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=10.0
+        )
         assert "fuel_five_laps" not in played_keys
 
         # Fuel drops below 5
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=4.9)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=4.9
+        )
         assert "fuel_five_laps" in played_keys
 
     def test_fuel_two_lap_alert(self):
@@ -878,7 +916,9 @@ class TestSpotterFuelAlert:
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=1.9)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.9
+        )
         assert "fuel_two_laps" in played_keys
 
     def test_fuel_one_lap_alert(self):
@@ -887,7 +927,9 @@ class TestSpotterFuelAlert:
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=0.8)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=0.8
+        )
         assert "fuel_one_lap" in played_keys
 
     def test_fuel_alerts_fire_in_sequence(self):
@@ -897,19 +939,27 @@ class TestSpotterFuelAlert:
         spotter._player.play = lambda key: played_keys.append(key)
 
         # Start with 10 laps
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=10.0)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=10.0
+        )
         # Cross 5-lap threshold
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=4.5)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=4.5
+        )
         assert "fuel_five_laps" in played_keys
 
         played_keys.clear()
         # Cross 2-lap threshold
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5
+        )
         assert "fuel_two_laps" in played_keys
 
         played_keys.clear()
         # Cross 1-lap threshold
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=0.5)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=0.5
+        )
         assert "fuel_one_lap" in played_keys
 
     def test_fuel_alert_fires_once(self):
@@ -918,12 +968,16 @@ class TestSpotterFuelAlert:
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5
+        )
         assert "fuel_two_laps" in played_keys
 
         # Subsequent ticks should NOT fire again
         played_keys.clear()
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=1.3)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.3
+        )
         assert "fuel_two_laps" not in played_keys
 
     def test_fuel_alert_resets_above_threshold(self):
@@ -933,15 +987,21 @@ class TestSpotterFuelAlert:
         spotter._player.play = lambda key: played_keys.append(key)
 
         # Fire alert
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5
+        )
         assert "fuel_two_laps" in played_keys
 
         # Pit stop — fuel goes above threshold
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=5.0)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=5.0
+        )
 
         # Fuel drops below threshold again — should fire again
         played_keys.clear()
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=1.8)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.8
+        )
         assert "fuel_two_laps" in played_keys
 
     def test_fuel_alert_does_not_fire_at_exact_threshold(self):
@@ -950,7 +1010,9 @@ class TestSpotterFuelAlert:
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=2.0)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=2.0
+        )
         assert "fuel_two_laps" not in played_keys
 
     def test_fuel_alert_does_not_fire_with_zero(self):
@@ -959,7 +1021,9 @@ class TestSpotterFuelAlert:
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=0.0)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=0.0
+        )
         assert "fuel_two_laps" not in played_keys
         assert "fuel_five_laps" not in played_keys
         assert "fuel_one_lap" not in played_keys
@@ -971,15 +1035,21 @@ class TestSpotterFuelAlert:
         spotter._player.play = lambda key: played_keys.append(key)
 
         # Fire alert
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5
+        )
         assert "fuel_two_laps" in played_keys
 
         # Unknown fuel (0) should NOT reset the alert
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=0.0)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=0.0
+        )
 
         # Should NOT fire again (alert was not reset)
         played_keys.clear()
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=1.3)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.3
+        )
         assert "fuel_two_laps" not in played_keys
 
     def test_fuel_alert_reset_on_spotter_reset(self):
@@ -989,7 +1059,9 @@ class TestSpotterFuelAlert:
         spotter._player.play = lambda key: played_keys.append(key)
 
         # Fire alert
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5
+        )
         assert "fuel_two_laps" in played_keys
 
         # Reset
@@ -997,21 +1069,29 @@ class TestSpotterFuelAlert:
 
         # Should fire again after reset
         played_keys.clear()
-        spotter.update(0, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5)
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5
+        )
         assert "fuel_two_laps" in played_keys
 
 
 class TestSpotterFlagAlerts:
-    """Test flag transition detection (yellow, blue, black, white, red, checkered)."""
+    """Test flag transition detection (yellow, blue, black, white, red, checkered, debris, repair)."""
 
-    # iRacing SessionFlags bitmasks (same as Spotter.FLAG_* constants)
-    FLAG_CHECKERED = 0x00000001
-    FLAG_GREEN = 0x00000001
-    FLAG_YELLOW = 0x00000002
-    FLAG_RED = 0x00000004
-    FLAG_WHITE = 0x00000010
-    FLAG_BLACK = 0x00000020
-    FLAG_BLUE = 0x00008000
+    # iRacing SessionFlags bitmasks (from iRacing SDK / irsdk.Flags)
+    FLAG_CHECKERED = 0x0001
+    FLAG_WHITE = 0x0002
+    FLAG_GREEN = 0x0004
+    FLAG_YELLOW = 0x0008
+    FLAG_RED = 0x0010
+    FLAG_BLUE = 0x0020
+    FLAG_DEBRIS = 0x0040
+    FLAG_CROSSED = 0x0080
+    FLAG_CAUTION = 0x4000
+    FLAG_CAUTION_WAVING = 0x8000
+    FLAG_BLACK = 0x010000
+    FLAG_DISQUALIFY = 0x020000
+    FLAG_REPAIR = 0x100000
 
     def setup_method(self):
         self.config = {
@@ -1056,7 +1136,12 @@ class TestSpotterFlagAlerts:
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        # First transition
+        # Prime: first tick establishes initial state (no alert)
+        spotter.update(
+            0, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
+
+        # Yellow transition
         spotter.update(
             0,
             is_on_track=True,
@@ -1080,6 +1165,11 @@ class TestSpotterFlagAlerts:
         spotter = Spotter(self.config)
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
+
+        # Prime: first tick establishes initial state
+        spotter.update(
+            0, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
 
         # Yellow on
         spotter.update(
@@ -1228,6 +1318,11 @@ class TestSpotterFlagAlerts:
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
+        # Prime: first tick establishes initial state
+        spotter.update(
+            0, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
+
         spotter.update(
             0,
             is_on_track=True,
@@ -1238,8 +1333,14 @@ class TestSpotterFlagAlerts:
 
         spotter.reset()
 
-        # After reset, yellow should fire again (prev_flags was reset)
+        # After reset, first tick primes state again (no alert)
         played_keys.clear()
+        spotter.update(
+            0, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
+        assert "flag_yellow" not in played_keys
+
+        # Second tick: yellow should fire
         spotter.update(
             0,
             is_on_track=True,
@@ -1250,7 +1351,11 @@ class TestSpotterFlagAlerts:
 
 
 class TestSpotterSlipperyAlert:
-    """Test track wetness / slippery surface alert."""
+    """Test debris flag / slippery surface alert."""
+
+    # iRacing SessionFlags bitmasks (from iRacing SDK / irsdk.Flags)
+    FLAG_GREEN = 0x0004
+    FLAG_DEBRIS = 0x0040
 
     def setup_method(self):
         self.config = {
@@ -1268,51 +1373,90 @@ class TestSpotterSlipperyAlert:
             }
         }
 
-    def test_slippery_alert_on_wet_transition(self):
-        """Slippery alert should fire when track wetness goes from 0 to >0."""
+    def test_slippery_alert_on_debris_flag(self):
+        """Slippery alert should fire when debris flag transitions on."""
         spotter = Spotter(self.config)
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        # Start dry
-        spotter.update(0, is_on_track=True, track_surface=3, track_wetness=0.0)
+        # Start with green flag only
+        spotter.update(
+            0, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
         assert "flag_slippery" not in played_keys
 
-        # Track gets wet
-        spotter.update(0, is_on_track=True, track_surface=3, track_wetness=0.3)
+        # Debris flag comes out
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN | self.FLAG_DEBRIS,
+        )
         assert "flag_slippery" in played_keys
 
     def test_slippery_alert_no_repeat(self):
-        """Slippery alert should not fire again while track stays wet."""
+        """Slippery alert should not fire again while debris flag stays on."""
         spotter = Spotter(self.config)
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        # First wet transition
-        spotter.update(0, is_on_track=True, track_surface=3, track_wetness=0.3)
+        # Prime: first tick establishes initial state
+        spotter.update(
+            0, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
+
+        # Debris transition
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN | self.FLAG_DEBRIS,
+        )
         assert "flag_slippery" in played_keys
 
-        # Still wet — no repeat
+        # Still debris — no repeat
         played_keys.clear()
-        spotter.update(0, is_on_track=True, track_surface=3, track_wetness=0.5)
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN | self.FLAG_DEBRIS,
+        )
         assert "flag_slippery" not in played_keys
 
-    def test_slippery_alert_resets_when_dry(self):
-        """Slippery alert should reset when track dries out and re-fire on next wet."""
+    def test_slippery_alert_resets_when_debris_cleared(self):
+        """Slippery alert should re-fire when debris flag goes off and comes back."""
         spotter = Spotter(self.config)
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        # Wet
-        spotter.update(0, is_on_track=True, track_surface=3, track_wetness=0.3)
+        # Prime: first tick establishes initial state
+        spotter.update(
+            0, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
+
+        # Debris on
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN | self.FLAG_DEBRIS,
+        )
         assert "flag_slippery" in played_keys
 
-        # Dry
-        spotter.update(0, is_on_track=True, track_surface=3, track_wetness=0.0)
+        # Debris off
+        spotter.update(
+            0, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
 
-        # Wet again
+        # Debris on again
         played_keys.clear()
-        spotter.update(0, is_on_track=True, track_surface=3, track_wetness=0.2)
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN | self.FLAG_DEBRIS,
+        )
         assert "flag_slippery" in played_keys
 
     def test_slippery_alert_not_when_off_track(self):
@@ -1321,23 +1465,49 @@ class TestSpotterSlipperyAlert:
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        spotter.update(0, is_on_track=False, track_surface=0, track_wetness=0.5)
+        spotter.update(
+            0,
+            is_on_track=False,
+            track_surface=0,
+            session_flags=self.FLAG_GREEN | self.FLAG_DEBRIS,
+        )
         assert "flag_slippery" not in played_keys
 
     def test_slippery_alert_resets_on_spotter_reset(self):
-        """Slippery alert state should be reset on Spotter.reset()."""
+        """Slippery alert should re-fire after Spotter.reset()."""
         spotter = Spotter(self.config)
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        spotter.update(0, is_on_track=True, track_surface=3, track_wetness=0.3)
+        # Prime: first tick
+        spotter.update(
+            0, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
+
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN | self.FLAG_DEBRIS,
+        )
         assert "flag_slippery" in played_keys
 
         spotter.reset()
 
-        # After reset, wet transition should fire again (prev_wetness was reset to 0)
+        # After reset, first tick primes state again
         played_keys.clear()
-        spotter.update(0, is_on_track=True, track_surface=3, track_wetness=0.3)
+        spotter.update(
+            0, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
+        assert "flag_slippery" not in played_keys
+
+        # Second tick: debris should fire again
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN | self.FLAG_DEBRIS,
+        )
         assert "flag_slippery" in played_keys
 
 
@@ -1361,32 +1531,56 @@ class TestSpotterPitRoadAlerts:
         }
 
     def test_pit_entry_transition(self):
-        """Pit entry should play audio when OnPitRoad transitions to True."""
+        """Pit entry should play audio when OnPitRoad and track_surface confirm pit road."""
         spotter = Spotter(self.config)
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        # Not on pit road
-        spotter.update(0, is_on_track=True, track_surface=3, on_pit_road=False)
+        # Prime: first tick sets initial state (no alert on first tick)
+        # Pass green flag so race_started=True
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=0x0004,
+            on_pit_road=False,
+        )
         assert "pit_entry" not in played_keys
 
-        # Enter pit road
-        spotter.update(0, is_on_track=True, track_surface=2, on_pit_road=True)
+        # Enter pit road — surface confirms (pit road = 2)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=2,
+            session_flags=0x0004,
+            on_pit_road=True,
+        )
         assert "pit_entry" in played_keys
 
     def test_pit_exit_transition(self):
-        """Pit exit should play audio when OnPitRoad transitions to False."""
+        """Pit exit should play audio when OnPitRoad and track_surface confirm exit."""
         spotter = Spotter(self.config)
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        # Start on pit road
-        spotter.update(0, is_on_track=True, track_surface=2, on_pit_road=True)
-        assert "pit_entry" in played_keys
+        # Prime: start on pit road (first tick, no alert)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=2,
+            session_flags=0x0004,
+            on_pit_road=True,
+        )
+        assert "pit_entry" not in played_keys  # first tick, no transition
 
-        # Exit pit road
-        played_keys.clear()
-        spotter.update(0, is_on_track=True, track_surface=3, on_pit_road=False)
+        # Exit pit road — surface confirms (on track = 3)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=0x0004,
+            on_pit_road=False,
+        )
         assert "pit_exit" in played_keys
 
     def test_pit_road_no_repeat(self):
@@ -1395,13 +1589,34 @@ class TestSpotterPitRoadAlerts:
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
+        # Prime: not on pit road
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=0x0004,
+            on_pit_road=False,
+        )
+
         # Enter pit road
-        spotter.update(0, is_on_track=True, track_surface=2, on_pit_road=True)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=2,
+            session_flags=0x0004,
+            on_pit_road=True,
+        )
         assert "pit_entry" in played_keys
 
         # Still on pit road — no repeat
         played_keys.clear()
-        spotter.update(0, is_on_track=True, track_surface=2, on_pit_road=True)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=2,
+            session_flags=0x0004,
+            on_pit_road=True,
+        )
         assert "pit_entry" not in played_keys
         assert "pit_exit" not in played_keys
 
@@ -1411,16 +1626,111 @@ class TestSpotterPitRoadAlerts:
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
+        # Prime: not on pit road (green flag = race started)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=0x0004,
+            on_pit_road=False,
+        )
+
         # Enter pit road
-        spotter.update(0, is_on_track=True, track_surface=2, on_pit_road=True)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=2,
+            session_flags=0x0004,
+            on_pit_road=True,
+        )
         assert "pit_entry" in played_keys
 
         spotter.reset()
 
-        # After reset, entering pit road should fire again
+        # After reset, first tick primes state again (no alert)
         played_keys.clear()
-        spotter.update(0, is_on_track=True, track_surface=2, on_pit_road=True)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=0x0004,
+            on_pit_road=False,
+        )
+        assert "pit_entry" not in played_keys
+
+        # Enter pit road again after reset
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=2,
+            session_flags=0x0004,
+            on_pit_road=True,
+        )
         assert "pit_entry" in played_keys
+
+    def test_pit_road_start_finish_flicker(self):
+        """OnPitRoad flicker at start/finish should not trigger pit alerts."""
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Prime: on racing surface, not on pit road (green flag = race started)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=0x0004,
+            on_pit_road=False,
+        )
+        assert "pit_entry" not in played_keys
+
+        # iRacing flicker: OnPitRoad=True but still on racing surface (3)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=0x0004,
+            on_pit_road=True,
+        )
+        assert "pit_entry" not in played_keys  # surface disagrees — flicker
+        assert "pit_exit" not in played_keys
+
+        # Flicker ends: back to normal
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=0x0004,
+            on_pit_road=False,
+        )
+        assert "pit_entry" not in played_keys
+        assert "pit_exit" not in played_keys
+
+    def test_pit_road_suppressed_before_green(self):
+        """Pit entry/exit should be suppressed before green flag (on grid)."""
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Prime: on grid, no green flag yet
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=2,
+            session_flags=0,
+            on_pit_road=True,
+        )
+        assert "pit_entry" not in played_keys  # on grid, not racing
+
+        # Cross start line — leave "pit road" area
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=0,
+            on_pit_road=False,
+        )
+        assert "pit_exit" not in played_keys  # still no green flag
 
 
 # ---------------------------------------------------------------------------
@@ -1515,9 +1825,18 @@ class TestSpotterAudioPlayer:
             "fuel_two_laps",
             "fuel_one_lap",
             "flag_yellow",
+            "flag_blue",
             "flag_black",
             "flag_white",
+            "flag_red",
+            "flag_checkered",
             "flag_slippery",
+            "flagmeatball",
+            "penalty_1x",
+            "penalty_2x",
+            "penalty_4x",
+            "pit_entry",
+            "pit_exit",
         ]
         for key in expected_keys:
             assert key in SpotterAudioPlayer.DEFAULT_AUDIO_PATHS, (

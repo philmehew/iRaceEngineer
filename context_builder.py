@@ -99,13 +99,17 @@ def format_engine_warnings(warnings: int) -> str:
 
 
 def format_car_proximity(car_left_right: int) -> str:
-    """Format CarLeftRight value to human-readable string."""
-    if car_left_right == 0:
+    """Format CarLeftRight value to human-readable string.
+
+    iRacing CarLeftRight is an ordinal enum (not bitmask):
+        0=off, 1=clear, 2=car left, 3=car right, 4=both, 5=two left, 6=two right
+    """
+    if car_left_right in (0, 1):
         return ""
     parts = []
-    if car_left_right & 1:
+    if car_left_right in (2, 4, 5):
         parts.append("car LEFT")
-    if car_left_right & 2:
+    if car_left_right in (3, 4, 6):
         parts.append("car RIGHT")
     return " | ".join(parts)
 
@@ -277,6 +281,13 @@ class ContextBuilder:
         )
         lines.append(f"Flags: {', '.join(flags)}")
 
+        # Race fastest lap
+        race_fastest = player.get("race_fastest_lap")
+        if race_fastest and race_fastest.get("time", 0) > 0:
+            fast_time = format_lap_time(race_fastest["time"])
+            fast_driver = race_fastest.get("driver_name", "?")
+            lines.append(f"Race fastest: {fast_time} ({fast_driver})")
+
         # Weather
         weather = session.get("weather", {})
         if weather:
@@ -397,6 +408,13 @@ class ContextBuilder:
             f"Driver: {driver_name}. Race: {track_str}, Lap {race_laps}/{total_laps_str}, P{pos} (Class P{class_pos})"
         )
         lines.append(f"Flags: {', '.join(flags)}")
+
+        # Race fastest lap
+        race_fastest = player.get("race_fastest_lap")
+        if race_fastest and race_fastest.get("time", 0) > 0:
+            fast_time = format_lap_time(race_fastest["time"])
+            fast_driver = race_fastest.get("driver_name", "?")
+            lines.append(f"Race fastest: {fast_time} ({fast_driver})")
 
         # Track config
         track_length = config.get("track_length_km", 0)
@@ -744,9 +762,7 @@ class ContextBuilder:
             elif tyre_staleness == "live":
                 lines.append("  Tyres: (data updating — fresh from pit stop)")
             else:
-                lines.append(
-                    "  Tyres: unreliable (status unknown, data may not be updating)"
-                )
+                lines.append("  Tyres: data availability not yet confirmed")
 
             # When tyre data is stale/frozen, check if all pressures are identical
             # and collapse them into one line to avoid the LLM saying "pressures stable"

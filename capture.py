@@ -279,7 +279,7 @@ def create_sample_data(output_dir: str) -> str:
             },
             "telemetry": {
                 # Session
-                "SessionFlags": 1,  # Green
+                "SessionFlags": 4,  # Green
                 "SessionLapsRemain": 60 - lap,
                 "SessionTimeRemain": 3600 - lap * 90,
                 "SessionNum": 0,
@@ -375,6 +375,7 @@ def create_sample_data(output_dir: str) -> str:
                 "CarIdxP2P_Count": [2, 4, 1, 3 if lap < 8 else 2, 2, 3, 1],
                 "CarIdxTireCompound": [0, 0, 1, 0, 0, 1, 0],
                 # Incidents
+                "CarIdxSessionFlags": [0, 0, 0, 0],
                 "PlayerCarMyIncidentCount": 0,
                 "PlayerCarTeamIncidentCount": 2,
                 "CarDistAhead": gap_ahead,

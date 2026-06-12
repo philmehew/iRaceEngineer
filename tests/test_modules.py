@@ -24,10 +24,11 @@ from capture import TelemetryReplay
 # --- Fixtures ---
 
 
-def sample_telemetry(lap=10, fuel=72.0, flags=1):
+def sample_telemetry(lap=10, fuel=72.0, flags=4):
     """Generate sample telemetry data for testing."""
     return {
         "SessionFlags": flags,
+        "CarIdxSessionFlags": [0, 0, 0, 0],
         "SessionLapsRemain": 60 - lap,
         "SessionTimeRemain": 3600 - lap * 90,
         "SessionNum": 0,
@@ -202,7 +203,7 @@ def sample_session_info():
     }
 
 
-def make_state(lap=10, fuel=72.0, flags=1):
+def make_state(lap=10, fuel=72.0, flags=4):
     """Create a RaceState with sample data."""
     config = {
         "prompt": {
@@ -400,10 +401,13 @@ class TestContextBuilder:
         assert "water temp" in result or "fuel pressure" in result
 
     def test_format_car_proximity(self):
-        assert format_car_proximity(0) == ""
-        assert format_car_proximity(1) == "car LEFT"
-        assert format_car_proximity(2) == "car RIGHT"
-        assert "LEFT" in format_car_proximity(3) and "RIGHT" in format_car_proximity(3)
+        assert format_car_proximity(0) == ""  # off
+        assert format_car_proximity(1) == ""  # clear (no cars)
+        assert format_car_proximity(2) == "car LEFT"
+        assert format_car_proximity(3) == "car RIGHT"
+        assert "LEFT" in format_car_proximity(4) and "RIGHT" in format_car_proximity(
+            4
+        )  # both
 
     def test_full_context_includes_engine_health(self):
         state = make_state()

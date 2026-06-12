@@ -65,7 +65,10 @@ class SessionInfo:
     laps_total: int = 0
     laps_remain: int = 0
     time_remain: float = 0.0
-    flags: int = 0  # SessionFlags bitmask
+    flags: int = 0  # SessionFlags bitmask (session-wide)
+    player_flags: int = (
+        0  # CarIdxSessionFlags for player car (driver-specific: black, repair, etc.)
+    )
     session_state: int = 0
 
 
@@ -529,7 +532,6 @@ class IRacingClient:
             "CarDistBehind",
             "CarLeftRight",
             "PlayerCarMyIncidentCount",
-            "PlayerCarDriverIncidentCount",
             "PlayerCarTeamIncidentCount",
             "PlayerCarTowTime",
             # Car status
@@ -642,6 +644,7 @@ class IRacingClient:
             "dpRRTireColdPress",
             # Session
             "SessionFlags",
+            "CarIdxSessionFlags",
             "SessionLapsRemain",
             "SessionLapsRemainEx",
             "SessionTimeRemain",
@@ -725,6 +728,11 @@ class IRacingClient:
             laps_remain=self.get_telemetry_value("SessionLapsRemain", 0),
             time_remain=self.get_telemetry_value("SessionTimeRemain", 0.0),
             flags=int(self.get_telemetry_value("SessionFlags", 0)),
+            player_flags=int(
+                self.get_telemetry_value("CarIdxSessionFlags", [0])[
+                    self.get_telemetry_value("PlayerCarIdx", 0)
+                ]
+            ),
             session_state=int(self.get_telemetry_value("SessionState", 0)),
         )
 

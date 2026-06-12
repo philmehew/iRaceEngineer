@@ -54,11 +54,14 @@ class SpotterCall:
 class ProximityDetector:
     """State machine that detects CarLeftRight transitions.
 
-    iRacing CarLeftRight values:
-        0 = no car alongside
-        1 = car on the left
-        2 = car on the right
-        3 = car on both sides
+    iRacing CarLeftRight values (from irsdk.CarLeftRight — ordinal enum, NOT bitmask):
+        0 = off (no connection)
+        1 = clear (no cars alongside)
+        2 = car on the left
+        3 = car on the right
+        4 = cars on both sides (three wide)
+        5 = two cars on the left
+        6 = two cars on the right
 
     The detector tracks the previous state per direction and fires events
     only on transitions (rising edges for appearance, falling edges for
@@ -84,7 +87,7 @@ class ProximityDetector:
         cooldowns = spotter_config.get("cooldowns", {})
         self._proximity_cooldown = cooldowns.get("proximity_ms", 3000) / 1000.0
         self._clearance_cooldown = cooldowns.get("clearance_ms", 5000) / 1000.0
-        self._clear_delay = cooldowns.get("clear_delay_ms", 500) / 1000.0
+        self._clear_delay = cooldowns.get("clear_delay_ms", 0) / 1000.0
         self._appear_delay = cooldowns.get("appear_delay_ms", 200) / 1000.0
 
         self._prev_left = False
@@ -110,20 +113,40 @@ class ProximityDetector:
         self._pending_appear_since_left: float | None = None
         self._pending_appear_since_right: float | None = None
 
+        # Side-correction tracking: when iRacing briefly reports a car on the
+        # wrong side before settling on the correct side, we want to correct
+        # the wrong-side call by playing "clear" + the correct side.
+        # Only applies when the car has been continuously alongside (no gap
+        # where CarLeftRight=0) — a gap means genuine car movement, not flicker.
+        self._last_side: str | None = None  # "left", "right", or "three_wide"
+        self._last_side_time: float = 0.0
+        self._side_correction_window: float = 1.5  # seconds
+        self._continuous_alongside_since_last_side: bool = False
+
     def update(self, car_left_right: int, current_time: float) -> list[SpotterCall]:
         """Process a CarLeftRight value and return any calls to play.
 
         Args:
-            car_left_right: iRacing CarLeftRight value (0=none, 1=left, 2=right, 3=both)
+            car_left_right: iRacing CarLeftRight value
+                (0=off, 1=clear, 2=left, 3=right, 4=both, 5=two_left, 6=two_right)
             current_time: Monotonic time for cooldown tracking (time.monotonic())
 
         Returns:
             List of SpotterCall events to play.
         """
-        cur_left = bool(car_left_right & 1)
-        cur_right = bool(car_left_right & 2)
+        # iRacing CarLeftRight is an ordinal enum (not a bitmask):
+        #   0=off, 1=clear, 2=car_left, 3=car_right, 4=both, 5=two_left, 6=two_right
+        cur_left = car_left_right in (2, 4, 5)  # car_left, both, two_cars_left
+        cur_right = car_left_right in (3, 4, 6)  # car_right, both, two_cars_right
 
         calls: list[SpotterCall] = []
+
+        # Track whether car has been continuously alongside since the last
+        # side call. If CarLeftRight=0 (no car alongside), reset the flag.
+        # This distinguishes genuine car movement (car left, gap, car right)
+        # from telemetry flicker (car left, briefly wrong side, car left).
+        if not cur_left and not cur_right:
+            self._continuous_alongside_since_last_side = False
 
         # === Phase 1: Update pending appearance timers ===
         # When a car first appears on a side, start a pending appear timer
@@ -193,14 +216,34 @@ class ProximityDetector:
                     )
                     self._last_call_time["three_wide"] = current_time
                     self._car_alongside = True
+                    self._last_side = "three_wide"
+                    self._last_side_time = current_time
+                    self._continuous_alongside_since_last_side = True
                     # Reset proximity cooldowns for individual sides too, so
                     # a rapid 0→3→0→1 sequence doesn't re-trigger left immediately
                     self._last_call_time["car_left"] = current_time
                     self._last_call_time["car_right"] = current_time
             else:
-                # Individual side appearance
+                # Individual side appearance — with side-correction for flicker
                 if left_appeared:
                     if self._cooldown_elapsed("car_left", current_time):
+                        # Side-correction: if the opposite side was just announced
+                        # AND the opposite side is no longer present AND there's
+                        # been no gap in car-alongside status, this is likely a
+                        # telemetry flicker. Play "clear" to correct the wrong
+                        # side call, then play the correct side.
+                        if (
+                            self._last_side == "right"
+                            and not cur_right  # right car is no longer there
+                            and self._continuous_alongside_since_last_side  # no gap
+                            and (current_time - self._last_side_time)
+                            < self._side_correction_window
+                        ):
+                            calls.append(
+                                SpotterCall(
+                                    call_type="clear", priority=0, audio_key="clear"
+                                )
+                            )
                         calls.append(
                             SpotterCall(
                                 call_type="car_left",
@@ -210,9 +253,25 @@ class ProximityDetector:
                         )
                         self._last_call_time["car_left"] = current_time
                         self._car_alongside = True
+                        self._last_side = "left"
+                        self._last_side_time = current_time
+                        self._continuous_alongside_since_last_side = True
 
                 if right_appeared:
                     if self._cooldown_elapsed("car_right", current_time):
+                        # Side-correction: mirror of left-side logic above
+                        if (
+                            self._last_side == "left"
+                            and not cur_left  # left car is no longer there
+                            and self._continuous_alongside_since_last_side  # no gap
+                            and (current_time - self._last_side_time)
+                            < self._side_correction_window
+                        ):
+                            calls.append(
+                                SpotterCall(
+                                    call_type="clear", priority=0, audio_key="clear"
+                                )
+                            )
                         calls.append(
                             SpotterCall(
                                 call_type="car_right",
@@ -222,6 +281,10 @@ class ProximityDetector:
                         )
                         self._last_call_time["car_right"] = current_time
                         self._car_alongside = True
+                        self._last_side = "right"
+                        self._last_side_time = current_time
+                        self._continuous_alongside_since_last_side = True
+                        self._last_side_time = current_time
 
         # === Phase 4: Debounced clear detection ===
         # Instead of firing "clear" the instant telemetry reads the car as gone,
@@ -317,6 +380,9 @@ class ProximityDetector:
         self._pending_clear_since_right = None
         self._pending_appear_since_left = None
         self._pending_appear_since_right = None
+        self._last_side = None
+        self._last_side_time = 0.0
+        self._continuous_alongside_since_last_side = False
 
 
 class SpotterAudioPlayer:
@@ -340,10 +406,16 @@ class SpotterAudioPlayer:
         "flag_yellow": "audio/flagyellow.wav",
         "flag_blue": "audio/flagblue.wav",
         "flag_black": "audio/flagblack.wav",
+        "flagfurledblack": "audio/flagfurledblack.wav",
         "flag_white": "audio/flagwhite.wav",
         "flag_red": "audio/flagred.wav",
         "flag_checkered": "audio/flagchequered.wav",
         "flag_slippery": "audio/flagslippery.wav",
+        "flag_green": "audio/flaggreen.wav",
+        "flagmeatball": "audio/flagmeatball.wav",
+        "penalty_1x": "audio/penaltyonex.wav",
+        "penalty_2x": "audio/penaltytwox.wav",
+        "penalty_4x": "audio/penaltyfourx.wav",
         "pit_entry": "audio/pitentry.wav",
         "pit_exit": "audio/pitexit.wav",
     }
@@ -392,6 +464,7 @@ class SpotterAudioPlayer:
                 raw_data = wf.readframes(n_frames)
 
             # Convert to float32 numpy array
+            dtype: type = np.int16
             if sample_width == 2:
                 dtype = np.int16
             elif sample_width == 4:
@@ -508,19 +581,28 @@ class Spotter:
         spotter = Spotter(config)
         # Each tick:
         spotter.update(car_left_right=1, is_on_track=True, track_surface=3,
-                       fuel_laps_remaining=5.2, session_flags=0x01,
-                       track_wetness=0.0, on_pit_road=False)
+                       fuel_laps_remaining=5.2, session_flags=0x04,
+                       incidents=0, on_pit_road=False)
         # On reconnect:
         spotter.reset()
     """
 
-    # iRacing SessionFlags bitmasks (from iRacing SDK Flags class)
-    FLAG_CHECKERED = 0x00000001
-    FLAG_WHITE = 0x00000010
-    FLAG_YELLOW = 0x00000002
-    FLAG_RED = 0x00000004
-    FLAG_BLACK = 0x00000020
-    FLAG_BLUE = 0x00008000
+    # iRacing SessionFlags bitmasks (from iRacing SDK / irsdk.Flags)
+    FLAG_CHECKERED = 0x0001
+    FLAG_WHITE = 0x0002
+    FLAG_GREEN = 0x0004
+    FLAG_YELLOW = 0x0008
+    FLAG_RED = 0x0010
+    FLAG_BLUE = 0x0020
+    FLAG_DEBRIS = 0x0040
+    FLAG_CROSSED = 0x0080
+    FLAG_CAUTION = 0x4000
+    FLAG_CAUTION_WAVING = 0x8000
+    FLAG_BLACK = 0x010000
+    FLAG_DISQUALIFY = 0x020000
+    FLAG_SERVICABLE = 0x040000
+    FLAG_FURLED = 0x080000
+    FLAG_REPAIR = 0x100000
 
     # Fuel alert thresholds (laps remaining): (threshold, audio_key, reset_threshold)
     # Each alert fires once when laps drop below threshold, resets when laps
@@ -546,14 +628,19 @@ class Spotter:
         }
 
         # Flag state: track previous flags for transition detection
-        self._prev_flags: int = 0
+        self._prev_flags: int | None = None  # None = first tick not yet processed
+        self._race_started: bool = False  # True after first green flag seen
 
-        # Track wetness state: previous wetness value for transition detection
-        self._prev_track_wetness: float = 0.0
-        self._slippery_alert_fired: bool = False
+        # Incident count state: track previous values for change detection
+        self._prev_incidents: int | None = None
 
         # Pit road state: track transitions for pit entry/exit alerts
-        self._prev_on_pit_road: bool = False
+        self._prev_on_pit_road: bool | None = (
+            None  # None = first tick not yet processed
+        )
+        self._confirmed_on_pit_road: bool = (
+            False  # True only when OnPitRoad + surface agree
+        )
 
         if self._enabled:
             logger.info("Spotter enabled — car proximity calls active")
@@ -568,7 +655,7 @@ class Spotter:
         track_surface: int = 0,
         fuel_laps_remaining: float = 0.0,
         session_flags: int = 0,
-        track_wetness: float = 0.0,
+        incidents: int = 0,
         on_pit_road: bool = False,
     ):
         """Process a telemetry tick.
@@ -577,15 +664,15 @@ class Spotter:
         runs edge detection, and plays any resulting audio calls.
 
         Args:
-            car_left_right: iRacing CarLeftRight value (0=none, 1=left, 2=right, 3=both)
+            car_left_right: iRacing CarLeftRight value
+                (0=off, 1=clear, 2=left, 3=right, 4=both, 5=two_left, 6=two_right)
             is_on_track: If False, skip processing (car is in garage)
             track_surface: iRacing PlayerTrackSurface value.
                 -1=not in world, 0=garage, 1=pit stall, 2=pit road, 3=on racing surface.
                 Proximity calls are only processed when >= 3 (on racing surface).
             fuel_laps_remaining: Estimated laps of fuel remaining (0 = unknown).
             session_flags: iRacing SessionFlags bitmask for flag transition detection.
-            track_wetness: iRacing TrackWetness value (0-1). Alert fires when
-                wetness transitions from 0 to >0 (surface becomes slippery).
+            incidents: Player's incident points (1x, 2x, 4x). Alert fires on increases.
             on_pit_road: iRacing OnPitRoad boolean. Alert fires on transitions
                 (entering or exiting pit road).
         """
@@ -593,7 +680,7 @@ class Spotter:
             return
 
         # --- Proximity calls (only on racing surface) ---
-        if is_on_track and track_surface >= 3 and 0 <= car_left_right <= 3:
+        if is_on_track and track_surface >= 3 and 0 <= car_left_right <= 6:
             calls = self._detector.update(car_left_right, time.monotonic())
             for call in calls:
                 self._player.play(call.audio_key)
@@ -619,65 +706,131 @@ class Spotter:
         # --- Flag transition alerts ---
         # Detect rising edges (flag transitions from off to on).
         # Only fire when the player is on track.
+        # First tick: just record the initial flag state, don't alert.
         if is_on_track:
-            rising = session_flags & ~self._prev_flags  # flags that just turned on
-            if rising & self.FLAG_YELLOW:
-                self._player.play("flag_yellow")
-                logger.info("Flag alert: yellow flag")
-            if rising & self.FLAG_BLUE:
-                self._player.play("flag_blue")
-                logger.info("Flag alert: blue flag")
-            if rising & self.FLAG_BLACK:
-                self._player.play("flag_black")
-                logger.info("Flag alert: black flag")
-            if rising & self.FLAG_WHITE:
-                self._player.play("flag_white")
-                logger.info("Flag alert: white flag")
-            if rising & self.FLAG_RED:
-                self._player.play("flag_red")
-                logger.info("Flag alert: red flag")
-            if rising & self.FLAG_CHECKERED:
-                self._player.play("flag_checkered")
-                logger.info("Flag alert: checkered flag")
-            self._prev_flags = session_flags
+            if self._prev_flags is None:
+                # First tick — prime the initial state, no alerts
+                self._prev_flags = session_flags
+                # If green flag is already set, race is already underway
+                if session_flags & self.FLAG_GREEN:
+                    self._race_started = True
+                logger.info(
+                    f"Flag state primed: 0x{session_flags:08x} (race_started={self._race_started})"
+                )
+            else:
+                rising = session_flags & ~self._prev_flags  # flags that just turned on
+                if rising & self.FLAG_YELLOW:
+                    self._player.play("flag_yellow")
+                    logger.info("Flag alert: yellow flag")
+                if rising & self.FLAG_CAUTION:
+                    self._player.play("flag_yellow")
+                    logger.info("Flag alert: caution (yellow)")
+                if rising & self.FLAG_CAUTION_WAVING:
+                    self._player.play("flag_yellow")
+                    logger.info("Flag alert: caution waving (yellow)")
+                if rising & self.FLAG_BLUE and self._race_started:
+                    self._player.play("flag_blue")
+                    logger.info("Flag alert: blue flag")
+                if rising & self.FLAG_BLACK:
+                    self._player.play("flag_black")
+                    logger.info("Flag alert: black flag")
+                if rising & self.FLAG_DISQUALIFY:
+                    self._player.play("flag_black")
+                    logger.info("Flag alert: disqualify flag")
+                if rising & self.FLAG_FURLED:
+                    self._player.play("flagfurledblack")
+                    logger.info("Flag alert: furled black flag (warning)")
+                if rising & self.FLAG_WHITE:
+                    self._player.play("flag_white")
+                    logger.info("Flag alert: white flag")
+                if rising & self.FLAG_RED:
+                    self._player.play("flag_red")
+                    logger.info("Flag alert: red flag")
+                if rising & self.FLAG_CHECKERED:
+                    self._player.play("flag_checkered")
+                    logger.info("Flag alert: checkered flag")
+                if rising & self.FLAG_DEBRIS:
+                    self._player.play("flag_slippery")
+                    logger.info("Flag alert: debris (slippery surface)")
+                if rising & self.FLAG_REPAIR:
+                    self._player.play("flagmeatball")
+                    logger.info("Flag alert: meatball (repair order)")
+                if rising & self.FLAG_GREEN:
+                    self._race_started = True
+                    # Absorb current pit road state to avoid false "pit exit"
+                    # when transitioning from grid to racing surface on green
+                    self._confirmed_on_pit_road = on_pit_road and track_surface <= 2
+                    self._prev_on_pit_road = self._confirmed_on_pit_road
+                    self._player.play("flag_green")
+                    logger.info("Flag alert: green flag — race started")
+                self._prev_flags = session_flags
+                if rising:
+                    logger.debug(
+                        f"Flags: prev=0x{self._prev_flags:08x}, "
+                        f"curr=0x{session_flags:08x}, rising=0x{rising:08x}"
+                    )
 
-        # --- Track wetness (slippery surface) alert ---
-        # Fire when track wetness transitions from dry (0) to wet (>0).
-        # Reset when track dries out (wetness returns to 0).
-        # Only fire when on track.
-        if is_on_track:
-            if (
-                track_wetness > 0
-                and self._prev_track_wetness == 0
-                and not self._slippery_alert_fired
-            ):
-                self._player.play("flag_slippery")
-                self._slippery_alert_fired = True
-                logger.info("Track alert: slippery surface (wet)")
-            elif track_wetness == 0:
-                self._slippery_alert_fired = False
-            self._prev_track_wetness = track_wetness
+        # --- Incident count change alerts ---
+        # First tick: just record initial state, don't alert.
+        if self._prev_incidents is None:
+            self._prev_incidents = incidents
+            logger.info(f"Incident state primed: incidents={incidents}")
+        else:
+            # 1x, 2x, 4x penalties: detected when incident points increase.
+            if incidents > self._prev_incidents:
+                delta = incidents - self._prev_incidents
+                if delta >= 4:
+                    self._player.play("penalty_4x")
+                    logger.info(f"Incident alert: +{delta}x (4x penalty)")
+                elif delta == 2:
+                    self._player.play("penalty_2x")
+                    logger.info("Incident alert: 2x penalty")
+                else:
+                    self._player.play("penalty_1x")
+                    logger.info("Incident alert: 1x penalty")
+            self._prev_incidents = incidents
 
         # --- Pit road transition alerts ---
         # Fire on entering pit road (False→True) and exiting (True→False).
         # Useful for confirming pit entry/exit to the driver.
-        if on_pit_road and not self._prev_on_pit_road:
-            self._player.play("pit_entry")
-            logger.info("Pit road: entered pit road")
-        elif not on_pit_road and self._prev_on_pit_road:
-            self._player.play("pit_exit")
-            logger.info("Pit road: exited pit road")
-        self._prev_on_pit_road = on_pit_road
+        # iRacing's OnPitRoad telemetry can flicker True briefly at the
+        # start/finish line. To avoid false alerts, we only confirm pit
+        # road when OnPitRoad=True AND PlayerTrackSurface indicates pit
+        # road or pit stall (values 1-2). If OnPitRoad=True but surface=3
+        # (on racing surface), it's a start/finish flicker — ignore it.
+        # Also suppress pit alerts before the race goes green — on the grid
+        # you're technically "on pit road" but you're not pitting.
+        on_pit_road_confirmed = on_pit_road and track_surface <= 2
+        if self._prev_on_pit_road is None:
+            # First tick — just record the initial state, don't alert
+            self._prev_on_pit_road = on_pit_road_confirmed
+            self._confirmed_on_pit_road = on_pit_road_confirmed
+        else:
+            if on_pit_road_confirmed and not self._confirmed_on_pit_road:
+                if self._race_started:
+                    self._player.play("pit_entry")
+                    logger.info("Pit road: entered pit road")
+                else:
+                    logger.debug("Pit road: on grid (pit entry suppressed)")
+            elif not on_pit_road_confirmed and self._confirmed_on_pit_road:
+                if self._race_started:
+                    self._player.play("pit_exit")
+                    logger.info("Pit road: exited pit road")
+                else:
+                    logger.debug("Pit road: leaving grid (pit exit suppressed)")
+            self._confirmed_on_pit_road = on_pit_road_confirmed
+            self._prev_on_pit_road = on_pit_road_confirmed
 
     def reset(self):
         """Reset spotter state (on session start/reconnect)."""
         self._detector.reset()
         for threshold in self._fuel_alerts_fired:
             self._fuel_alerts_fired[threshold] = False
-        self._prev_flags = 0
-        self._prev_track_wetness = 0.0
-        self._slippery_alert_fired = False
-        self._prev_on_pit_road = False
+        self._prev_flags = None
+        self._race_started = False
+        self._prev_incidents = None
+        self._prev_on_pit_road = None
+        self._confirmed_on_pit_road = False
         logger.debug("Spotter state reset")
 
     @property

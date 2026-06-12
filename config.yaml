@@ -96,19 +96,25 @@ spotter:
     fuel_five_laps: "audio/fuelfivelaps.wav"  # Fuel below 5 laps remaining
     fuel_two_laps: "audio/fueltwolaps.wav"    # Fuel below 2 laps remaining
     fuel_one_lap: "audio/fuelonelap.wav"      # Fuel below 1 lap remaining
-    flag_yellow: "audio/flagyellow.wav"        # Yellow flag
+    flag_yellow: "audio/flagyellow.wav"        # Yellow flag / caution
     flag_blue: "audio/flagblue.wav"            # Blue flag (faster car behind)
-    flag_black: "audio/flagblack.wav"          # Black flag
+    flag_black: "audio/flagblack.wav"          # Black flag / disqualify
+    flagfurledblack: "audio/flagfurledblack.wav"  # Furled black flag (warning)
     flag_white: "audio/flagwhite.wav"          # White flag (slow car ahead)
     flag_red: "audio/flagred.wav"              # Red flag
     flag_checkered: "audio/flagchequered.wav"  # Checkered flag
-    flag_slippery: "audio/flagslippery.wav"    # Track surface slippery (wet)
+    flag_slippery: "audio/flagslippery.wav"    # Debris flag (slippery surface)
+    flag_green: "audio/flaggreen.wav"          # Green flag (race start / restart)
+    flagmeatball: "audio/flagmeatball.wav"     # Meatball flag (repair order)
+    penalty_1x: "audio/penaltyonex.wav"         # 1x incident penalty
+    penalty_2x: "audio/penaltytwox.wav"         # 2x incident penalty
+    penalty_4x: "audio/penaltyfourx.wav"        # 4x incident penalty
     pit_entry: "audio/pitentry.wav"            # Entered pit road
     pit_exit: "audio/pitexit.wav"              # Exited pit road
   cooldowns:
     proximity_ms: 3000                    # Don't repeat proximity calls within 3s
     clearance_ms: 5000                    # Don't repeat clearance calls within 5s
-    clear_delay_ms: 500                   # Debounce: car must be gone this long before "clear" fires
+    clear_delay_ms: 0                      # No debounce on "clear" — fire immediately
     appear_delay_ms: 200                  # Debounce: car must be alongside this long before proximity fires
   output_device: null                     # null = system default, or device name/index
   volume: 1.0                             # Volume multiplier (independent of TTS)

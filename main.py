@@ -705,7 +705,7 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                     track_surface = state.player.player_track_surface
                     fuel_laps = state.fuel_laps_remaining
                     flags = state.session.flags
-                    wetness = state.session.track_wetness
+                    incidents = state.player.incidents
                     on_pit_road = state.player.on_pit_road
                     spotter.update(
                         car_lr,
@@ -713,7 +713,7 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                         track_surface=track_surface,
                         fuel_laps_remaining=fuel_laps,
                         session_flags=flags,
-                        track_wetness=wetness,
+                        incidents=incidents,
                         on_pit_road=on_pit_road,
                     )
 
