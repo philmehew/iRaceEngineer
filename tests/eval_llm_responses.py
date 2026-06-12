@@ -167,9 +167,10 @@ def run_eval(session_dir: str, count: int, output_file: str, config: dict):
         telemetry = data.get("telemetry", {})
         session_info = data.get("session_info", {})
         driver_names = data.get("driver_names", {})
+        units = data.get("units", {})
         if driver_names:
             driver_names = {int(k): v for k, v in driver_names.items()}
-        state.update(telemetry, session_info, driver_names)
+        state.update(telemetry, session_info, driver_names, units=units)
 
         # Set team info on first snapshot (driver names available then)
         if snap_idx == 0 and driver_names:
