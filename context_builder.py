@@ -148,6 +148,7 @@ class ContextBuilder:
             "- 'Incidents' are safety points (0x per off-track), NOT car damage. Always report the count when it's in the context.\n"
             "- If tyre data is marked unreliable, still report the values but don't comment on degradation, trends, or whether they're changing. Say 'last known: Left Front 79C...' rather than skipping them.\n"
             "- [ACTION] add_fuel amounts: whole litres only (integers, never decimals), min 1L, max = tank capacity minus current fuel. Never exceed tank capacity.\n"
+            "- When speaking fuel amounts, use 'litres' not 'L'. Example: 'Add 60 litres' not 'Add 60L'.\n"
             "- Weather data is current conditions only — never predict future weather.\n"
             "- Lap times in the 'Pace' line are the driver's own times. Lap times in the 'Nearby' section are other cars' times.\n"
             "- When fuel burn says 'unknown', do NOT invent a specific L/lap figure. Say 'fuel burn unknown' or estimate from race structure only.\n"
@@ -288,6 +289,17 @@ class ContextBuilder:
             fast_driver = race_fastest.get("driver_name", "?")
             lines.append(f"Race fastest: {fast_time} ({fast_driver})")
 
+        # Race leader
+        race_leader = player.get("race_leader")
+        if race_leader:
+            leader_name = race_leader.get("driver_name", "?")
+            leader_lap = race_leader.get("lap", 0)
+            leader_last = race_leader.get("last_lap_time", -1)
+            leader_str = f"Leader: {leader_name}, Lap {leader_lap}"
+            if leader_last and leader_last > 0:
+                leader_str += f", last lap {format_lap_time(leader_last)}"
+            lines.append(leader_str)
+
         # Weather
         weather = session.get("weather", {})
         if weather:
@@ -415,6 +427,17 @@ class ContextBuilder:
             fast_time = format_lap_time(race_fastest["time"])
             fast_driver = race_fastest.get("driver_name", "?")
             lines.append(f"Race fastest: {fast_time} ({fast_driver})")
+
+        # Race leader
+        race_leader = player.get("race_leader")
+        if race_leader:
+            leader_name = race_leader.get("driver_name", "?")
+            leader_lap = race_leader.get("lap", 0)
+            leader_last = race_leader.get("last_lap_time", -1)
+            leader_str = f"Leader: {leader_name}, Lap {leader_lap}"
+            if leader_last and leader_last > 0:
+                leader_str += f", last lap {format_lap_time(leader_last)}"
+            lines.append(leader_str)
 
         # Track config
         track_length = config.get("track_length_km", 0)

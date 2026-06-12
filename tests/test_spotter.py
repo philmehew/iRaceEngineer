@@ -1830,6 +1830,8 @@ class TestSpotterAudioPlayer:
             "flag_white",
             "flag_red",
             "flag_checkered",
+            "flag_green",
+            "lights_out",
             "flag_slippery",
             "flagmeatball",
             "penalty_1x",

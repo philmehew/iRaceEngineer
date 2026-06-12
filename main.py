@@ -260,6 +260,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("iraceengineer")
 
+# Dedicated spotter log — writes to file so transitions are visible after the fact
+spotter_logger = logging.getLogger("spotter")
+spotter_file = os.path.join("logs", "spotter.log")
+os.makedirs("logs", exist_ok=True)
+spotter_handler = RotatingFileHandler(spotter_file, maxBytes=1_000_000, backupCount=2)
+spotter_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s: %(message)s", datefmt="%H:%M:%S")
+)
+spotter_logger.addHandler(spotter_handler)
+# Keep console output too
+spotter_logger.propagate = True
+
 # Dedicated logger for LLM query data — writes prompt/response to a local file
 llm_query_logger = logging.getLogger("iraceengineer.llm_query")
 llm_query_logger.propagate = False  # Don't double-print to console
@@ -705,6 +717,7 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                     track_surface = state.player.player_track_surface
                     fuel_laps = state.fuel_laps_remaining
                     flags = state.session.flags
+                    session_state = state.session.session_state
                     incidents = state.player.incidents
                     on_pit_road = state.player.on_pit_road
                     spotter.update(
@@ -713,6 +726,7 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                         track_surface=track_surface,
                         fuel_laps_remaining=fuel_laps,
                         session_flags=flags,
+                        session_state=session_state,
                         incidents=incidents,
                         on_pit_road=on_pit_road,
                     )

@@ -1256,27 +1256,47 @@ class RaceState:
     def race_fastest_lap(self) -> dict | None:
         """Find the fastest lap of the race across all cars.
 
+        Scans the full standings (not just nearby cars) so it captures
+        the overall fastest lap regardless of position.
+
         Returns a dict with 'time', 'driver_name', and 'car_idx', or None
         if no valid lap times exist yet.
         """
         fastest = None
-        # Check player
+        for entry in self.standings:
+            t = entry.get("best_lap_time", -1)
+            if t > 0 and (fastest is None or t < fastest["time"]):
+                fastest = {
+                    "time": t,
+                    "driver_name": entry.get("driver_name", "?"),
+                    "car_idx": entry.get("car_idx", -1),
+                }
+        # Fallback: check player (may not be in standings yet)
         if self.player.best_lap_time > 0:
-            fastest = {
-                "time": self.player.best_lap_time,
-                "driver_name": self.player.driver_name,
-                "car_idx": self.player.car_idx,
-            }
-        # Check nearby cars
-        for car in self.nearby_cars:
-            if car.best_lap_time > 0:
-                if fastest is None or car.best_lap_time < fastest["time"]:  # type: ignore[operator]
-                    fastest = {
-                        "time": car.best_lap_time,
-                        "driver_name": car.driver_name,
-                        "car_idx": car.car_idx,
-                    }
+            if fastest is None or self.player.best_lap_time < fastest["time"]:
+                fastest = {
+                    "time": self.player.best_lap_time,
+                    "driver_name": self.player.driver_name,
+                    "car_idx": self.player.car_idx,
+                }
         return fastest
+
+    @property
+    def race_leader(self) -> dict | None:
+        """Find the current race leader.
+
+        Returns a dict with 'driver_name', 'position' (always 1), 'lap',
+        and 'last_lap_time', or None if standings are empty.
+        """
+        for entry in self.standings:
+            if entry.get("position") == 1:
+                return {
+                    "driver_name": entry.get("driver_name", "?"),
+                    "position": 1,
+                    "lap": entry.get("lap", 0),
+                    "last_lap_time": entry.get("last_lap_time", -1),
+                }
+        return None
 
     @property
     def estimated_total_laps(self) -> int | None:
@@ -1422,6 +1442,7 @@ class RaceState:
                 "fuel_est_quality": self.fuel_est_quality,
                 "avg_fuel_per_lap": self.avg_fuel_per_lap,
                 "race_fastest_lap": self.race_fastest_lap,
+                "race_leader": self.race_leader,
                 "tyre_staleness": self.tyre_staleness,
                 "current_lap_time": self.player.current_lap_time,
                 "best_lap_time": self.player.best_lap_time,

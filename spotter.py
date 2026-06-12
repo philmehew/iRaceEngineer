@@ -412,6 +412,7 @@ class SpotterAudioPlayer:
         "flag_checkered": "audio/flagchequered.wav",
         "flag_slippery": "audio/flagslippery.wav",
         "flag_green": "audio/flaggreen.wav",
+        "lights_out": "audio/lightsout.wav",
         "flagmeatball": "audio/flagmeatball.wav",
         "penalty_1x": "audio/penaltyonex.wav",
         "penalty_2x": "audio/penaltytwox.wav",
@@ -629,7 +630,13 @@ class Spotter:
 
         # Flag state: track previous flags for transition detection
         self._prev_flags: int | None = None  # None = first tick not yet processed
-        self._race_started: bool = False  # True after first green flag seen
+        self._race_started: bool = False  # True when SessionState >= 3
+
+        # Session state: track transitions for lights-out detection
+        self._prev_session_state: int | None = (
+            None  # None = first tick not yet processed
+        )
+        self._initial_green: bool = False  # True after first green flag of session
 
         # Incident count state: track previous values for change detection
         self._prev_incidents: int | None = None
@@ -655,6 +662,7 @@ class Spotter:
         track_surface: int = 0,
         fuel_laps_remaining: float = 0.0,
         session_flags: int = 0,
+        session_state: int = 0,
         incidents: int = 0,
         on_pit_road: bool = False,
     ):
@@ -672,12 +680,54 @@ class Spotter:
                 Proximity calls are only processed when >= 3 (on racing surface).
             fuel_laps_remaining: Estimated laps of fuel remaining (0 = unknown).
             session_flags: iRacing SessionFlags bitmask for flag transition detection.
+            session_state: iRacing SessionState value.
+                1=GetInCar, 2=ParadeLaps, 3=Racing, 4=Checkered, 5=CoolDown.
+                Used to derive _race_started (state >= 3 means race is on).
             incidents: Player's incident points (1x, 2x, 4x). Alert fires on increases.
             on_pit_road: iRacing OnPitRoad boolean. Alert fires on transitions
                 (entering or exiting pit road).
         """
         if not self._enabled:
             return
+
+        # --- Session state: lights-out detection + race started ---
+        # iRacing SessionState: 1=GetInCar, 2=ParadeLaps, 3=Racing,
+        # 4=Checkered, 5=CoolDown.
+        # - 2→3 transition = lights out (race goes from parade to racing)
+        # - State >= 3 = race is on (sets _race_started for pit/blue alerts)
+        # - State drops to 1-2 = new session (clears _race_started)
+        # Fallback: if session_state is 0 (not provided), check green flag.
+        if self._prev_session_state is None:
+            # First tick — prime state
+            self._prev_session_state = session_state
+            if session_state >= 3:
+                self._race_started = True
+                logger.info(
+                    f"Session state primed: {session_state} (race already started)"
+                )
+            elif session_state == 0 and session_flags & self.FLAG_GREEN:
+                self._race_started = True
+                logger.info("Session state primed: green flag fallback")
+            else:
+                logger.info(f"Session state primed: {session_state}")
+        elif session_state != self._prev_session_state:
+            if self._prev_session_state in (1, 2) and session_state >= 3:
+                # Lights out! GetInCar/ParadeLaps → Racing (or Checkered/CoolDown
+                # in some race formats that skip state 3)
+                self._race_started = True
+                self._player.play("lights_out")
+                logger.info(
+                    f"Lights out! (SessionState {self._prev_session_state} → {session_state})"
+                )
+            elif session_state >= 1 and session_state <= 2 and self._race_started:
+                # Dropped back to pre-race — new session
+                self._race_started = False
+                logger.info(f"Session state reset: {session_state} (new session)")
+            elif session_state >= 3 and not self._race_started:
+                # Joined mid-race at state >= 3 (not via 2→3 transition)
+                self._race_started = True
+                logger.info(f"Race already started (SessionState={session_state})")
+            self._prev_session_state = session_state
 
         # --- Proximity calls (only on racing surface) ---
         if is_on_track and track_surface >= 3 and 0 <= car_left_right <= 6:
@@ -705,70 +755,80 @@ class Spotter:
 
         # --- Flag transition alerts ---
         # Detect rising edges (flag transitions from off to on).
-        # Only fire when the player is on track.
+        # Only fire audio when the player is on track.
+        # _race_started is now derived from SessionState (above), not
+        # from the green flag edge — so this section only handles audio.
         # First tick: just record the initial flag state, don't alert.
-        if is_on_track:
-            if self._prev_flags is None:
-                # First tick — prime the initial state, no alerts
-                self._prev_flags = session_flags
-                # If green flag is already set, race is already underway
-                if session_flags & self.FLAG_GREEN:
-                    self._race_started = True
-                logger.info(
-                    f"Flag state primed: 0x{session_flags:08x} (race_started={self._race_started})"
-                )
-            else:
-                rising = session_flags & ~self._prev_flags  # flags that just turned on
-                if rising & self.FLAG_YELLOW:
-                    self._player.play("flag_yellow")
-                    logger.info("Flag alert: yellow flag")
-                if rising & self.FLAG_CAUTION:
-                    self._player.play("flag_yellow")
-                    logger.info("Flag alert: caution (yellow)")
-                if rising & self.FLAG_CAUTION_WAVING:
-                    self._player.play("flag_yellow")
-                    logger.info("Flag alert: caution waving (yellow)")
-                if rising & self.FLAG_BLUE and self._race_started:
-                    self._player.play("flag_blue")
-                    logger.info("Flag alert: blue flag")
-                if rising & self.FLAG_BLACK:
-                    self._player.play("flag_black")
-                    logger.info("Flag alert: black flag")
-                if rising & self.FLAG_DISQUALIFY:
-                    self._player.play("flag_black")
-                    logger.info("Flag alert: disqualify flag")
-                if rising & self.FLAG_FURLED:
-                    self._player.play("flagfurledblack")
-                    logger.info("Flag alert: furled black flag (warning)")
-                if rising & self.FLAG_WHITE:
-                    self._player.play("flag_white")
-                    logger.info("Flag alert: white flag")
-                if rising & self.FLAG_RED:
-                    self._player.play("flag_red")
-                    logger.info("Flag alert: red flag")
-                if rising & self.FLAG_CHECKERED:
-                    self._player.play("flag_checkered")
-                    logger.info("Flag alert: checkered flag")
-                if rising & self.FLAG_DEBRIS:
-                    self._player.play("flag_slippery")
-                    logger.info("Flag alert: debris (slippery surface)")
-                if rising & self.FLAG_REPAIR:
-                    self._player.play("flagmeatball")
-                    logger.info("Flag alert: meatball (repair order)")
-                if rising & self.FLAG_GREEN:
-                    self._race_started = True
-                    # Absorb current pit road state to avoid false "pit exit"
-                    # when transitioning from grid to racing surface on green
-                    self._confirmed_on_pit_road = on_pit_road and track_surface <= 2
-                    self._prev_on_pit_road = self._confirmed_on_pit_road
+        if self._prev_flags is None:
+            # First tick — prime the initial state, no alerts
+            self._prev_flags = session_flags
+            logger.info(
+                f"Flag state primed: 0x{session_flags:08x} (race_started={self._race_started})"
+            )
+        elif is_on_track:
+            rising = session_flags & ~self._prev_flags  # flags that just turned on
+            if rising & self.FLAG_YELLOW:
+                self._player.play("flag_yellow")
+                logger.info("Flag alert: yellow flag")
+            if rising & self.FLAG_CAUTION:
+                self._player.play("flag_yellow")
+                logger.info("Flag alert: caution (yellow)")
+            if rising & self.FLAG_CAUTION_WAVING:
+                self._player.play("flag_yellow")
+                logger.info("Flag alert: caution waving (yellow)")
+            if rising & self.FLAG_BLUE and self._race_started:
+                self._player.play("flag_blue")
+                logger.info("Flag alert: blue flag")
+            if rising & self.FLAG_BLACK:
+                self._player.play("flag_black")
+                logger.info("Flag alert: black flag")
+            if rising & self.FLAG_DISQUALIFY:
+                self._player.play("flag_black")
+                logger.info("Flag alert: disqualify flag")
+            if rising & self.FLAG_FURLED:
+                self._player.play("flagfurledblack")
+                logger.info("Flag alert: furled black flag (warning)")
+            if rising & self.FLAG_WHITE:
+                self._player.play("flag_white")
+                logger.info("Flag alert: white flag")
+            if rising & self.FLAG_RED:
+                self._player.play("flag_red")
+                logger.info("Flag alert: red flag")
+            if rising & self.FLAG_CHECKERED:
+                self._player.play("flag_checkered")
+                logger.info("Flag alert: checkered flag")
+            if rising & self.FLAG_DEBRIS:
+                self._player.play("flag_slippery")
+                logger.info("Flag alert: debris (slippery surface)")
+            if rising & self.FLAG_REPAIR:
+                self._player.play("flagmeatball")
+                logger.info("Flag alert: meatball (repair order)")
+            if rising & self.FLAG_GREEN:
+                # Absorb current pit road state to avoid false "pit exit"
+                # when transitioning from grid to racing surface on green
+                self._confirmed_on_pit_road = on_pit_road and track_surface <= 2
+                self._prev_on_pit_road = self._confirmed_on_pit_road
+                # Skip "green flag" on initial race start — "lights out" already
+                # covers that. Only play on subsequent greens (e.g. restarts
+                # after yellow). _initial_green tracks whether this is the first
+                # green of the session (lights_out already played for it).
+                if not self._initial_green:
+                    self._initial_green = True
+                    logger.info("Flag alert: green flag (initial start, suppressed)")
+                else:
                     self._player.play("flag_green")
-                    logger.info("Flag alert: green flag — race started")
-                self._prev_flags = session_flags
-                if rising:
-                    logger.debug(
-                        f"Flags: prev=0x{self._prev_flags:08x}, "
-                        f"curr=0x{session_flags:08x}, rising=0x{rising:08x}"
-                    )
+                    logger.info("Flag alert: green flag (restart)")
+            self._prev_flags = session_flags
+            if rising:
+                logger.debug(
+                    f"Flags: prev=0x{self._prev_flags:08x}, "
+                    f"curr=0x{session_flags:08x}, rising=0x{rising:08x}"
+                )
+        else:
+            # Not on track — do NOT update _prev_flags so that rising
+            # edges are preserved and will fire when the car returns to track.
+            # (_race_started is derived from SessionState above, not flags.)
+            pass
 
         # --- Incident count change alerts ---
         # First tick: just record initial state, don't alert.
@@ -827,7 +887,12 @@ class Spotter:
         for threshold in self._fuel_alerts_fired:
             self._fuel_alerts_fired[threshold] = False
         self._prev_flags = None
+        # _race_started will be re-derived from SessionState on the next
+        # tick, so it's correct regardless of whether we reconnect mid-race
+        # (state >= 3 → True immediately) or between sessions (state 1-2 → False).
         self._race_started = False
+        self._prev_session_state = None
+        self._initial_green = False
         self._prev_incidents = None
         self._prev_on_pit_road = None
         self._confirmed_on_pit_road = False
