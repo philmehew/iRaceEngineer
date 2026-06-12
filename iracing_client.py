@@ -407,6 +407,87 @@ class IRacingClient:
                         return int(driver.get("CurDriverIncidentCount", 0))
         return 0
 
+    def get_telemetry_units(self, fields: list[str] | None = None) -> dict[str, str]:
+        """Get the unit strings for telemetry variables from iRacing SDK.
+
+        Each VarHeader in iRacing's shared memory has a 'unit' field (e.g.
+        'kPa', 'm', 'degC', 'degF', 'L', 'gal', 'bar', 'V', '%' etc).
+        This method reads those unit strings so the calling code can convert
+        values to the desired display units.
+
+        Args:
+            fields: Optional list of field names to query. If None, returns
+                units for all known telemetry fields.
+
+        Returns:
+            Dict mapping field name -> unit string (e.g. {'LFcoldPressure': 'kPa'}).
+        """
+        if not self.is_connected:
+            return {}
+
+        try:
+            var_dict = self._ir._var_headers_dict
+        except (AttributeError, TypeError):
+            return {}
+
+        if fields is None:
+            # All fields that might need unit conversion
+            fields = [
+                "FuelLevel",
+                "FuelLevelPct",
+                "FuelUsePerHour",
+                "LFcoldPressure",
+                "RFcoldPressure",
+                "LRcoldPressure",
+                "RRcoldPressure",
+                "LFbrakeLinePress",
+                "RFbrakeLinePress",
+                "LRbrakeLinePress",
+                "RRbrakeLinePress",
+                "OilTemp",
+                "OilPress",
+                "WaterTemp",
+                "ManifoldPress",
+                "Voltage",
+                "CarDistAhead",
+                "CarDistBehind",
+                "dcBrakeBias",
+                "LFtempCL",
+                "LFtempCM",
+                "LFtempCR",
+                "RFtempCL",
+                "RFtempCM",
+                "RFtempCR",
+                "LRtempCL",
+                "LRCtempCM",
+                "LRtempCR",
+                "RRtempCL",
+                "RRtempCM",
+                "RRtempCR",
+                "LFodometer",
+                "RFodometer",
+                "LRodometer",
+                "RRodometer",
+                "TrackTemp",
+                "AirTemp",
+                "AirPressure",
+                "WindVel",
+                "Speed",
+            ]
+
+        units: dict[str, str] = {}
+        for field in fields:
+            try:
+                var_header = var_dict.get(field)
+                if var_header and hasattr(var_header, "unit"):
+                    unit_str = var_header.unit
+                    if unit_str:
+                        units[field] = unit_str.strip("\x00").strip()
+            except Exception:
+                pass
+
+        return units
+
     def get_player_telemetry(self) -> dict[str, Any]:
         """Get telemetry values specific to the player's car.
 

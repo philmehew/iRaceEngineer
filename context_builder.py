@@ -65,6 +65,11 @@ def format_metric(value: float, unit: str = "", decimals: int = 2) -> str:
     return f"{value:.{decimals}f}{unit}"
 
 
+def kpa_to_psi(kpa: float) -> float:
+    """Convert kPa to PSI."""
+    return kpa * 0.145038
+
+
 def format_engine_warnings(warnings: int) -> str:
     """Format EngineWarnings bitmask to human-readable labels."""
     if warnings == 0:
@@ -295,11 +300,17 @@ class ContextBuilder:
         fuel_level = player.get("fuel_level", 0)
         fuel_est_quality = player.get("fuel_est_quality", "unreliable")
         fuel_max = session_config.get("fuel_max_litres", 0)
+        fuel_max_pct = session_config.get("fuel_max_pct", 1.0)
+        fuel_max_start = session_config.get("fuel_max_start_litres", 0)
+        effective_fuel_max = fuel_max_start if fuel_max_start > 0 else fuel_max
         lines.append("\nYour car:")
         # Build fuel line with max add if tank capacity is known
-        if fuel_max and fuel_level > 0:
-            max_add = fuel_max - fuel_level
-            fuel_str = f"  Fuel: {fuel_level:.2f}L/{fuel_max:.0f}L (max add: {max_add:.0f}L, {format_pct(fuel_pct)}"
+        if effective_fuel_max and fuel_level > 0:
+            max_add = effective_fuel_max - fuel_level
+            if fuel_max_pct < 1.0 and fuel_max_start > 0:
+                fuel_str = f"  Fuel: {fuel_level:.2f}L/{fuel_max_start:.1f}L (max add: {max_add:.0f}L, {format_pct(fuel_pct)}"
+            else:
+                fuel_str = f"  Fuel: {fuel_level:.2f}L/{fuel_max:.0f}L (max add: {max_add:.0f}L, {format_pct(fuel_pct)}"
         else:
             fuel_str = f"  Fuel: {fuel_level:.2f}L ({format_pct(fuel_pct)}"
         if fuel_laps > 0 and fuel_est_quality == "good":
@@ -406,6 +417,12 @@ class ContextBuilder:
         incident_limit = config.get("incident_limit", "")
         fast_repairs = config.get("fast_repairs_limit", "")
         fuel_max = config.get("fuel_max_litres", 0)
+        fuel_max_pct = config.get("fuel_max_pct", 1.0)
+        fuel_max_start = config.get("fuel_max_start_litres", 0)
+        # Use effective max fuel (tank × restriction) for calculations.
+        # If there's a fuel restriction (e.g. 40%), fuel_max_start is the
+        # actual max you can start with (e.g. 22L × 0.4 = 8.8L).
+        effective_fuel_max = fuel_max_start if fuel_max_start > 0 else fuel_max
         if is_fixed or incident_limit or fuel_max:
             cfg_parts = []
             if is_fixed:
@@ -420,7 +437,12 @@ class ContextBuilder:
             if fast_repairs:
                 cfg_parts.append(f"fast repairs: {fast_repairs}")
             if fuel_max:
-                cfg_parts.append(f"tank: {fuel_max:.0f}L")
+                if fuel_max_pct < 1.0 and fuel_max_start > 0:
+                    cfg_parts.append(
+                        f"tank: {fuel_max:.0f}L (max load: {fuel_max_start:.1f}L / {fuel_max_pct:.0%})"
+                    )
+                else:
+                    cfg_parts.append(f"tank: {fuel_max:.0f}L")
             lines.append(f"Session: {' | '.join(cfg_parts)}")
 
         # Weather
@@ -521,6 +543,10 @@ class ContextBuilder:
         fuel_level = player.get("fuel_level", 0)
         fuel_est_quality = player.get("fuel_est_quality", "unreliable")
         avg_fuel_per_lap = player.get("avg_fuel_per_lap", 0)
+        # Use effective max fuel (tank × restriction) for calculations
+        fuel_max_pct = config.get("fuel_max_pct", 1.0)
+        fuel_max_start = config.get("fuel_max_start_litres", 0)
+        effective_fuel_max = fuel_max_start if fuel_max_start > 0 else fuel_max
 
         lines.append("\nYour car:")
         on_track = player.get("is_on_track", True)
@@ -549,10 +575,13 @@ class ContextBuilder:
             fuel_desc = "⚠ CRITICAL"
 
         fuel_line = f"  Fuel: {fuel_level:.2f}L"
-        if fuel_max and fuel_level > 0:
-            fuel_line += f"/{fuel_max:.0f}L"
+        if effective_fuel_max and fuel_level > 0:
+            if fuel_max_pct < 1.0 and fuel_max_start > 0:
+                fuel_line += f"/{fuel_max_start:.1f}L"
+            else:
+                fuel_line += f"/{fuel_max:.0f}L"
             # Show max fuel add so the LLM can't suggest more than the tank holds
-            max_add = fuel_max - fuel_level
+            max_add = effective_fuel_max - fuel_level
             if max_add > 0:
                 fuel_line += f" (max add: {max_add:.0f}L,"
             else:
@@ -631,7 +660,7 @@ class ContextBuilder:
         if (
             avg_fuel_per_lap > 0
             and race_laps_remain > 0
-            and fuel_max > 0
+            and effective_fuel_max > 0
             and fuel_level > 0
         ):
             fuel_needed = avg_fuel_per_lap * race_laps_remain
@@ -642,7 +671,7 @@ class ContextBuilder:
                 add_litres = min(
                     int(fuel_deficit + avg_fuel_per_lap)
                     + 1,  # deficit + 1 lap margin, ceil
-                    int(fuel_max - fuel_level),  # tank capacity
+                    int(effective_fuel_max - fuel_level),  # max fuel capacity
                 )
                 add_litres = max(1, add_litres)  # at least 1L
                 quality_note = "" if fuel_est_quality == "good" else " (approx)"
@@ -734,13 +763,14 @@ class ContextBuilder:
 
             if is_stale and all_pressures_same and pressures:
                 # Collapse identical stale pressures into one line
+                # Pressures are stored in kPa; convert to PSI for display
                 stale_label = (
                     "not updating"
                     if tyre_staleness == "stale"
                     else "may not be updating"
                 )
                 lines.append(
-                    f"    All pressures: {pressures[0]:.2f}PSI ({stale_label} — normal for iRacing cars on track)"
+                    f"    All pressures: {kpa_to_psi(pressures[0]):.1f}PSI ({stale_label} — normal for iRacing cars on track)"
                 )
                 # Show per-corner data without pressure
                 for corner in ["LF", "RF", "LR", "RR"]:
@@ -768,7 +798,8 @@ class ContextBuilder:
                     odo = tyre_odometers.get(corner, 0)
                     parts = [_tyre_temp_str(corner, avg_temp)]
                     if pressure > 0:
-                        parts.append(f"{pressure:.2f}PSI")
+                        # Pressure stored in kPa; convert to PSI for display
+                        parts.append(f"{kpa_to_psi(pressure):.1f}PSI")
                     if wear_center > 0:
                         parts.append(f"{format_wear(wear_center)}")
                     if odo > 0:
@@ -776,17 +807,21 @@ class ContextBuilder:
                     lines.append(f"    {CORNER_NAMES[corner]}: {' | '.join(parts)}")
 
         # Brakes + brake bias
+        # Brake line pressures are stored in kPa; convert to PSI for display
         brake_pressures = player.get("brake_pressures", {})
         brake_temps = []
         for corner in ["LF", "RF", "LR", "RR"]:
             bp = brake_pressures.get(corner, 0)
             if bp > 0:
-                brake_temps.append(f"{CORNER_NAMES[corner]} {bp:.0f}")
+                # Convert kPa to PSI for display
+                brake_temps.append(f"{CORNER_NAMES[corner]} {kpa_to_psi(bp):.0f}PSI")
         if brake_temps:
             lines.append(f"  Brakes: {' / '.join(brake_temps)}")
+        # Brake bias: stored as percentage (0-100 range after sanitisation)
         brake_bias = player.get("brake_bias", 0)
-        if brake_bias:
-            lines.append(f"  Brake bias: {brake_bias:.2f}%")
+        if brake_bias and 10 < brake_bias < 90:
+            # Only show if value is plausible (10-90% range)
+            lines.append(f"  Brake bias: {brake_bias:.1f}%")
 
         # Incidents (safety-rating points, NOT car damage) / penalties
         incidents = player.get("incidents", 0)
@@ -852,21 +887,49 @@ class ContextBuilder:
         if lap_time_parts:
             lines.append(f"  Pace: {' | '.join(lap_time_parts)}")
 
-        # Proximity — filter out iRacing sentinel values (e.g. 500000.0 = no car nearby)
+        # Proximity — CarDistAhead/Behind from iRacing are in metres, NOT seconds.
+        # Use the nearby cars' gap_seconds (computed from track position) for
+        # meaningful time gaps, and show iRacing's distance values as metres.
         car_prox = player.get("car_left_right", 0)
         dist_ahead = player.get("car_dist_ahead", 0)
         dist_behind = player.get("car_dist_behind", 0)
         tow_time = player.get("tow_time", 0)
-        PROXIMITY_SENTINEL = 1000.0  # Values above this mean "no car nearby"
+        PROXIMITY_SENTINEL = 10000.0  # Values above this mean "no car nearby"
         prox_parts = []
         if car_prox:
             prox_str = format_car_proximity(car_prox)
             if prox_str:
                 prox_parts.append(prox_str)
         if 0 < dist_ahead < PROXIMITY_SENTINEL:
-            prox_parts.append(f"nearest ahead: +{dist_ahead:.2f}s")
+            # Convert metres to approximate seconds using best lap time if available
+            # so the LLM can reason about gaps. Fall back to raw metres if no time.
+            best_lap = player.get("best_lap_time", 0)
+            track_length_km = config.get("track_length_km", 0)
+            if best_lap > 0 and track_length_km > 0:
+                avg_speed_mps = (track_length_km * 1000) / best_lap
+                gap_seconds = dist_ahead / avg_speed_mps if avg_speed_mps > 0 else 0
+                if gap_seconds > 0:
+                    prox_parts.append(
+                        f"nearest ahead: +{gap_seconds:.1f}s ({dist_ahead:.0f}m)"
+                    )
+                else:
+                    prox_parts.append(f"nearest ahead: {dist_ahead:.0f}m")
+            else:
+                prox_parts.append(f"nearest ahead: {dist_ahead:.0f}m")
         if 0 < dist_behind < PROXIMITY_SENTINEL:
-            prox_parts.append(f"nearest behind: -{dist_behind:.2f}s")
+            best_lap = player.get("best_lap_time", 0)
+            track_length_km = config.get("track_length_km", 0)
+            if best_lap > 0 and track_length_km > 0:
+                avg_speed_mps = (track_length_km * 1000) / best_lap
+                gap_seconds = dist_behind / avg_speed_mps if avg_speed_mps > 0 else 0
+                if gap_seconds > 0:
+                    prox_parts.append(
+                        f"nearest behind: -{gap_seconds:.1f}s ({dist_behind:.0f}m)"
+                    )
+                else:
+                    prox_parts.append(f"nearest behind: {dist_behind:.0f}m")
+            else:
+                prox_parts.append(f"nearest behind: {dist_behind:.0f}m")
         if tow_time > 0:
             prox_parts.append(f"tow {tow_time:.2f}s")
         if prox_parts:

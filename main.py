@@ -686,10 +686,17 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                 telemetry = iracing.get_telemetry()
                 session_info = iracing.get_session_info()
 
+                # Read telemetry units for unit conversion (kPa, degF, etc.)
+                # Only needed once per session, but safe to call each tick
+                try:
+                    units = iracing.get_telemetry_units()
+                except Exception:
+                    units = {}
+
                 # Update race state (under lock to prevent stale reads from F9 handler)
                 driver_names = {d.car_idx: d.driver_name for d in iracing.drivers}
                 with _state_lock:
-                    state.update(telemetry, session_info, driver_names)
+                    state.update(telemetry, session_info, driver_names, units=units)
 
                 # Spotter tick — car proximity audio calls
                 if spotter is not None:
@@ -745,17 +752,23 @@ def run_capture_mode(config: dict, capture_dir: str, interval_ms: int = 1000):
                 telemetry = iracing.get_telemetry()
                 session_info = iracing.get_session_info()
 
+                # Read telemetry units for unit conversion (kPa, degF, etc.)
+                try:
+                    units = iracing.get_telemetry_units()
+                except Exception:
+                    units = {}
+
                 if capture.should_capture():
                     driver_names = {d.car_idx: d.driver_name for d in iracing.drivers}
                     filepath = capture.capture_snapshot(
-                        telemetry, session_info, driver_names
+                        telemetry, session_info, driver_names, units=units
                     )
                     print(
                         f"  📸 Captured snapshot {capture.snapshot_count}: {filepath}"
                     )
 
                 # Still update state for consistency
-                state.update(telemetry, session_info)
+                state.update(telemetry, session_info, units=units)
 
             time.sleep(tick_interval)
 
@@ -816,9 +829,10 @@ def run_replay_mode(
         telemetry = snapshot.get("telemetry", {})
         session_info = snapshot.get("session_info", {})
         driver_names = snapshot.get("driver_names", {})
+        units = snapshot.get("units", {})
         if driver_names:
             driver_names = {int(k): v for k, v in driver_names.items()}
-        state.update(telemetry, session_info, driver_names)
+        state.update(telemetry, session_info, driver_names, units=units)
         snapshots_processed += 1
 
     # Show final state summary
@@ -920,9 +934,10 @@ def run_replay_mode(
             telemetry = snapshot.get("telemetry", {})
             session_info = snapshot.get("session_info", {})
             driver_names = snapshot.get("driver_names", {})
+            units = snapshot.get("units", {})
             if driver_names:
                 driver_names = {int(k): v for k, v in driver_names.items()}
-            state.update(telemetry, session_info, driver_names)
+            state.update(telemetry, session_info, driver_names, units=units)
             p = state.player
             # Update shared prompt state
             prompt_state["lap"] = p.lap
@@ -1011,9 +1026,10 @@ def run_replay_mode(
             telemetry = snapshot.get("telemetry", {})
             session_info = snapshot.get("session_info", {})
             driver_names = snapshot.get("driver_names", {})
+            units = snapshot.get("units", {})
             if driver_names:
                 driver_names = {int(k): v for k, v in driver_names.items()}
-            state.update(telemetry, session_info, driver_names)
+            state.update(telemetry, session_info, driver_names, units=units)
             p = state.player
             print(
                 f"  📊 Lap {p.lap}, P{p.position}, "

@@ -15,6 +15,139 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+# --- Unit conversion helpers ---
+# iRacing reports telemetry in various units (kPa, degF, etc.) depending
+# on the car and session. These helpers convert from iRacing units to
+# our display units, with sanity checks to catch wildly wrong values.
+
+# kPa → PSI conversion factor
+KPA_TO_PSI = 0.145038
+
+
+def convert_kpa_to_psi(kpa: float) -> float:
+    """Convert kPa to PSI."""
+    return kpa * KPA_TO_PSI
+
+
+def convert_f_to_c(fahrenheit: float) -> float:
+    """Convert Fahrenheit to Celsius."""
+    return (fahrenheit - 32) * 5 / 9
+
+
+def sanitize_fuel_level(raw_fuel: float, fuel_pct: float, fuel_max: float) -> float:
+    """Sanitize fuel level reading.
+
+    iRacing's FuelLevel telemetry variable is supposed to be in litres,
+    but some cars or sessions return values in different scales (e.g.
+    millilitres, or percentage * 1000). If the raw value is wildly
+    inconsistent with FuelLevelPct * tank_capacity, derive fuel from
+    the percentage instead.
+
+    Args:
+        raw_fuel: The raw FuelLevel value from iRacing.
+        fuel_pct: The FuelLevelPct value (0.0-1.0).
+        fuel_max: The tank capacity in litres.
+
+    Returns:
+        Sanitised fuel level in litres.
+    """
+    if raw_fuel <= 0:
+        return raw_fuel
+
+    # If we have a tank capacity and the raw value exceeds it by 2x,
+    # it's clearly wrong. Derive from percentage instead.
+    if fuel_max > 0 and raw_fuel > fuel_max * 2:
+        if 0 < fuel_pct <= 1.0:
+            derived = fuel_pct * fuel_max
+            logger.warning(
+                f"FuelLevel {raw_fuel:.2f}L exceeds tank capacity "
+                f"{fuel_max:.1f}L — deriving from FuelLevelPct "
+                f"({fuel_pct:.3f} × {fuel_max:.1f}L = {derived:.2f}L)"
+            )
+            return derived
+        # No valid percentage — can't derive, but flag it
+        logger.warning(
+            f"FuelLevel {raw_fuel:.2f}L exceeds tank capacity "
+            f"{fuel_max:.1f}L and no valid FuelLevelPct ({fuel_pct:.3f})"
+        )
+        return raw_fuel
+
+    # If raw fuel seems plausible but percentage contradicts it
+    # (e.g. raw=7.5L but pct=0.09 suggests ~2L), use percentage
+    if fuel_max > 0 and 0 < fuel_pct <= 1.0:
+        derived = fuel_pct * fuel_max
+        # If they disagree by more than 3x, trust the percentage
+        if raw_fuel > 0 and derived > 0:
+            ratio = raw_fuel / derived
+            if ratio > 3 or ratio < 0.33:
+                logger.warning(
+                    f"FuelLevel {raw_fuel:.2f}L disagrees with "
+                    f"FuelLevelPct ({fuel_pct:.3f} × {fuel_max:.1f}L = {derived:.2f}L) "
+                    f"— using percentage-derived value"
+                )
+                return derived
+
+    return raw_fuel
+
+
+def sanitize_pressure(raw_pressure: float) -> float:
+    """Sanitize tyre/brake pressure reading.
+
+    iRacing reports pressures in kPa for most cars, but some cars or
+    sessions may report in Pa, hPa, or other scaled units. This function
+    normalizes values into the expected kPa range.
+
+    Normal kPa ranges:
+    - Tyre pressures: ~100-350 kPa (14-50 PSI)
+    - Brake line pressures: ~300-20000 kPa
+
+    Returns:
+        Pressure in kPa (normalized to plausible range).
+    """
+    if raw_pressure <= 0:
+        return raw_pressure
+
+    # Normal kPa range — plausible as-is
+    if 10 < raw_pressure <= 500:
+        return raw_pressure
+
+    # Very large values — try to normalize
+    if raw_pressure > 100000:
+        # Likely in Pascals — convert to kPa (divide by 1000)
+        return raw_pressure / 1000
+
+    if raw_pressure > 5000:
+        # Could be in hectopascals (÷100) or 10x kPa (÷10).
+        # Try ÷100 first (gives plausible tyre pressures for MX-5 style values)
+        # e.g. 6600 ÷ 100 = 66 kPa (9.6 PSI) — plausible for cold tyres
+        # e.g. 11000 ÷ 100 = 110 kPa (16 PSI) — plausible
+        # e.g. 18500 ÷ 100 = 185 kPa (26.8 PSI) — plausible for hot tyres
+        candidate = raw_pressure / 100
+        if 10 < candidate <= 500:
+            return candidate
+        # Try ÷10 if ÷100 gives too-low values
+        # e.g. 6600 ÷ 10 = 660 kPa (95.7 PSI) — too high for tyres
+        # This probably won't help, but try anyway
+        candidate = raw_pressure / 10
+        if 10 < candidate <= 500:
+            return candidate
+        # Nothing works — return as-is and let display handle it
+        return raw_pressure
+
+    if raw_pressure > 500:
+        # 500-5000: could be in Pa (÷1000 gives 0.5-5, too low for tyres)
+        # or 10x kPa (÷10 gives 50-500, plausible for brake pressures)
+        # For tyre pressures, this range is too high.
+        # Try ÷10 first
+        candidate = raw_pressure / 10
+        if 10 < candidate <= 500:
+            return candidate
+        return raw_pressure
+
+    # 0-10 range: very low kPa. Could be in bar (1-3 bar = 14-43 PSI)
+    # but too ambiguous to convert. Return as-is.
+    return raw_pressure
+
 
 @dataclass
 class EngineSnapshot:
@@ -34,7 +167,7 @@ class TyreState:
     temp_left: float = 0.0  # Inner/cold side temp (°C)
     temp_center: float = 0.0  # Center temp (°C)
     temp_right: float = 0.0  # Outer/hot side temp (°C)
-    cold_pressure: float = 0.0
+    cold_pressure: float = 0.0  # kPa (iRacing unit; converted to PSI at display)
     wear_left: float = 0.0  # 0-1 (fraction, not percentage)
     wear_center: float = 0.0
     wear_right: float = 0.0
@@ -129,8 +262,8 @@ class DriverState:
 
     # Player-only: proximity
     car_left_right: int = 0  # 0=none, 1=car left, 2=car right, 3=both
-    car_dist_ahead: float = 0.0  # metres
-    car_dist_behind: float = 0.0  # metres
+    car_dist_ahead: float = 0.0  # metres (iRacing CarDistAhead)
+    car_dist_behind: float = 0.0  # metres (iRacing CarDistBehind)
     tow_time: float = 0.0  # seconds of tow available
 
     # Player-only: shift lights
@@ -202,7 +335,11 @@ class SessionState:
     skies: int = 0
 
     # Session config (from WeekendInfo / DriverInfo)
-    fuel_max_litres: float = 0.0  # Tank capacity
+    fuel_max_litres: float = 0.0  # Tank capacity (full)
+    fuel_max_pct: float = (
+        1.0  # Max fuel load as fraction of tank (e.g. 0.4 for 40% restriction)
+    )
+    fuel_max_start_litres: float = 0.0  # Derived: max fuel at start = tank × max_pct
     is_fixed_setup: bool = False
     incident_limit: str = ""  # e.g. "unlimited", "17x"
     fast_repairs_limit: str = ""  # e.g. "unlimited"
@@ -268,6 +405,9 @@ class RaceState:
         self._last_update_time: float = 0.0
         self._tick_count: int = 0
 
+        # Telemetry units (populated from iRacing VarHeader.unit each tick)
+        self._telemetry_units: dict[str, str] = {}
+
         # Driver name lookup (set by main from iracing_client)
         self._driver_names: dict[int, str] = {}
 
@@ -308,13 +448,25 @@ class RaceState:
         telemetry: dict,
         session_info: dict,
         driver_names: dict[int, str] | None = None,
+        units: dict[str, str] | None = None,
     ):
         """Update race state from telemetry data and session info.
 
         Called each tick from the main poll loop.
+
+        Args:
+            telemetry: Dict of telemetry variable name -> raw value.
+            session_info: Parsed session info YAML data.
+            driver_names: Optional mapping of car_idx -> driver name.
+            units: Optional dict of telemetry variable name -> iRacing unit
+                string (e.g. 'kPa', 'degC', 'm'). Used for unit conversion.
         """
         if driver_names:
             self._driver_names = driver_names
+
+        # Cache telemetry units for use by _update_player and others
+        if units:
+            self._telemetry_units = units
 
         self._tick_count += 1
         self._last_update_time = time.time()
@@ -331,8 +483,8 @@ class RaceState:
         # Update session state
         self._update_session(telemetry, session_info)
 
-        # Update player state
-        self._update_player(telemetry)
+        # Update player state (pass units for conversion)
+        self._update_player(telemetry, units=self._telemetry_units)
 
         # Update nearby cars / standings
         self._update_standings(telemetry)
@@ -422,6 +574,18 @@ class RaceState:
             self.session.fuel_max_litres = float(
                 driver_info.get("DriverCarFuelMaxLtr", 0.0)
             )
+            # DriverCarMaxFuelPct is the max fuel load as a fraction of the
+            # full tank (e.g. 0.4 means only 40% of the tank can be used).
+            # Default 1.0 = no restriction.
+            self.session.fuel_max_pct = float(
+                driver_info.get("DriverCarMaxFuelPct", 1.0)
+            )
+            if self.session.fuel_max_pct <= 0:
+                self.session.fuel_max_pct = 1.0  # Safety default
+            # Derived: the actual max fuel at session start
+            self.session.fuel_max_start_litres = (
+                self.session.fuel_max_litres * self.session.fuel_max_pct
+            )
             self.session.idle_rpm = float(driver_info.get("DriverCarIdleRPM", 0.0))
             self.session.redline_rpm = float(driver_info.get("DriverCarRedLine", 0.0))
             self.session.shift_rpm = float(driver_info.get("DriverCarSLShiftRPM", 0.0))
@@ -438,9 +602,17 @@ class RaceState:
                 driver_info.get("DriverCarEstLapTime", 0.0)
             )
 
-    def _update_player(self, telemetry: dict):
-        """Update player car state from telemetry."""
+    def _update_player(self, telemetry: dict, units: dict | None = None):
+        """Update player car state from telemetry.
+
+        Args:
+            telemetry: Dict of telemetry variable name -> raw value.
+            units: Optional dict of telemetry variable name -> iRacing unit
+                string (e.g. 'kPa', 'degC', 'm'). Used for unit conversion.
+        """
         p = self.player
+        if units is None:
+            units = {}
 
         # Save previous tyre values for staleness detection
         if p.tyres:
@@ -472,16 +644,35 @@ class RaceState:
         p.throttle = float(telemetry.get("Throttle", 0.0))
         p.brake = float(telemetry.get("Brake", 0.0))
 
-        # Engine health (player only)
-        p.oil_temp = float(telemetry.get("OilTemp", 0.0))
+        # Engine health (player only) — convert units where needed
+        raw_oil_temp = float(telemetry.get("OilTemp", 0.0))
+        raw_water_temp = float(telemetry.get("WaterTemp", 0.0))
+        # iRacing can report temps in degF depending on car/settings
+        if units.get("OilTemp") == "degF" and raw_oil_temp > 0:
+            raw_oil_temp = convert_f_to_c(raw_oil_temp)
+        if units.get("WaterTemp") == "degF" and raw_water_temp > 0:
+            raw_water_temp = convert_f_to_c(raw_water_temp)
+        p.oil_temp = raw_oil_temp
         p.oil_press = float(telemetry.get("OilPress", 0.0))
         p.oil_level = float(telemetry.get("OilLevel", 0.0))
-        p.water_temp = float(telemetry.get("WaterTemp", 0.0))
+        p.water_temp = raw_water_temp
         p.water_level = float(telemetry.get("WaterLevel", 0.0))
         p.fuel_press = float(telemetry.get("FuelPress", 0.0))
         p.engine_warnings = int(telemetry.get("EngineWarnings", 0))
         p.manifold_press = float(telemetry.get("ManifoldPress", 0.0))
-        p.voltage = float(telemetry.get("Voltage", 0.0))
+
+        # Voltage — sanity check: car voltage should be 10-18V
+        raw_voltage = float(telemetry.get("Voltage", 0.0))
+        if raw_voltage > 50:
+            # Likely in wrong unit — divide by 5 as a rough heuristic
+            # (iRacing sometimes reports Voltage * 5 for some cars)
+            p.voltage = raw_voltage / 5
+            logger.debug(
+                f"Voltage {raw_voltage:.1f} exceeds 50V — "
+                f"assuming 5x scaling, using {p.voltage:.1f}V"
+            )
+        else:
+            p.voltage = raw_voltage
 
         # Car status
         p.is_on_track = bool(telemetry.get("IsOnTrack", False))
@@ -499,6 +690,8 @@ class RaceState:
         p.pit_opt_repair_time_left = float(telemetry.get("PitOptRepairLeft", 0.0))
 
         # Proximity (player only)
+        # CarDistAhead/Behind are in metres per iRacing SDK, not seconds.
+        # We store them as-is for now; context_builder labels them correctly.
         p.car_left_right = int(telemetry.get("CarLeftRight", 0))
         p.car_dist_ahead = float(telemetry.get("CarDistAhead", 0.0))
         p.car_dist_behind = float(telemetry.get("CarDistBehind", 0.0))
@@ -508,22 +701,60 @@ class RaceState:
         p.shift_indicator_pct = float(telemetry.get("ShiftIndicatorPct", 0.0))
         p.shift_rpm = float(telemetry.get("PlayerCarSLShiftRPM", 0.0))
 
-        # Brake bias (player only)
-        p.brake_bias = float(telemetry.get("dcBrakeBias", 0.0))
+        # Brake bias (player only) — sanity check: should be 0-100%
+        raw_brake_bias = float(telemetry.get("dcBrakeBias", 0.0))
+        # dcBrakeBias in iRacing is typically 0.0-1.0 (fraction), but some
+        # cars report it differently. If >1, it's likely a percentage already
+        # or in a different scale. Values >200 are clearly wrong.
+        if raw_brake_bias > 200:
+            p.brake_bias = 0.0  # clearly invalid data
+            logger.debug(f"Brake bias {raw_brake_bias:.1f} exceeds 200% — ignoring")
+        elif raw_brake_bias > 1.0:
+            # Likely already a percentage (e.g. 54.5 means 54.5%)
+            p.brake_bias = raw_brake_bias
+        else:
+            # Fraction (0.0-1.0), convert to percentage
+            p.brake_bias = raw_brake_bias * 100
 
-        # Fuel (player only)
-        p.fuel_level = float(telemetry.get("FuelLevel", 0.0))
+        # Fuel (player only) — sanitise fuel level against tank capacity
+        raw_fuel_level = float(telemetry.get("FuelLevel", 0.0))
         p.fuel_pct = float(telemetry.get("FuelLevelPct", 0.0))
+        # Clamp fuel_pct to 0-1 range (iRacing sometimes reports >1 briefly)
+        if p.fuel_pct > 1.5:
+            # Likely a percentage (0-100) rather than fraction (0-1)
+            p.fuel_pct = p.fuel_pct / 100
+        p.fuel_pct = max(0.0, min(p.fuel_pct, 1.0))
+        # Use the effective max fuel (tank × restriction) for validation,
+        # since fuel_pct is relative to the restricted amount, not the full tank.
+        effective_max = (
+            self.session.fuel_max_start_litres
+            if self.session.fuel_max_start_litres > 0
+            else self.session.fuel_max_litres
+        )
+        p.fuel_level = sanitize_fuel_level(raw_fuel_level, p.fuel_pct, effective_max)
         p.fuel_use_per_hour = float(telemetry.get("FuelUsePerHour", 0.0))
 
         # Tyres (per corner — player only for temps/wear)
+        # iRacing reports pressures in kPa; store raw kPa and convert at display time
         for corner in ["LF", "RF", "LR", "RR"]:
             prefix = corner
+            # Temperature conversion: some cars report in degF
+            raw_temp_l = float(telemetry.get(f"{prefix}tempCL", 0.0))
+            raw_temp_c = float(telemetry.get(f"{prefix}tempCM", 0.0))
+            raw_temp_r = float(telemetry.get(f"{prefix}tempCR", 0.0))
+            temp_unit = units.get(f"{prefix}tempCL", "")
+            if temp_unit == "degF":
+                raw_temp_l = convert_f_to_c(raw_temp_l) if raw_temp_l > 0 else 0.0
+                raw_temp_c = convert_f_to_c(raw_temp_c) if raw_temp_c > 0 else 0.0
+                raw_temp_r = convert_f_to_c(raw_temp_r) if raw_temp_r > 0 else 0.0
+            # Pressure: iRacing reports in kPa. Sanitize wildly wrong values.
+            raw_pressure = float(telemetry.get(f"{prefix}coldPressure", 0.0))
+            raw_pressure = sanitize_pressure(raw_pressure)
             p.tyres[corner] = TyreState(
-                temp_left=float(telemetry.get(f"{prefix}tempCL", 0.0)),
-                temp_center=float(telemetry.get(f"{prefix}tempCM", 0.0)),
-                temp_right=float(telemetry.get(f"{prefix}tempCR", 0.0)),
-                cold_pressure=float(telemetry.get(f"{prefix}coldPressure", 0.0)),
+                temp_left=raw_temp_l,
+                temp_center=raw_temp_c,
+                temp_right=raw_temp_r,
+                cold_pressure=raw_pressure,  # stored in kPa
                 wear_left=float(telemetry.get(f"{prefix}wearL", 0.0)),
                 wear_center=float(telemetry.get(f"{prefix}wearM", 0.0)),
                 wear_right=float(telemetry.get(f"{prefix}wearR", 0.0)),
@@ -537,12 +768,12 @@ class RaceState:
             "RR": float(telemetry.get("RRodometer", 0.0)),
         }
 
-        # Brakes (player only)
+        # Brakes (player only) — pressures in kPa from iRacing
         p.brake_pressures = {
-            "LF": float(telemetry.get("LFbrakeLinePress", 0.0)),
-            "RF": float(telemetry.get("RFbrakeLinePress", 0.0)),
-            "LR": float(telemetry.get("LRbrakeLinePress", 0.0)),
-            "RR": float(telemetry.get("RRbrakeLinePress", 0.0)),
+            "LF": sanitize_pressure(float(telemetry.get("LFbrakeLinePress", 0.0))),
+            "RF": sanitize_pressure(float(telemetry.get("RFbrakeLinePress", 0.0))),
+            "LR": sanitize_pressure(float(telemetry.get("LRbrakeLinePress", 0.0))),
+            "RR": sanitize_pressure(float(telemetry.get("RRbrakeLinePress", 0.0))),
         }
         p.brake_abs_active = bool(telemetry.get("BrakeABSactive", False))
 
@@ -708,6 +939,19 @@ class RaceState:
                     if self._fuel_at_lap_start > 0
                     else 0.0,
                 )
+                # Sanity check: fuel used per lap should be 0.1-15L for any
+                # realistic race car. Wildly wrong telemetry can produce
+                # values like 4275L/lap which corrupt all downstream
+                # calculations (fuel range, shortage warnings, etc.).
+                if fuel_used > 15:
+                    logger.warning(
+                        f"Fuel used {fuel_used:.1f}L for lap "
+                        f"{current_lap_completed} exceeds 15L sanity "
+                        f"threshold — discarding (start="
+                        f"{self._fuel_at_lap_start:.2f}, end="
+                        f"{self.player.fuel_level:.2f})"
+                    )
+                    fuel_used = 0.0
                 record = LapRecord(
                     lap_number=current_lap_completed,
                     lap_time=lap_time,
@@ -1057,6 +1301,8 @@ class RaceState:
                 },
                 "config": {
                     "fuel_max_litres": self.session.fuel_max_litres,
+                    "fuel_max_pct": self.session.fuel_max_pct,
+                    "fuel_max_start_litres": self.session.fuel_max_start_litres,
                     "is_fixed_setup": self.session.is_fixed_setup,
                     "incident_limit": self.session.incident_limit,
                     "fast_repairs_limit": self.session.fast_repairs_limit,

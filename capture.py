@@ -54,7 +54,11 @@ class TelemetryCapture:
         return False
 
     def capture_snapshot(
-        self, telemetry: dict, session_info: dict, driver_names: dict | None = None
+        self,
+        telemetry: dict,
+        session_info: dict,
+        driver_names: dict | None = None,
+        units: dict | None = None,
     ) -> str:
         """Save a telemetry snapshot to a JSON file.
 
@@ -62,6 +66,7 @@ class TelemetryCapture:
             telemetry: Raw telemetry dict from IRacingClient.get_telemetry()
             session_info: Parsed session info dict
             driver_names: Optional driver name lookup {car_idx: name}
+            units: Optional telemetry unit mapping from IRacingClient.get_telemetry_units()
 
         Returns:
             Path to the saved file.
@@ -75,6 +80,7 @@ class TelemetryCapture:
             "session_info": session_info,
             "telemetry": telemetry,
             "driver_names": driver_names or {},
+            "units": units or {},
         }
 
         filepath = self.session_dir / filename
