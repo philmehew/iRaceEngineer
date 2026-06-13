@@ -720,6 +720,20 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                     session_state = state.session.session_state
                     incidents = state.player.incidents
                     on_pit_road = state.player.on_pit_road
+
+                    # Find car directly behind player for closing-approach alert
+                    car_behind_gap = 0.0
+                    car_behind_lap_time = -1.0
+                    for car in state.nearby_cars:
+                        if car.gap_seconds < 0:  # negative = behind player
+                            # Closest behind = least negative gap
+                            if (
+                                car_behind_gap == 0.0
+                                or car.gap_seconds > car_behind_gap
+                            ):
+                                car_behind_gap = car.gap_seconds
+                                car_behind_lap_time = car.last_lap_time
+
                     spotter.update(
                         car_lr,
                         is_on_track=on_track,
@@ -729,6 +743,9 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                         session_state=session_state,
                         incidents=incidents,
                         on_pit_road=on_pit_road,
+                        car_behind_gap=car_behind_gap,
+                        car_behind_lap_time=car_behind_lap_time,
+                        player_last_lap_time=state.player.last_lap_time,
                     )
 
             else:

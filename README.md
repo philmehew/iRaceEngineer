@@ -10,7 +10,7 @@ Real-time iRacing data collection with on-demand LLM race engineering. Collects 
 - **Sends** the prompt to any OpenAI-compatible LLM endpoint when you press F9 (text query) or hold F10 (voice query)
 - **Parses** optional `[ACTION]` directives in the LLM response (pit this lap, add fuel, change tyres) — logged in dry-run mode, executable when enabled
 - **Speaks** LLM responses aloud via Piper TTS, and **listens** for voice questions via Whisper STT (optional, fully local)
-- **Spotter** — real-time audio calls for car proximity using pre-recorded WAV files (car left, car right, three wide, clear). Deterministic local logic, no LLM involved
+- **Spotter** — real-time audio calls for car proximity, car-behind-closing alerts, race flags, fuel, penalties, and pit transitions using pre-recorded WAV files. Deterministic local logic, no LLM involved
 - **Records** and **replays** telemetry snapshots for testing without iRacing running
 
 ## Architecture
@@ -28,9 +28,9 @@ iRacing (shared memory)
         │                          │
         ▼ (on button press)       ▼ (every tick)
  context_builder.py   ← condenses     spotter.py ← deterministic audio calls
-        │              state →         │            (car left/right, three wide, clear)
-        ▼              configurable    ▼
- llm_client.py        depth prompt   Pre-recorded WAV files (audio/)
+        │              state →         │            (car left/right, three wide, clear,
+        ▼              configurable    ▼             car behind closing, flags, fuel,
+ llm_client.py        depth prompt   Pre-recorded WAV files (audio/)  penalties, pit entry/exit)
         │
         ▼
  action_executor.py   ← parses [ACTION] directives (dry_run by default)
@@ -443,26 +443,70 @@ The solution is to route race engineer audio through a **virtual audio cable** s
 
 Result: you hear the race engineer and spotter through your headset, but Discord only transmits your voice — not the race engineer.
 
-## Spotter (Car Proximity Audio)
+## Spotter (Car Proximity & Race Alerts)
 
-iRaceEngineer includes a **local, deterministic spotter** that plays pre-recorded audio calls when cars appear alongside you. No LLM is involved — this is pure edge-detection logic running at the telemetry poll rate (~30Hz).
+iRaceEngineer includes a **local, deterministic spotter** that plays pre-recorded audio calls for car proximity, race flags, fuel, penalties, pit transitions, and car-behind-closing alerts. No LLM is involved — this is pure edge-detection logic running at the telemetry poll rate (~30Hz).
 
-### How It Works
+### Proximity Calls
 
 The spotter reads iRacing's `CarLeftRight` telemetry value every tick:
-- **0** = no car alongside
-- **1** = car on your left
-- **2** = car on your right
-- **3** = car on both sides (three wide)
+- **0** = off (no connection)
+- **1** = clear (no cars alongside)
+- **2** = car on your left
+- **3** = car on your right
+- **4** = cars on both sides (three wide)
+- **5** = two cars on the left
+- **6** = two cars on the right
 
-It detects **transitions** (not steady state), so you only hear a call when a car appears or clears — not every tick. Cooldown timers prevent repeated calls.
+It detects **transitions** (not steady state), so you only hear a call when a car appears or clears — not every tick. Cooldown timers and debounce delays prevent repeated calls and telemetry flicker.
 
 | Transition | Call | Audio File |
 |------------|------|------------|
-| Car appears on left (0→1, 2→3) | `car_left` | `audio/carleft.wav` |
-| Car appears on right (0→2, 1→3) | `car_right` | `audio/carright.wav` |
-| Both sides appear from none (0→3) | `three_wide` | `audio/carthreewide.wav` |
-| Any side clears (1→0, 2→0, 3→0, 3→1, 3→2) | `clear` | `audio/carclear.wav` |
+| Car appears on left | `car_left` | `audio/carleft.wav` |
+| Car appears on right | `car_right` | `audio/carright.wav` |
+| Both sides appear from none | `three_wide` | `audio/carthreewide.wav` |
+| Any side clears | `clear` | `audio/carclear.wav` |
+
+### Car Behind Closing
+
+The spotter also detects when the car directly behind you is **closing the gap** using lap-time comparison — if they're consistently running faster laps, you'll hear a warning before they arrive alongside. This is more reliable than computing a distance derivative from `CarDistBehind` (which is noisy at 30Hz).
+
+**How it works:**
+- Tracks the gap and lap time of the car directly behind you (from `nearby_cars`)
+- Counts consecutive laps where the car behind is faster
+- After 2 consecutive faster laps (configurable), fires a "car behind closing" alert
+- Suppressed during yellow/caution flags (field closure bunches everyone up)
+- Suppressed when the car is already alongside (gap < 1.5s — that's CarLeftRight's job)
+- Resets when the gap grows above 12s, the car behind slows down, or they pit/disappear
+
+| Alert | Condition | Audio File |
+|-------|-----------|------------|
+| Car behind closing | Car behind faster for ≥2 laps, gap 1.5–10s | `audio/carbehindclosing.wav` |
+
+### Other Spotter Alerts
+
+| Alert | Trigger | Audio File |
+|-------|---------|------------|
+| Fuel — 5 laps | Fuel laps remaining drops below 5 | `audio/fuelfivelaps.wav` |
+| Fuel — 2 laps | Fuel laps remaining drops below 2 | `audio/fueltwolaps.wav` |
+| Fuel — 1 lap | Fuel laps remaining drops below 1 | `audio/fuelonelap.wav` |
+| Yellow flag | Yellow/caution flag transition on | `audio/flagyellow.wav` |
+| Yellow waving | Yellow waving flag transition on | `audio/flagyellowwaving.wav` |
+| Blue flag | Blue flag transition on (after race start) | `audio/flagblue.wav` |
+| Black flag | Black flag transition on | `audio/flagblack.wav` |
+| Furled black | Furled black flag (warning) | `audio/flagblackfurled.wav` |
+| White flag | White flag (1 lap to go) | `audio/flagwhite.wav` |
+| Red flag | Red flag transition on | `audio/flagred.wav` |
+| Checkered flag | Checkered flag transition on | `audio/flagchequered.wav` |
+| Green flag | Green flag transition on (restarts only) | `audio/flaggreen.wav` |
+| Debris/slippery | Debris flag transition on | `audio/flagslippery.wav` |
+| Meatball/repair | Repair order flag transition on | `audio/flagmeatball.wav` |
+| 1x incident | Incident points increase by 1 | `audio/penaltyonex.wav` |
+| 2x incident | Incident points increase by 2 | `audio/penaltytwox.wav` |
+| 4x incident | Incident points increase by ≥4 | `audio/penaltyfourx.wav` |
+| Lights out | Session transitions from parade to racing | `audio/lightsout.wav` |
+| Pit entry | OnPitRoad confirms pit road entry (after race start) | `audio/pitentry.wav` |
+| Pit exit | OnPitRoad confirms pit road exit (after race start) | `audio/pitexit.wav` |
 
 ### Audio Files
 
@@ -533,7 +577,7 @@ voice:
     device_index: null           # Joystick device index (when method: wheel_button)
     button_index: null           # Button index (when method: wheel_button)
 
-# Spotter — real-time audio calls for car proximity (local, no LLM)
+# Spotter — real-time audio calls for car proximity & race alerts (local, no LLM)
 spotter:
   enabled: true
   audio_paths:
@@ -541,9 +585,16 @@ spotter:
     car_right: "audio/carright.wav"          # Car appears on right
     three_wide: "audio/carthreewide.wav"     # Cars on both sides simultaneously
     clear: "audio/carclear.wav"              # Car clears from alongside
+    car_behind_closing: "audio/carbehindclosing.wav"  # Car behind is closing
   cooldowns:
     proximity_ms: 3000                        # Don't repeat car left/right within 3s
     clearance_ms: 5000                        # Don't repeat clear calls within 5s
+  closing:                                    # Car-behind-closing alert thresholds
+    consecutive_faster_laps: 2                # Laps car behind must be faster before alerting
+    max_gap_seconds: 10.0                     # Only alert if gap < this (seconds)
+    min_gap_seconds: 1.5                      # Don't alert if car already alongside
+    reset_gap_seconds: 12.0                   # Reset alert when gap grows above this
+    cooldown_seconds: 30.0                    # Minimum time between repeated alerts
   output_device: null                         # null = system default
   volume: 1.0                                 # Volume multiplier (independent of TTS)
 
@@ -703,7 +754,7 @@ Same as `--capture` but always saves to the `tests/sample_data/` folder (from co
 | `context_builder.py` | Condenses state → LLM prompt (3 depth levels, format helpers) |
 | `llm_client.py` | OpenAI-compatible API caller (works with any `/v1` endpoint) |
 | `action_executor.py` | Parses `[ACTION]` directives from LLM responses |
-| `spotter.py` | Deterministic car proximity calls — edge-detect CarLeftRight transitions, play WAV files |
+| `spotter.py` | Deterministic car proximity & race alert calls — CarLeftRight transitions, car-behind-closing, flags, fuel, penalties, pit transitions |
 | `stt_client.py` | Speech-to-text — Whisper (faster-whisper) + mic capture (sounddevice) |
 | `tts_client.py` | Text-to-speech — Piper TTS + audio playback (sounddevice) |
 | `capture.py` | Record/replay telemetry JSON for testing |
@@ -711,7 +762,7 @@ Same as `--capture` but always saves to the `tests/sample_data/` folder (from co
 | `test_tts.py` | Standalone TTS test — speak text without iRacing |
 | `test_wheel.py` | Standalone wheel button discovery — find device/button indices for push-to-talk |
 | `tests/test_modules.py` | Unit tests — RaceState, ContextBuilder, ActionExecutor, TelemetryReplay |
-| `tests/test_spotter.py` | Unit tests — ProximityDetector state machine, SpotterAudioPlayer, Spotter coordinator |
+| `tests/test_spotter.py` | Unit tests — ProximityDetector, CarBehindTracker, SpotterAudioPlayer, Spotter coordinator |
 | `tests/eval_llm_responses.py` | Batch LLM evaluation — asks 50 questions against replay data, logs results |
 
 ## Roadmap
@@ -719,11 +770,12 @@ Same as `--capture` but always saves to the `tests/sample_data/` folder (from co
 This is the first working slice of the iRaceEngineer spotter system. Planned next steps from the [spec notes](specnotes.md):
 
 - [ ] **SQLite persistence** — store per-lap data for historical queries
-- [ ] **Pre-recorded audio** — spotter calls for flags, more clearance phrases
+- [ ] **Pre-recorded audio** — more spotter calls (10 to go, 5 to go, rain onset, engine warnings)
 - [x] **TTS output** — Piper TTS for spoken LLM responses (local, offline)
 - [x] **Mic input / STT** — faster-whisper for push-to-talk voice questions
 - [ ] **Multi-driver audio** — name-prefixed calls for 7 drivers
 - [x] **Spotter proximity logic** — deterministic 30Hz calls for car proximity (car left/right, three wide, clear)
+- [x] **Spotter car-behind-closing** — lap-time delta detection warns when car behind is consistently faster
 - [ ] **Action execution** — enable real `[ACTION]` commands to iRacing
 - [ ] **Team-aware prompts** — label teammates explicitly in nearby cars section, show per-teammate data, separate team section in full depth
 

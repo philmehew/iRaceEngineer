@@ -9,9 +9,8 @@ track_surface guard, and the fuel alert feature.
 
 from unittest.mock import MagicMock
 
-import pytest
 
-from spotter import ProximityDetector, Spotter, SpotterCall
+from spotter import CarBehindTracker, ProximityDetector, Spotter, SpotterCall
 
 # iRacing CarLeftRight enum values (from irsdk.CarLeftRight — ordinal, NOT bitmask)
 CLR_OFF = 0
@@ -30,6 +29,8 @@ DEFAULT_CONFIG = {
             "clearance_ms": 5000,
             "clear_delay_ms": 100,  # 0.1s — short enough for fast tests
             "appear_delay_ms": 0,  # No appearance delay — immediate calls
+            "still_there_delay_ms": 500,  # 0.5s — short for fast tests
+            "still_there_cooldown_ms": 1000,  # 1s — short for fast tests
         }
     }
 }
@@ -1839,12 +1840,734 @@ class TestSpotterAudioPlayer:
             "penalty_4x",
             "pit_entry",
             "pit_exit",
+            "car_behind_closing",
+            "car_still_there",
         ]
         for key in expected_keys:
             assert key in SpotterAudioPlayer.DEFAULT_AUDIO_PATHS, (
                 f"Missing default path: {key}"
             )
 
+    def test_default_audio_paths_include_car_behind_closing(self):
+        """Default audio paths should include car_behind_closing alert."""
+        from spotter import SpotterAudioPlayer
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+        assert "car_behind_closing" in SpotterAudioPlayer.DEFAULT_AUDIO_PATHS
+
+
+# ---------------------------------------------------------------------------
+# CarBehindTracker — Car Behind Closing Alert Tests
+# ---------------------------------------------------------------------------
+
+
+class TestCarBehindTracker:
+    """Test the CarBehindTracker lap-time delta detection."""
+
+    def setup_method(self):
+        self.tracker = CarBehindTracker({})
+
+    def test_no_alert_when_no_car_behind(self):
+        """No alert when gap_seconds is 0 (no car behind)."""
+        self.tracker.update(
+            gap_seconds=0.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+        )
+        assert not self.tracker.should_alert(current_time=1.0)
+
+    def test_no_alert_when_car_behind_is_slower(self):
+        """No alert when the car behind is running slower laps."""
+        # Lap 1: car behind is slower
+        self.tracker.update(
+            gap_seconds=5.0, car_behind_faster=False, is_yellow=False, current_time=1.0
+        )
+        assert not self.tracker.should_alert(current_time=1.0)
+        # Lap 2: still slower
+        self.tracker.update(
+            gap_seconds=5.5, car_behind_faster=False, is_yellow=False, current_time=2.0
+        )
+        assert not self.tracker.should_alert(current_time=2.0)
+
+    def test_alert_after_consecutive_faster_laps(self):
+        """Alert fires after car behind is faster for 2 consecutive laps within gap."""
+        # Lap 1: car behind is faster
+        self.tracker.update(
+            gap_seconds=5.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+        )
+        assert not self.tracker.should_alert(current_time=1.0)  # only 1 lap faster
+
+        # Lap 2: car behind is faster again
+        self.tracker.update(
+            gap_seconds=4.0, car_behind_faster=True, is_yellow=False, current_time=2.0
+        )
+        assert self.tracker.should_alert(current_time=2.0)  # 2 laps faster — fire!
+
+    def test_no_alert_when_gap_too_large(self):
+        """No alert when gap exceeds max_gap threshold (default 10s)."""
+        # Car behind is faster but too far away
+        self.tracker.update(
+            gap_seconds=15.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+        )
+        self.tracker.update(
+            gap_seconds=14.0, car_behind_faster=True, is_yellow=False, current_time=2.0
+        )
+        assert not self.tracker.should_alert(current_time=2.0)
+
+    def test_no_alert_when_gap_too_small(self):
+        """No alert when gap is below min_gap (car already alongside — CarLeftRight's job)."""
+        # Car behind is faster and very close (alongside)
+        self.tracker.update(
+            gap_seconds=1.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+        )
+        self.tracker.update(
+            gap_seconds=0.8, car_behind_faster=True, is_yellow=False, current_time=2.0
+        )
+        assert not self.tracker.should_alert(current_time=2.0)
+
+    def test_alert_resets_when_gap_grows(self):
+        """Alert resets when gap grows above reset threshold (12s default)."""
+        # Lap 1 & 2: car behind is faster — alert fires
+        self.tracker.update(
+            gap_seconds=5.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+        )
+        self.tracker.update(
+            gap_seconds=4.0, car_behind_faster=True, is_yellow=False, current_time=2.0
+        )
+        assert self.tracker.should_alert(current_time=2.0)
+
+        # Gap grows beyond reset threshold — tracker resets
+        self.tracker.update(
+            gap_seconds=13.0, car_behind_faster=False, is_yellow=False, current_time=3.0
+        )
+
+        # Car behind closes again — should be able to fire again
+        # Advance time past the 30s cooldown
+        self.tracker.update(
+            gap_seconds=8.0, car_behind_faster=True, is_yellow=False, current_time=40.0
+        )
+        self.tracker.update(
+            gap_seconds=7.0, car_behind_faster=True, is_yellow=False, current_time=41.0
+        )
+        assert self.tracker.should_alert(
+            current_time=41.0
+        )  # Can re-alert after gap grew
+
+    def test_alert_resets_when_car_behind_slows(self):
+        """Alert resets when car behind stops being faster (slower lap)."""
+        # Lap 1 & 2: faster — alert fires
+        self.tracker.update(
+            gap_seconds=5.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+        )
+        self.tracker.update(
+            gap_seconds=4.0, car_behind_faster=True, is_yellow=False, current_time=2.0
+        )
+        assert self.tracker.should_alert(current_time=2.0)
+
+        # Car behind slows down — resets alert_fired and consecutive count
+        self.tracker.update(
+            gap_seconds=4.5, car_behind_faster=False, is_yellow=False, current_time=3.0
+        )
+
+        # Must rebuild consecutive count (time past cooldown)
+        self.tracker.update(
+            gap_seconds=4.0, car_behind_faster=True, is_yellow=False, current_time=40.0
+        )
+        assert not self.tracker.should_alert(
+            current_time=40.0
+        )  # Only 1 consecutive faster lap
+
+    def test_no_alert_during_yellow(self):
+        """No alert accumulation during yellow flag (field closure bunched up)."""
+        # Lap 1: faster, but yellow flag
+        self.tracker.update(
+            gap_seconds=5.0, car_behind_faster=True, is_yellow=True, current_time=1.0
+        )
+        # Lap 2: faster, still yellow
+        self.tracker.update(
+            gap_seconds=4.0, car_behind_faster=True, is_yellow=True, current_time=2.0
+        )
+        assert not self.tracker.should_alert(
+            current_time=2.0
+        )  # Yellow suppresses counting
+
+        # After yellow clears, must start counting fresh
+        self.tracker.update(
+            gap_seconds=3.0, car_behind_faster=True, is_yellow=False, current_time=3.0
+        )
+        assert not self.tracker.should_alert(
+            current_time=3.0
+        )  # Only 1 lap after yellow
+
+    def test_no_repeated_alerts(self):
+        """Alert should not fire again until reset conditions are met."""
+        # Build up to alert
+        self.tracker.update(
+            gap_seconds=5.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+        )
+        self.tracker.update(
+            gap_seconds=4.0, car_behind_faster=True, is_yellow=False, current_time=2.0
+        )
+        assert self.tracker.should_alert(current_time=2.0)
+
+        # Continuing ticks should not re-alert (within 30s cooldown)
+        self.tracker.update(
+            gap_seconds=3.5, car_behind_faster=True, is_yellow=False, current_time=3.0
+        )
+        assert not self.tracker.should_alert(current_time=3.0)
+        self.tracker.update(
+            gap_seconds=3.0, car_behind_faster=True, is_yellow=False, current_time=4.0
+        )
+        assert not self.tracker.should_alert(current_time=4.0)
+
+    def test_reset_clears_state(self):
+        """Reset should clear all tracking state so alerts can re-fire."""
+        # Build up to alert
+        self.tracker.update(
+            gap_seconds=5.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+        )
+        self.tracker.update(
+            gap_seconds=4.0, car_behind_faster=True, is_yellow=False, current_time=2.0
+        )
+        assert self.tracker.should_alert(current_time=2.0)
+
+        self.tracker.reset()
+
+        # After reset, must build up consecutive count again
+        self.tracker.update(
+            gap_seconds=5.0, car_behind_faster=True, is_yellow=False, current_time=3.0
+        )
+        assert not self.tracker.should_alert(current_time=3.0)  # Only 1 lap
+
+    def test_no_car_behind_resets_tracker(self):
+        """Passing gap_seconds=0 resets tracker state completely."""
+        # Build up to alert
+        self.tracker.update(
+            gap_seconds=5.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+        )
+        self.tracker.update(
+            gap_seconds=4.0, car_behind_faster=True, is_yellow=False, current_time=2.0
+        )
+        assert self.tracker.should_alert(current_time=2.0)
+
+        # Car behind pits/disappears
+        self.tracker.update(
+            gap_seconds=0.0, car_behind_faster=False, is_yellow=False, current_time=3.0
+        )
+
+        # Must rebuild consecutive count
+        self.tracker.update(
+            gap_seconds=6.0, car_behind_faster=True, is_yellow=False, current_time=4.0
+        )
+        assert not self.tracker.should_alert(current_time=4.0)
+
+    def test_custom_thresholds_from_config(self):
+        """CarBehindTracker should use custom thresholds from config."""
+        config = {
+            "spotter": {
+                "closing": {
+                    "consecutive_faster_laps": 3,
+                    "max_gap_seconds": 15.0,
+                    "min_gap_seconds": 2.0,
+                    "reset_gap_seconds": 18.0,
+                    "cooldown_seconds": 60.0,
+                }
+            }
+        }
+        tracker = CarBehindTracker(config)
+        assert tracker._consecutive_threshold == 3
+        assert tracker._max_gap == 15.0
+        assert tracker._min_gap == 2.0
+        assert tracker._reset_gap == 18.0
+        assert tracker._cooldown == 60.0
+
+
+class TestSpotterCarBehindClosing:
+    """Integration test for car-behind-closing alert through the Spotter class."""
+
+    # iRacing SessionFlags bitmasks
+    FLAG_GREEN = 0x0004
+    FLAG_YELLOW = 0x0008
+
+    def setup_method(self):
+        self.config = {
+            "spotter": {
+                "enabled": True,
+                "cooldowns": {
+                    "proximity_ms": 3000,
+                    "clearance_ms": 5000,
+                    "clear_delay_ms": 100,
+                    "appear_delay_ms": 0,
+                },
+                "audio_paths": {},
+                "output_device": None,
+                "volume": 1.0,
+            }
+        }
+
+    def test_no_alert_without_car_behind_data(self):
+        """No alert when car_behind_gap=0 (default — no data)."""
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Start green flag — race is on
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
+
+        # Tick with no car behind data — should not crash or alert
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            car_behind_gap=0.0,
+            car_behind_lap_time=-1.0,
+            player_last_lap_time=-1.0,
+        )
+        assert "car_behind_closing" not in played_keys
+
+    def test_car_behind_closing_alert_fires(self):
+        """Alert fires when car behind is consistently faster within gap threshold."""
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Prime: green flag, on track
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
+
+        # Tick 1: car behind is faster (gap = 5s, their lap = 91s, our lap = 92s)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            car_behind_gap=-5.0,  # negative = behind
+            car_behind_lap_time=91.0,
+            player_last_lap_time=92.0,
+        )
+        assert "car_behind_closing" not in played_keys  # 1st faster lap, not enough
+
+        # Tick 2: car behind still faster (gap shrinking)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            car_behind_gap=-4.0,
+            car_behind_lap_time=91.0,
+            player_last_lap_time=92.0,
+        )
+        assert "car_behind_closing" in played_keys  # 2 consecutive faster laps
+
+    def test_no_alert_when_not_on_track(self):
+        """No alert when player is not on track."""
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Prime
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
+
+        # Not on track — no alert even though car behind is closing
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=False,  # NOT on track
+            track_surface=0,
+            session_flags=self.FLAG_GREEN,
+            car_behind_gap=-5.0,
+            car_behind_lap_time=91.0,
+            player_last_lap_time=92.0,
+        )
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=False,
+            track_surface=0,
+            session_flags=self.FLAG_GREEN,
+            car_behind_gap=-4.0,
+            car_behind_lap_time=91.0,
+            player_last_lap_time=92.0,
+        )
+        assert "car_behind_closing" not in played_keys
+
+    def test_no_alert_during_yellow_flag(self):
+        """No closing alert during yellow flag (field bunched up)."""
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Prime: green flag
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
+
+        # Yellow flag — car behind is faster but yellow suppresses
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN | self.FLAG_YELLOW,
+            car_behind_gap=-5.0,
+            car_behind_lap_time=91.0,
+            player_last_lap_time=92.0,
+        )
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN | self.FLAG_YELLOW,
+            car_behind_gap=-4.0,
+            car_behind_lap_time=91.0,
+            player_last_lap_time=92.0,
+        )
+        assert "car_behind_closing" not in played_keys
+
+    def test_no_alert_when_car_alongside(self):
+        """No closing alert when gap < 1.5s (car is alongside — CarLeftRight's job)."""
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Prime
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
+
+        # Gap only 0.8s — car alongside, not closing
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            car_behind_gap=-0.8,
+            car_behind_lap_time=91.0,
+            player_last_lap_time=92.0,
+        )
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            car_behind_gap=-0.8,
+            car_behind_lap_time=91.0,
+            player_last_lap_time=92.0,
+        )
+        assert "car_behind_closing" not in played_keys
+
+    def test_reset_clears_car_behind_tracker(self):
+        """Spotter.reset() should clear car-behind tracker state."""
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Prime and trigger alert
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            car_behind_gap=-5.0,
+            car_behind_lap_time=91.0,
+            player_last_lap_time=92.0,
+        )
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            car_behind_gap=-4.0,
+            car_behind_lap_time=91.0,
+            player_last_lap_time=92.0,
+        )
+        assert "car_behind_closing" in played_keys
+
+        # Reset
+        spotter.reset()
+
+        # Should need to rebuild consecutive count after reset
+        played_keys.clear()
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+        )
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            car_behind_gap=-5.0,
+            car_behind_lap_time=91.0,
+            player_last_lap_time=92.0,
+        )
+        assert "car_behind_closing" not in played_keys  # Only 1 lap, need 2
+
+
+class TestProximityDetectorStillThere:
+    """Test the 'still there' reminder — fires when a car has been alongside
+    continuously for more than still_there_delay_ms, repeats every
+    still_there_cooldown_ms, and resets when the car clears."""
+
+    def setup_method(self):
+        self.config = {
+            "spotter": {
+                "cooldowns": {
+                    "proximity_ms": 3000,
+                    "clearance_ms": 5000,
+                    "clear_delay_ms": 100,
+                    "appear_delay_ms": 0,
+                    "still_there_delay_ms": 500,  # 0.5s for fast tests
+                    "still_there_cooldown_ms": 1000,  # 1s for fast tests
+                }
+            }
+        }
+        self.detector = ProximityDetector(self.config)
+        self.t = 0.0
+
+    def _tick(self, car_lr: int, dt: float = 0.1) -> list[SpotterCall]:
+        self.t += dt
+        mapped = {0: CLR_CLEAR, 1: CLR_CAR_LEFT, 2: CLR_CAR_RIGHT, 3: CLR_BOTH}.get(
+            car_lr, car_lr
+        )
+        return self.detector.update(mapped, self.t)
+
+    def _call_types(self, calls: list[SpotterCall]) -> list[str]:
+        return [c.call_type for c in calls]
+
+    def test_still_there_fires_after_delay(self):
+        """'Still there' should fire when a car has been alongside for
+        longer than still_there_delay."""
+        # Car appears left
+        calls = self._tick(1)
+        assert "car_left" in self._call_types(calls)
+
+        # Stay alongside for 0.4s — not yet past the 0.5s delay
+        for _ in range(4):
+            calls = self._tick(1)
+            assert "car_still_there" not in self._call_types(calls)
+
+        # Stay alongside for 0.1s more — total 0.5s, past the delay
+        self.t += 0.1
+        calls = self.detector.update(CLR_CAR_LEFT, self.t)
+        assert "car_still_there" in self._call_types(calls)
+
+    def test_still_there_not_before_delay(self):
+        """'Still there' should NOT fire before the delay has elapsed."""
+        calls = self._tick(1)
+        assert "car_left" in self._call_types(calls)
+
+        # Stay alongside for 0.4s — not yet past the 0.5s delay
+        for _ in range(4):
+            calls = self._tick(1)
+            assert "car_still_there" not in self._call_types(calls)
+
+    def test_still_there_resets_on_clear(self):
+        """'Still there' timer should reset when the car clears."""
+        # Car appears left
+        calls = self._tick(1)
+        assert "car_left" in self._call_types(calls)
+
+        # Stay alongside for 0.4s (not yet past delay)
+        for _ in range(4):
+            self._tick(1)
+
+        # Car clears
+        self._tick(0)
+        self.t += 0.2  # past clear_delay
+        calls = self.detector.update(CLR_CLEAR, self.t)
+        assert "clear" in self._call_types(calls)
+
+        # Advance past proximity cooldown (3s) so car_left can fire again
+        self.t += 3.5
+
+        # Car reappears — timer should restart
+        calls = self.detector.update(CLR_CAR_LEFT, self.t)
+        assert "car_left" in self._call_types(calls)
+
+        # Stay alongside for 0.4s — not yet past the delay (timer restarted)
+        for _ in range(4):
+            calls = self._tick(1)
+            assert "car_still_there" not in self._call_types(calls)
+
+    def test_still_there_repeats_with_cooldown(self):
+        """'Still there' should repeat every still_there_cooldown while
+        the car remains alongside."""
+        # Car appears left
+        calls = self._tick(1)
+        assert "car_left" in self._call_types(calls)
+
+        # Wait for still_there_delay (0.5s) — first still_there
+        self.t += 0.5
+        calls = self.detector.update(CLR_CAR_LEFT, self.t)
+        assert "car_still_there" in self._call_types(calls)
+
+        # Wait for cooldown (1s) — second still_there
+        self.t += 1.0
+        calls = self.detector.update(CLR_CAR_LEFT, self.t)
+        assert "car_still_there" in self._call_types(calls)
+
+    def test_still_there_does_not_repeat_within_cooldown(self):
+        """'Still there' should NOT repeat within the cooldown period."""
+        # Car appears left
+        calls = self._tick(1)
+        assert "car_left" in self._call_types(calls)
+
+        # Wait for still_there_delay (0.5s) — first still_there
+        self.t += 0.5
+        calls = self.detector.update(CLR_CAR_LEFT, self.t)
+        assert "car_still_there" in self._call_types(calls)
+
+        # 0.5s later — still within cooldown (1s), should not fire
+        self.t += 0.5
+        calls = self.detector.update(CLR_CAR_LEFT, self.t)
+        assert "car_still_there" not in self._call_types(calls)
+
+    def test_still_there_for_car_right(self):
+        """'Still there' should also work for car on the right."""
+        calls = self._tick(2)
+        assert "car_right" in self._call_types(calls)
+
+        # Wait for still_there_delay
+        self.t += 0.5
+        calls = self.detector.update(CLR_CAR_RIGHT, self.t)
+        assert "car_still_there" in self._call_types(calls)
+
+    def test_still_there_for_three_wide(self):
+        """'Still there' should work for three-wide (both sides)."""
+        calls = self._tick(3)
+        assert "three_wide" in self._call_types(calls)
+
+        # Wait for still_there_delay
+        self.t += 0.5
+        calls = self.detector.update(CLR_BOTH, self.t)
+        assert "car_still_there" in self._call_types(calls)
+
+    def test_still_there_not_fired_when_no_car_alongside(self):
+        """'Still there' should never fire when no car is alongside."""
+        # No car alongside
+        calls = self._tick(0)
+        assert calls == []
+
+        # Advance well past the delay
+        self.t += 10.0
+        calls = self.detector.update(CLR_CLEAR, self.t)
+        assert "car_still_there" not in self._call_types(calls)
+
+    def test_still_there_timer_persists_through_side_switch(self):
+        """'Still there' timer should persist when car switches sides
+        (side correction), since the car has been continuously alongside."""
+        # Car appears left
+        calls = self._tick(1)
+        assert "car_left" in self._call_types(calls)
+
+        # Stay alongside for 0.3s
+        for _ in range(3):
+            self._tick(1)
+
+        # Car switches to right (side correction scenario)
+        # The car is still alongside, just on a different side
+        # Since we have appear_delay=0, the car_right fires immediately
+        # but _alongside_since should persist from the original car_left call
+        original_alongside_since = self.detector._alongside_since
+
+        calls = self._tick(2)
+        # car_right should fire (with side correction clear+right)
+        # _alongside_since should NOT be reset
+        assert self.detector._alongside_since == original_alongside_since
+
+    def test_still_there_resets_on_spotter_reset(self):
+        """Spotter.reset() should clear still-there timer state."""
+        self._tick(1)  # car left appears
+
+        # Advance partway through the delay
+        for _ in range(3):
+            self._tick(1)
+
+        # Reset
+        self.detector.reset()
+
+        # Car appears again — timer should restart from scratch
+        calls = self._tick(1)
+        assert "car_left" in self._call_types(calls)
+
+        # Only 0.1s since appearance — not yet past delay
+        calls = self._tick(1)
+        assert "car_still_there" not in self._call_types(calls)
+
+    def test_still_there_delay_configurable(self):
+        """still_there_delay should be configurable via still_there_delay_ms."""
+        config = {
+            "spotter": {
+                "cooldowns": {
+                    "proximity_ms": 3000,
+                    "clearance_ms": 5000,
+                    "clear_delay_ms": 100,
+                    "appear_delay_ms": 0,
+                    "still_there_delay_ms": 1000,  # 1s delay
+                    "still_there_cooldown_ms": 5000,
+                }
+            }
+        }
+        detector = ProximityDetector(config)
+        t = 0.0
+
+        # Car appears left
+        t += 0.1
+        calls = detector.update(CLR_CAR_LEFT, t)
+        assert "car_left" in [c.call_type for c in calls]
+
+        # 0.5s — not yet past 1s delay
+        t += 0.5
+        calls = detector.update(CLR_CAR_LEFT, t)
+        assert "car_still_there" not in [c.call_type for c in calls]
+
+        # 0.6s more — total 1.2s, past the 1s delay
+        t += 0.6
+        calls = detector.update(CLR_CAR_LEFT, t)
+        assert "car_still_there" in [c.call_type for c in calls]
+
+    def test_still_there_cooldown_configurable(self):
+        """still_there_cooldown should be configurable via still_there_cooldown_ms."""
+        config = {
+            "spotter": {
+                "cooldowns": {
+                    "proximity_ms": 3000,
+                    "clearance_ms": 5000,
+                    "clear_delay_ms": 100,
+                    "appear_delay_ms": 0,
+                    "still_there_delay_ms": 200,
+                    "still_there_cooldown_ms": 5000,  # 5s cooldown
+                }
+            }
+        }
+        detector = ProximityDetector(config)
+        t = 0.0
+
+        # Car appears left
+        t += 0.1
+        detector.update(CLR_CAR_LEFT, t)
+
+        # Wait for delay — first still_there
+        t += 0.2
+        calls = detector.update(CLR_CAR_LEFT, t)
+        assert "car_still_there" in [c.call_type for c in calls]
+
+        # 2s later — within 5s cooldown, should not fire
+        t += 2.0
+        calls = detector.update(CLR_CAR_LEFT, t)
+        assert "car_still_there" not in [c.call_type for c in calls]
+
+        # 3.1s more — total 5.1s past last still_there, past cooldown
+        t += 3.1
+        calls = detector.update(CLR_CAR_LEFT, t)
+        assert "car_still_there" in [c.call_type for c in calls]
+
+    def test_still_there_default_values(self):
+        """Default still_there_delay should be 5s, cooldown 10s."""
+        config = {"spotter": {"cooldowns": {}}}
+        detector = ProximityDetector(config)
+        assert detector._still_there_delay == 5.0  # 5000ms default
+        assert detector._still_there_cooldown == 10.0  # 10000ms default

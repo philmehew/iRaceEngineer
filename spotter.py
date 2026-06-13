@@ -11,7 +11,10 @@ Architecture:
     ProximityDetector   ← edge-detect CarLeftRight transitions, enforce cooldowns
            │
            ▼
-         Spotter           ← coordinator: owns detector + audio player, called each tick
+    CarBehindTracker    ← lap-time delta detection for car-behind-closing alert
+           │
+           ▼
+         Spotter           ← coordinator: owns detector + tracker + audio player, called each tick
            │
            ▼
     SpotterAudioPlayer   ← loads WAVs into memory at startup, plays via sounddevice.OutputStream
@@ -22,10 +25,16 @@ Key design decisions:
 - Cooldown timers prevent repeated calls within a configurable window.
 - Appearance debounce: delays proximity calls by appear_delay_ms to suppress
   telemetry flicker (e.g. iRacing briefly reporting the wrong side).
+- Still-there reminder: when a car has been alongside continuously for more
+  than still_there_delay_ms (default 5s), plays a "still there" reminder.
+  Repeats every still_there_cooldown_ms (default 10s) while the car remains.
 - Guard: only processes CarLeftRight when the player is on the racing surface
   (PlayerTrackSurface >= 3), suppressing false calls in the pit lane.
 - Fuel alert: plays "fuel_two_laps" when estimated laps remaining drops below
   a configurable threshold (default 2.0 laps).
+- Car behind closing: uses lap-time delta comparison (not CarDistBehind derivative)
+  for noise-immune detection. Fires after N consecutive faster laps by the car
+  behind, when the gap is within configurable bounds, suppressed during yellow.
 """
 
 import logging
@@ -45,7 +54,7 @@ class SpotterCall:
     """A single spotter call event to be played as audio."""
 
     call_type: (
-        str  # e.g. "car_left", "car_right", "three_wide", "clear", "fuel_two_laps"
+        str  # e.g. "car_left", "car_right", "three_wide", "clear", "car_still_there"
     )
     priority: int  # 0=safety_critical, 1=team_wide, 2=driver_specific, 3=on_demand
     audio_key: str  # key into the pre-loaded audio samples dict
@@ -89,6 +98,10 @@ class ProximityDetector:
         self._clearance_cooldown = cooldowns.get("clearance_ms", 5000) / 1000.0
         self._clear_delay = cooldowns.get("clear_delay_ms", 0) / 1000.0
         self._appear_delay = cooldowns.get("appear_delay_ms", 200) / 1000.0
+        self._still_there_delay = cooldowns.get("still_there_delay_ms", 5000) / 1000.0
+        self._still_there_cooldown = (
+            cooldowns.get("still_there_cooldown_ms", 10000) / 1000.0
+        )
 
         self._prev_left = False
         self._prev_right = False
@@ -122,6 +135,13 @@ class ProximityDetector:
         self._last_side_time: float = 0.0
         self._side_correction_window: float = 1.5  # seconds
         self._continuous_alongside_since_last_side: bool = False
+
+        # Still-there tracking: monitors how long a car has been continuously
+        # alongside. When duration exceeds still_there_delay, a "still there"
+        # reminder fires. Repeats every still_there_cooldown while the car
+        # remains alongside.
+        self._alongside_since: float | None = None  # time when car first appeared
+        self._last_still_there_time: float = 0.0  # last time still_there fired
 
     def update(self, car_left_right: int, current_time: float) -> list[SpotterCall]:
         """Process a CarLeftRight value and return any calls to play.
@@ -216,6 +236,8 @@ class ProximityDetector:
                     )
                     self._last_call_time["three_wide"] = current_time
                     self._car_alongside = True
+                    if self._alongside_since is None:
+                        self._alongside_since = current_time
                     self._last_side = "three_wide"
                     self._last_side_time = current_time
                     self._continuous_alongside_since_last_side = True
@@ -253,6 +275,8 @@ class ProximityDetector:
                         )
                         self._last_call_time["car_left"] = current_time
                         self._car_alongside = True
+                        if self._alongside_since is None:
+                            self._alongside_since = current_time
                         self._last_side = "left"
                         self._last_side_time = current_time
                         self._continuous_alongside_since_last_side = True
@@ -281,10 +305,11 @@ class ProximityDetector:
                         )
                         self._last_call_time["car_right"] = current_time
                         self._car_alongside = True
+                        if self._alongside_since is None:
+                            self._alongside_since = current_time
                         self._last_side = "right"
                         self._last_side_time = current_time
                         self._continuous_alongside_since_last_side = True
-                        self._last_side_time = current_time
 
         # === Phase 4: Debounced clear detection ===
         # Instead of firing "clear" the instant telemetry reads the car as gone,
@@ -339,6 +364,7 @@ class ProximityDetector:
                 )
                 self._last_call_time["clear"] = current_time
                 self._car_alongside = False
+                self._alongside_since = None
             # Clear the pending timers regardless — we only fire once.
             # If we suppressed "clear" because a car is alongside on the
             # other side, we'll get a new pending clear when that car leaves.
@@ -346,6 +372,25 @@ class ProximityDetector:
                 self._pending_clear_since_left = None
             if right_clear_matured:
                 self._pending_clear_since_right = None
+
+        # === Phase 5: Still-there reminder ===
+        # If a car has been continuously alongside for longer than
+        # still_there_delay, fire a "still there" reminder. Repeats
+        # every still_there_cooldown while the car remains alongside.
+        if (
+            self._alongside_since is not None
+            and self._car_alongside
+            and (current_time - self._alongside_since) >= self._still_there_delay
+        ):
+            if self._cooldown_elapsed("still_there", current_time):
+                calls.append(
+                    SpotterCall(
+                        call_type="car_still_there",
+                        priority=0,
+                        audio_key="car_still_there",
+                    )
+                )
+                self._last_call_time["still_there"] = current_time
 
         # Update previous state
         self._prev_left = cur_left
@@ -361,11 +406,12 @@ class ProximityDetector:
         """
         # Proximity-related calls use the proximity cooldown
         proximity_types = {"car_left", "car_right", "three_wide"}
-        cooldown = (
-            self._proximity_cooldown
-            if call_type in proximity_types
-            else self._clearance_cooldown
-        )
+        if call_type == "still_there":
+            cooldown = self._still_there_cooldown
+        elif call_type in proximity_types:
+            cooldown = self._proximity_cooldown
+        else:
+            cooldown = self._clearance_cooldown
         if call_type not in self._last_call_time:
             return True  # Never called before — no cooldown to enforce
         return (current_time - self._last_call_time[call_type]) >= cooldown
@@ -383,6 +429,160 @@ class ProximityDetector:
         self._last_side = None
         self._last_side_time = 0.0
         self._continuous_alongside_since_last_side = False
+        self._alongside_since = None
+        self._last_still_there_time = 0.0
+
+
+class CarBehindTracker:
+    """Tracks whether the car behind is closing on the player.
+
+    Uses lap-time comparison: if the car behind consistently runs faster
+    laps than the player, they're closing. This is more reliable than
+    computing a derivative from CarDistBehind (which is noisy at 30Hz)
+    and uses data already computed in nearby_cars.
+
+    The tracker counts consecutive laps where the car behind was faster.
+    After a configurable threshold (default 2), it fires a "car behind
+    closing" alert. The alert resets when the gap grows back above a
+    hysteresis threshold, the car behind slows down, or yellow flag
+    bunches the field.
+
+    Cooldown prevents repeated alerts within a configurable window.
+    """
+
+    # Configurable thresholds (can be overridden via config spotter.closing)
+    DEFAULT_CONSECUTIVE_FASTER = 2  # Laps of faster pace before alerting
+    DEFAULT_MAX_GAP = 10.0  # Only alert if gap < this (seconds)
+    DEFAULT_MIN_GAP = 1.5  # Don't alert if car is already alongside
+    DEFAULT_RESET_GAP = 12.0  # Reset alert when gap grows above this
+    DEFAULT_COOLDOWN = 30.0  # Seconds between repeated alerts
+
+    def __init__(self, config: dict):
+        closing_config = config.get("spotter", {}).get("closing", {})
+        self._consecutive_threshold = closing_config.get(
+            "consecutive_faster_laps", self.DEFAULT_CONSECUTIVE_FASTER
+        )
+        self._max_gap = closing_config.get("max_gap_seconds", self.DEFAULT_MAX_GAP)
+        self._min_gap = closing_config.get("min_gap_seconds", self.DEFAULT_MIN_GAP)
+        self._reset_gap = closing_config.get(
+            "reset_gap_seconds", self.DEFAULT_RESET_GAP
+        )
+        self._cooldown = closing_config.get("cooldown_seconds", self.DEFAULT_COOLDOWN)
+
+        # State
+        self._consecutive_faster: int = (
+            0  # How many consecutive laps car behind was faster
+        )
+        self._alert_fired: bool = (
+            False  # Whether the closing alert has been fired for this approach
+        )
+        self._last_alert_time: float = 0.0  # Monotonic time of last alert
+        self._car_behind_present: bool = False  # Whether we're tracking a car behind
+
+    def update(
+        self,
+        gap_seconds: float,
+        car_behind_faster: bool,
+        is_yellow: bool,
+        current_time: float,
+    ) -> None:
+        """Process a tick of car-behind data.
+
+        Args:
+            gap_seconds: Absolute gap to car behind in seconds (positive value).
+                0 means no car behind.
+            car_behind_faster: True if car behind's last lap time is less than
+                the player's (they're running faster laps).
+            is_yellow: True if yellow/caution flag is active (suppress alerts).
+            current_time: Monotonic time for cooldown tracking.
+        """
+        # No car behind — reset tracking state
+        if gap_seconds <= 0:
+            if self._car_behind_present:
+                logger.debug("Car behind: no car behind, resetting tracker")
+            self._consecutive_faster = 0
+            self._alert_fired = False
+            self._car_behind_present = False
+            return
+
+        self._car_behind_present = True
+
+        # Yellow flag — don't accumulate "faster" laps during caution
+        if is_yellow:
+            self._consecutive_faster = 0
+            self._alert_fired = False
+            return
+
+        # Car alongside or very close — that's CarLeftRight's job
+        if gap_seconds < self._min_gap:
+            self._consecutive_faster = 0
+            self._alert_fired = False
+            return
+
+        # Gap too large — not closing on us meaningfully
+        if gap_seconds > self._reset_gap:
+            self._consecutive_faster = 0
+            self._alert_fired = False
+            return
+
+        # Track consecutive faster laps
+        if car_behind_faster:
+            self._consecutive_faster += 1
+            logger.debug(
+                f"Car behind: faster (consecutive={self._consecutive_faster}, "
+                f"gap={gap_seconds:.1f}s)"
+            )
+        else:
+            # Car behind is not faster — they've stopped closing
+            if self._consecutive_faster > 0:
+                logger.debug(
+                    f"Car behind: slower (was {self._consecutive_faster} faster, resetting)"
+                )
+            self._consecutive_faster = 0
+            # They stopped closing — allow a new alert next time they speed up
+            self._alert_fired = False
+
+    def should_alert(self, current_time: float | None = None) -> bool:
+        """Whether a 'car behind closing' alert should fire this tick.
+
+        Returns True when:
+        - Car behind has been faster for ≥ consecutive_threshold laps
+        - Gap is within [min_gap, max_gap]
+        - Alert hasn't already been fired for this approach
+        - Cooldown since last alert has elapsed
+
+        Args:
+            current_time: Monotonic time for cooldown check. Defaults to
+                time.monotonic() if not provided (for production use).
+                Pass explicit values in tests for deterministic timing.
+        """
+        if not self._car_behind_present:
+            return False
+
+        if self._consecutive_faster < self._consecutive_threshold:
+            return False
+
+        if self._alert_fired:
+            return False
+
+        # Cooldown check — only enforce if a previous alert was actually fired
+        # (i.e. _last_alert_time > 0, which is set when the first alert fires).
+        # This avoids the initial _last_alert_time=0 from blocking the first alert.
+        now = current_time if current_time is not None else time.monotonic()
+        if self._last_alert_time > 0 and (now - self._last_alert_time) < self._cooldown:
+            return False
+
+        # Fire the alert
+        self._alert_fired = True
+        self._last_alert_time = now
+        return True
+
+    def reset(self):
+        """Reset all tracking state (e.g. on session start/reconnect)."""
+        self._consecutive_faster = 0
+        self._alert_fired = False
+        self._last_alert_time = 0.0
+        self._car_behind_present = False
 
 
 class SpotterAudioPlayer:
@@ -420,6 +620,8 @@ class SpotterAudioPlayer:
         "penalty_4x": "audio/penaltyfourx.wav",
         "pit_entry": "audio/pitentry.wav",
         "pit_exit": "audio/pitexit.wav",
+        "car_behind_closing": "audio/carbehindclosing.wav",
+        "car_still_there": "audio/carstillthere.wav",
     }
 
     def __init__(self, config: dict):
@@ -578,13 +780,16 @@ class Spotter:
     - Session flag transitions (yellow, blue, black, white, red, checkered)
     - Track wetness transitions (slippery surface alert)
     - Pit road transitions (pit entry and pit exit)
+    - Car behind closing (lap-time delta comparison)
 
     Usage:
         spotter = Spotter(config)
         # Each tick:
         spotter.update(car_left_right=1, is_on_track=True, track_surface=3,
                        fuel_laps_remaining=5.2, session_flags=0x04,
-                       incidents=0, on_pit_road=False)
+                       incidents=0, on_pit_road=False,
+                       car_behind_gap=-3.5, car_behind_lap_time=91.2,
+                       player_last_lap_time=92.5)
         # On reconnect:
         spotter.reset()
     """
@@ -622,6 +827,7 @@ class Spotter:
         self._enabled = spotter_config.get("enabled", True)
         self._detector = ProximityDetector(config)
         self._player = SpotterAudioPlayer(config)
+        self._car_behind_tracker = CarBehindTracker(config)
         self._config = config
 
         # Fuel alert state: track which alerts have been fired
@@ -667,6 +873,9 @@ class Spotter:
         session_state: int = 0,
         incidents: int = 0,
         on_pit_road: bool = False,
+        car_behind_gap: float = 0.0,
+        car_behind_lap_time: float = -1.0,
+        player_last_lap_time: float = -1.0,
     ):
         """Process a telemetry tick.
 
@@ -688,6 +897,12 @@ class Spotter:
             incidents: Player's incident points (1x, 2x, 4x). Alert fires on increases.
             on_pit_road: iRacing OnPitRoad boolean. Alert fires on transitions
                 (entering or exiting pit road).
+            car_behind_gap: Gap in seconds to the car directly behind (negative
+                = behind player). 0 = no car behind.
+            car_behind_lap_time: Last lap time of the car directly behind.
+                -1.0 = no data available.
+            player_last_lap_time: Player's last completed lap time.
+                -1.0 = no completed lap yet.
         """
         if not self._enabled:
             return
@@ -886,9 +1101,55 @@ class Spotter:
             self._confirmed_on_pit_road = on_pit_road_confirmed
             self._prev_on_pit_road = on_pit_road_confirmed
 
+        # --- Car behind closing alert ---
+        # Detects when the car directly behind is consistently running faster
+        # laps than the player (closing the gap). Uses lap-time comparison
+        # rather than CarDistBehind derivative for noise immunity.
+        # Only active when on track, racing, and with valid lap data.
+        if (
+            is_on_track
+            and self._race_started
+            and car_behind_gap < 0  # negative = behind player
+            and player_last_lap_time > 0
+            and car_behind_lap_time > 0
+        ):
+            abs_gap = abs(car_behind_gap)
+            is_yellow = bool(
+                session_flags
+                & (
+                    self.FLAG_YELLOW
+                    | self.FLAG_CAUTION
+                    | self.FLAG_CAUTION_WAVING
+                    | self.FLAG_YELLOW_WAVING
+                )
+            )
+            car_is_faster = car_behind_lap_time < player_last_lap_time
+            self._car_behind_tracker.update(
+                gap_seconds=abs_gap,
+                car_behind_faster=car_is_faster,
+                is_yellow=is_yellow,
+                current_time=time.monotonic(),
+            )
+            if self._car_behind_tracker.should_alert(current_time=time.monotonic()):
+                self._player.play("car_behind_closing")
+                logger.info(
+                    f"Car behind closing: gap={abs_gap:.1f}s, "
+                    f"their_lap={car_behind_lap_time:.1f}s, "
+                    f"our_lap={player_last_lap_time:.1f}s"
+                )
+        elif car_behind_gap >= 0:
+            # No car behind — reset tracker
+            self._car_behind_tracker.update(
+                gap_seconds=0.0,
+                car_behind_faster=False,
+                is_yellow=False,
+                current_time=time.monotonic(),
+            )
+
     def reset(self):
         """Reset spotter state (on session start/reconnect)."""
         self._detector.reset()
+        self._car_behind_tracker.reset()
         for threshold in self._fuel_alerts_fired:
             self._fuel_alerts_fired[threshold] = False
         self._prev_flags = None

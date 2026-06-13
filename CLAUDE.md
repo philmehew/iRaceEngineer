@@ -19,7 +19,7 @@ F10 key or wheel button (hold) → stt_client.py (mic → Whisper) → transcrib
 - **context_builder.py** — condenses state into ~0.2-2KB prompt at 3 depth levels (minimal/medium/full)
 - **llm_client.py** — OpenAI-compatible API caller, works with Ollama Cloud, OpenAI, LM Studio, etc.
 - **action_executor.py** — parses [ACTION] directives from LLM responses, dry_run by default (v1)
-- **spotter.py** — deterministic real-time audio calls for car proximity (car left/right, three wide, clear) using pre-recorded WAV files; no LLM involved
+- **spotter.py** — deterministic real-time audio calls for car proximity (car left/right, three wide, clear) and car-behind-closing alerts using pre-recorded WAV files; no LLM involved
 - **stt_client.py** — speech-to-text via faster-whisper + sounddevice mic capture, push-to-talk
 - **tts_client.py** — text-to-speech via Piper TTS + sounddevice playback, configurable output device
 - **capture.py** — record/replay telemetry JSON for testing without iRacing
@@ -35,7 +35,8 @@ F10 key or wheel button (hold) → stt_client.py (mic → Whisper) → transcrib
 - **Voice is optional** — voice deps in `[voice]` extra (`uv sync --extra voice`), graceful degradation if not installed
 - **Wheel button is optional** — pygame in `[wheel]` extra (`uv sync --extra wheel`), for push-to-talk via steering wheel button instead of keyboard F10
 - **Voice tested independently** — `test_stt.py` and `test_tts.py` are standalone scripts for testing each component
-- **Spotter is local and deterministic** — reads CarLeftRight telemetry at 30Hz, plays pre-recorded WAV files on transitions (car appears/clears alongside). No LLM involved. Edge-detection with cooldown timers prevents repeated calls. Uses sounddevice.OutputStream (not sd.play) to avoid conflicting with TTS.
+- **Spotter is local and deterministic** — reads CarLeftRight telemetry at 30Hz, plays pre-recorded WAV files on transitions (car appears/clears alongside). Also detects car-behind-closing using lap-time delta comparison (not noisy CarDistBehind derivative). No LLM involved. Edge-detection with cooldown timers prevents repeated calls. Uses sounddevice.OutputStream (not sd.play) to avoid conflicting with TTS.
+- **Still-there reminder** — when a car has been alongside continuously for more than `still_there_delay_ms` (default 5000ms), plays `carstillthere.wav` as a reminder. Repeats every `still_there_cooldown_ms` (default 10000ms) while the car remains alongside. Resets when the car clears.
 
 ## Tech Stack
 
@@ -87,8 +88,8 @@ Located in `tests/sample_data/` — 10 snapshots simulating a Spa 24h race stint
 
 - Config: `config.yaml`
 - Wheel button test: `test_wheel.py`
-- Spotter audio: `audio/` (carleft.wav, carright.wav, carthreewide.wav, carclear.wav)
+- Spotter audio: `audio/` (carleft.wav, carright.wav, carthreewide.wav, carclear.wav, carstillthere.wav, carbehindclosing.wav, plus flag/penalty/fuel/pit WAVs)
 - Sample data: `tests/sample_data/session_*`
-- Tests: `tests/test_modules.py`, `tests/test_spotter.py`
+- Tests: `tests/test_modules.py`, `tests/test_spotter.py` (ProximityDetector, CarBehindTracker, Spotter coordinator, SpotterAudioPlayer)
 - Plan file: `C:\Users\phil\.claude\plans\can-you-review-these-pure-crayon.md`
 - Spec notes: `specnotes.md`
