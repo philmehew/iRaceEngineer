@@ -404,9 +404,10 @@ class SpotterAudioPlayer:
         "fuel_two_laps": "audio/fueltwolaps.wav",
         "fuel_one_lap": "audio/fuelonelap.wav",
         "flag_yellow": "audio/flagyellow.wav",
+        "flag_yellow_waving": "audio/flagyellowwaving.wav",
         "flag_blue": "audio/flagblue.wav",
         "flag_black": "audio/flagblack.wav",
-        "flagfurledblack": "audio/flagfurledblack.wav",
+        "flag_black_furled": "audio/flagblackfurled.wav",
         "flag_white": "audio/flagwhite.wav",
         "flag_red": "audio/flagred.wav",
         "flag_checkered": "audio/flagchequered.wav",
@@ -597,6 +598,7 @@ class Spotter:
     FLAG_BLUE = 0x0020
     FLAG_DEBRIS = 0x0040
     FLAG_CROSSED = 0x0080
+    FLAG_YELLOW_WAVING = 0x0100
     FLAG_CAUTION = 0x4000
     FLAG_CAUTION_WAVING = 0x8000
     FLAG_BLACK = 0x010000
@@ -776,6 +778,9 @@ class Spotter:
             if rising & self.FLAG_CAUTION_WAVING:
                 self._player.play("flag_yellow")
                 logger.info("Flag alert: caution waving (yellow)")
+            if rising & self.FLAG_YELLOW_WAVING:
+                self._player.play("flag_yellow_waving")
+                logger.info("Flag alert: yellow waving")
             if rising & self.FLAG_BLUE and self._race_started:
                 self._player.play("flag_blue")
                 logger.info("Flag alert: blue flag")
@@ -786,7 +791,7 @@ class Spotter:
                 self._player.play("flag_black")
                 logger.info("Flag alert: disqualify flag")
             if rising & self.FLAG_FURLED:
-                self._player.play("flagfurledblack")
+                self._player.play("flag_black_furled")
                 logger.info("Flag alert: furled black flag (warning)")
             if rising & self.FLAG_WHITE:
                 self._player.play("flag_white")
