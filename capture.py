@@ -276,6 +276,13 @@ def create_sample_data(output_dir: str) -> str:
                         },
                     ]
                 },
+                "SplitTimeInfo": {
+                    "Sectors": [
+                        {"SectorNum": 1, "SectorStartPct": 0.0},
+                        {"SectorNum": 2, "SectorStartPct": 0.3333},
+                        {"SectorNum": 3, "SectorStartPct": 0.6667},
+                    ]
+                },
             },
             "telemetry": {
                 # Session
@@ -360,6 +367,7 @@ def create_sample_data(output_dir: str) -> str:
                 "CarIdxClassPosition": [1, 1, 2, 2, 3, 3, 4],
                 "CarIdxLap": [lap, lap, lap, lap, lap, lap, lap],
                 "CarIdxLapDistPct": [0.52, 0.50, 0.49, 0.46, 0.44, 0.41, 0.38],
+                "CarIdxTrackSurface": [2, 2, 2, 2, 2, 2, 2],  # 2 = on track
                 "CarIdxOnPitRoad": [False, False, False, False, False, False, False],
                 "CarIdxBestLapTime": [91.8, 92.0, 92.1, 92.3, 92.5, 92.7, 93.0],
                 "CarIdxLastLapTime": [

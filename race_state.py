@@ -189,6 +189,233 @@ class LapRecord:
 
 
 @dataclass
+class SectorBoundaries:
+    """Sector boundary definitions from iRacing's SplitTimeInfo."""
+
+    sector_boundaries: list[float] = field(default_factory=list)
+    # Sorted list of boundary percentages including 0.0.
+    # e.g. [0.0, 0.3333, 0.6667] means:
+    #   Sector 1: 0.0 → 0.3333
+    #   Sector 2: 0.3333 → 0.6667
+    #   Sector 3: 0.6667 → 1.0 (wraps back to 0.0)
+
+    num_sectors: int = 0
+
+
+@dataclass
+class CarSectorState:
+    """Per-car sector tracking state."""
+
+    car_idx: int = 0
+    prev_lap_dist_pct: float = -1.0  # Previous tick's LapDistPct (-1 = no prior tick)
+    sector_enter_time: dict[int, float] = field(default_factory=dict)
+    # sector_num (1-based) -> SessionTime when car entered this sector
+    fastest_sector_times: dict[int, float] = field(default_factory=dict)
+    # sector_num (1-based) -> fastest time in seconds
+
+
+class SectorTimeTracker:
+    """Tracks fastest sector times per car by monitoring CarIdxLapDistPct
+    boundary crossings against sector definitions from SplitTimeInfo.
+
+    Called each tick with the telemetry arrays. Detects when a car crosses
+    a sector boundary, records SessionTime at each crossing, and computes
+    per-sector elapsed times.
+    """
+
+    MAX_SECTOR_TIME = 300.0  # Sanity cap: ignore sectors > 5 minutes
+    LARGE_JUMP_THRESHOLD = 0.5  # % of lap: jump > this without wraparound = reset
+
+    def __init__(self):
+        self.boundaries: SectorBoundaries | None = None
+        self._car_states: dict[int, CarSectorState] = {}
+
+    def set_boundaries(self, sector_start_pcts: list[float]):
+        """Set sector boundaries from SplitTimeInfo.
+
+        Args:
+            sector_start_pcts: Sorted list of sector start percentages,
+                including 0.0. e.g. [0.0, 0.3333, 0.6667]
+        """
+        if not sector_start_pcts or len(sector_start_pcts) < 2:
+            return
+
+        new_boundaries = sorted(sector_start_pcts)
+        # Skip if boundaries haven't changed — avoids logging and resetting
+        # car states every tick (session_info always has SplitTimeInfo)
+        if (
+            self.boundaries is not None
+            and self.boundaries.sector_boundaries == new_boundaries
+        ):
+            return
+
+        self.boundaries = SectorBoundaries(
+            sector_boundaries=new_boundaries,
+            num_sectors=len(sector_start_pcts),
+        )
+        # Reset all car states when boundaries change (new session etc.)
+        self._car_states.clear()
+        logger.info(
+            f"Sector boundaries loaded: {self.boundaries.sector_boundaries} "
+            f"({self.boundaries.num_sectors} sectors)"
+        )
+
+    def update(
+        self,
+        lap_dist_pcts: list | tuple,
+        session_time: float,
+        track_surfaces: list | tuple,
+        on_pit_roads: list | tuple,
+        positions: list | tuple,
+    ):
+        """Process all cars each tick. Detect boundary crossings, compute sector times.
+
+        Args:
+            lap_dist_pcts: CarIdxLapDistPct array
+            session_time: SessionTime float
+            track_surfaces: CarIdxTrackSurface array
+            on_pit_roads: CarIdxOnPitRoad array (bool-ish)
+            positions: CarIdxPosition array
+        """
+        if not self.boundaries or session_time <= 0:
+            return
+
+        num_cars = len(lap_dist_pcts) if isinstance(lap_dist_pcts, (list, tuple)) else 0
+
+        for i in range(num_cars):
+            pos = positions[i] if i < len(positions) else 0
+            if not isinstance(pos, (int, float)) or pos <= 0:
+                continue  # Skip disconnected/invalid cars
+
+            pct = lap_dist_pcts[i] if i < len(lap_dist_pcts) else -1.0
+            try:
+                pct = float(pct)
+            except (TypeError, ValueError):
+                continue
+
+            surface = track_surfaces[i] if i < len(track_surfaces) else 0
+            in_pits = bool(on_pit_roads[i]) if i < len(on_pit_roads) else False
+
+            # Get or create car state
+            if i not in self._car_states:
+                self._car_states[i] = CarSectorState(car_idx=i)
+            car_state = self._car_states[i]
+
+            # Car off track (LapDistPct == -1) or in pits: skip and reset
+            if pct < 0 or in_pits or surface != 2:
+                car_state.prev_lap_dist_pct = -1.0
+                car_state.sector_enter_time.clear()
+                continue
+
+            # First tick for this car: just record position, no crossing detection
+            if car_state.prev_lap_dist_pct < 0:
+                car_state.prev_lap_dist_pct = pct
+                # Record entry time for the sector the car is currently in
+                current_sector = self._get_sector_for_pct(pct)
+                if current_sector not in car_state.sector_enter_time:
+                    car_state.sector_enter_time[current_sector] = session_time
+                continue
+
+            prev_pct = car_state.prev_lap_dist_pct
+
+            # Detect lap wraparound: prev near 1.0, curr near 0.0
+            wrapped = prev_pct > 0.5 and pct < 0.5
+
+            # Detect large jump without wraparound (disconnection etc.)
+            if not wrapped and abs(pct - prev_pct) > self.LARGE_JUMP_THRESHOLD:
+                car_state.prev_lap_dist_pct = pct
+                car_state.sector_enter_time.clear()
+                current_sector = self._get_sector_for_pct(pct)
+                car_state.sector_enter_time[current_sector] = session_time
+                continue
+
+            if wrapped:
+                # Split into two ranges: prev→1.0, then 0.0→curr
+                self._check_range(car_state, prev_pct, 1.0, session_time)
+                self._check_range(car_state, 0.0, pct, session_time)
+            else:
+                self._check_range(car_state, prev_pct, pct, session_time)
+
+            car_state.prev_lap_dist_pct = pct
+
+    def get_fastest_sectors(self, car_idx: int) -> dict[int, float]:
+        """Return {sector_num: fastest_time} for a car. Empty dict if no data."""
+        state = self._car_states.get(car_idx)
+        if not state:
+            return {}
+        return {k: v for k, v in state.fastest_sector_times.items() if v > 0}
+
+    def _get_sector_for_pct(self, pct: float) -> int:
+        """Return 1-based sector number for a given lap distance percentage."""
+        assert self.boundaries is not None
+        boundaries = self.boundaries.sector_boundaries
+        # Boundaries: [0.0, b1, b2, ...]
+        # Sector 1: 0.0 <= pct < b1
+        # Sector 2: b1 <= pct < b2
+        # ...
+        # Sector N: b_{N-1} <= pct < 1.0
+        for i in range(1, len(boundaries)):
+            if pct < boundaries[i]:
+                return i
+        return len(boundaries)  # Last sector
+
+    def _check_range(
+        self,
+        car_state: CarSectorState,
+        from_pct: float,
+        to_pct: float,
+        session_time: float,
+    ):
+        """Check if any sector boundary was crossed between from_pct and to_pct."""
+        assert self.boundaries is not None
+        boundaries = self.boundaries.sector_boundaries
+        for i, boundary_pct in enumerate(boundaries):
+            if from_pct < boundary_pct <= to_pct:
+                # Car crossed this boundary — entering sector (i+1)
+                self._on_boundary_crossed(car_state, i + 1, session_time)
+
+        # Also check the implicit boundary at 1.0 (start/finish = sector 1)
+        # Only relevant if the range goes from <1.0 to exactly 1.0
+        # (the wraparound case handles 0.98→0.02 via the split-range logic)
+        if from_pct < 1.0 <= to_pct:
+            self._on_boundary_crossed(car_state, 1, session_time)
+
+    def _on_boundary_crossed(
+        self, car_state: CarSectorState, entering_sector: int, session_time: float
+    ):
+        """Handle a sector boundary crossing.
+
+        Args:
+            entering_sector: 1-based sector number being ENTERED.
+        """
+        # The sector we just completed is the one before the entering sector
+        if self.boundaries is None:
+            return
+
+        num_sectors = self.boundaries.num_sectors
+        completed_sector = entering_sector - 1 if entering_sector > 1 else num_sectors
+
+        # Compute the time for the completed sector
+        if completed_sector in car_state.sector_enter_time:
+            enter_time = car_state.sector_enter_time[completed_sector]
+            sector_time = session_time - enter_time
+
+            if 0 < sector_time < self.MAX_SECTOR_TIME:
+                current_best = car_state.fastest_sector_times.get(
+                    completed_sector, -1.0
+                )
+                if current_best < 0 or sector_time < current_best:
+                    car_state.fastest_sector_times[completed_sector] = sector_time
+                    logger.debug(
+                        f"Car {car_state.car_idx} new best S{completed_sector}: "
+                        f"{sector_time:.3f}s"
+                    )
+
+        # Record entry time for the sector we're now entering
+        car_state.sector_enter_time[entering_sector] = session_time
+
+
+@dataclass
 class DriverState:
     """Per-driver state — used for the player, teammates, AND nearby cars.
 
@@ -401,6 +628,7 @@ class RaceState:
         self.team_drivers: dict[int, DriverState] = {}  # car_idx -> DriverState
         self.nearby_cars: list[DriverState] = []  # Cars near the player
         self.standings: list[dict] = []  # All cars, basic info
+        self.sector_tracker = SectorTimeTracker()
 
         # Internal tracking for lap detection
         self._last_lap_completed: int = -1
@@ -504,6 +732,18 @@ class RaceState:
 
         # Update nearby cars / standings
         self._update_standings(telemetry)
+
+        # Update sector time tracking (all cars)
+        if self.sector_tracker.boundaries:
+            session_time = float(telemetry.get("SessionTime", 0.0))
+            if session_time > 0:
+                self.sector_tracker.update(
+                    lap_dist_pcts=telemetry.get("CarIdxLapDistPct", []),
+                    session_time=session_time,
+                    track_surfaces=telemetry.get("CarIdxTrackSurface", []),
+                    on_pit_roads=telemetry.get("CarIdxOnPitRoad", []),
+                    positions=telemetry.get("CarIdxPosition", []),
+                )
 
         # Check for lap completion (to record lap history)
         self._check_lap_completion(telemetry)
@@ -622,6 +862,35 @@ class RaceState:
             self.session.est_lap_time = float(
                 driver_info.get("DriverCarEstLapTime", 0.0)
             )
+
+            # Sector boundaries from SplitTimeInfo (if available),
+            # otherwise fall back to equal-thirds
+            if not self.sector_tracker.boundaries:
+                split_info = session_info.get("SplitTimeInfo")
+                if split_info:
+                    sectors = split_info.get("Sectors", [])
+                    if sectors:
+                        boundaries = [0.0]  # Always include start/finish
+                        for sector in sectors:
+                            # Try known field names for the sector start percentage
+                            pct = sector.get(
+                                "SectorStartPct",
+                                sector.get(
+                                    "SectorStartLapPct", sector.get("LapPct", -1)
+                                ),
+                            )
+                            if (
+                                isinstance(pct, (int, float))
+                                and 0 <= pct <= 1
+                                and pct not in boundaries
+                            ):
+                                boundaries.append(float(pct))
+                        boundaries.sort()
+                        if len(boundaries) >= 2:
+                            self.sector_tracker.set_boundaries(boundaries)
+                if not self.sector_tracker.boundaries:
+                    # Fallback: equal-thirds (S1: 0–33%, S2: 33–67%, S3: 67–100%)
+                    self.sector_tracker.set_boundaries([0.0, 1.0 / 3.0, 2.0 / 3.0])
 
     def _update_player(self, telemetry: dict, units: dict | None = None):
         """Update player car state from telemetry.
@@ -1518,6 +1787,9 @@ class RaceState:
                 "tire_sets_available": self.player.tire_sets_available,
                 "tire_sets_used": self.player.tire_sets_used,
                 "tire_compound": self.player.tire_compound,
+                "fastest_sector_times": self.sector_tracker.get_fastest_sectors(
+                    self.player.car_idx
+                ),
             },
             "nearby_cars": [
                 {
@@ -1536,6 +1808,9 @@ class RaceState:
                     "track_surface": car.track_surface,
                     "rpm": car.rpm,
                     "gear": car.gear,
+                    "fastest_sector_times": self.sector_tracker.get_fastest_sectors(
+                        car.car_idx
+                    ),
                 }
                 for car in self.nearby_cars
             ],

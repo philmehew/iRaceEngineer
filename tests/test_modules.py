@@ -5,6 +5,7 @@ from race_state import (
     DriverState,
     TyreState,
     LapRecord,
+    SectorTimeTracker,
     FLAG_GREEN,
     FLAG_YELLOW,
 )
@@ -106,6 +107,8 @@ def sample_telemetry(lap=10, fuel=72.0, flags=4):
         "CarIdxP2P_Status": [0, 0, 1, 0],
         "CarIdxP2P_Count": [2, 4, 1, 3],
         "CarIdxTireCompound": [0, 0, 1, 0],
+        "CarIdxTrackSurface": [2, 2, 2, 2],  # 2 = on track
+        "SessionTime": 900.0 + lap * 90,
         "PlayerCarMyIncidentCount": 0,
         "PlayerCarTeamIncidentCount": 2,
         "CarDistAhead": 2.1,
@@ -199,6 +202,13 @@ def sample_session_info():
                     "CurDriverIncidentCount": 2,
                 },
             ],
+        },
+        "SplitTimeInfo": {
+            "Sectors": [
+                {"SectorNum": 1, "SectorStartPct": 0.0},
+                {"SectorNum": 2, "SectorStartPct": 0.3333},
+                {"SectorNum": 3, "SectorStartPct": 0.6667},
+            ]
         },
     }
 
@@ -645,3 +655,192 @@ class TestDriverState:
         assert nearby.fuel_level == 0.0  # Not available for other cars
         assert len(player.tyres) == 1
         assert len(nearby.tyres) == 0
+
+
+# --- SectorTimeTracker tests ---
+
+
+class TestSectorTimeTracker:
+    """Tests for sector boundary crossing detection and fastest time tracking."""
+
+    def test_set_boundaries(self):
+        tracker = SectorTimeTracker()
+        tracker.set_boundaries([0.0, 0.3333, 0.6667])
+        assert tracker.boundaries is not None
+        assert tracker.boundaries.num_sectors == 3
+        assert tracker.boundaries.sector_boundaries == [0.0, 0.3333, 0.6667]
+
+    def test_set_boundaries_too_few(self):
+        """Setting boundaries with < 2 entries is ignored."""
+        tracker = SectorTimeTracker()
+        tracker.set_boundaries([0.0])
+        assert tracker.boundaries is None
+
+    def test_get_sector_for_pct(self):
+        tracker = SectorTimeTracker()
+        tracker.set_boundaries([0.0, 0.3333, 0.6667])
+        # Sector 1: 0.0 <= pct < 0.3333
+        assert tracker._get_sector_for_pct(0.0) == 1
+        assert tracker._get_sector_for_pct(0.1) == 1
+        assert tracker._get_sector_for_pct(0.3332) == 1
+        # Sector 2: 0.3333 <= pct < 0.6667
+        assert tracker._get_sector_for_pct(0.3333) == 2
+        assert tracker._get_sector_for_pct(0.5) == 2
+        assert tracker._get_sector_for_pct(0.6666) == 2
+        # Sector 3: 0.6667 <= pct < 1.0
+        assert tracker._get_sector_for_pct(0.6667) == 3
+        assert tracker._get_sector_for_pct(0.9) == 3
+
+    def test_first_tick_baseline_only(self):
+        """First tick records position but doesn't compute sector times."""
+        tracker = SectorTimeTracker()
+        tracker.set_boundaries([0.0, 0.3333, 0.6667])
+        tracker.update(
+            lap_dist_pcts=[0.1],
+            session_time=10.0,
+            track_surfaces=[2],
+            on_pit_roads=[0],
+            positions=[1],
+        )
+        # No sector times yet — just baselined the car position
+        assert tracker.get_fastest_sectors(0) == {}
+
+    def test_boundary_crossing_detects_sector_time(self):
+        """Car crosses a sector boundary → sector time is computed."""
+        tracker = SectorTimeTracker()
+        tracker.set_boundaries([0.0, 0.3333, 0.6667])
+
+        # Tick 1: Car at 0.1 (sector 1), session time 10.0
+        tracker.update(
+            lap_dist_pcts=[0.1],
+            session_time=10.0,
+            track_surfaces=[2],
+            on_pit_roads=[0],
+            positions=[1],
+        )
+        # Tick 2: Car at 0.4 (crossed boundary at 0.3333, now in sector 2)
+        tracker.update(
+            lap_dist_pcts=[0.4],
+            session_time=38.5,
+            track_surfaces=[2],
+            on_pit_roads=[0],
+            positions=[1],
+        )
+
+        # Sector 1 time should be ~28.5s (38.5 - 10.0)
+        sectors = tracker.get_fastest_sectors(0)
+        assert 1 in sectors
+        assert abs(sectors[1] - 28.5) < 0.5
+
+    def test_multiple_sectors(self):
+        """Car completes all three sectors in a lap."""
+        tracker = SectorTimeTracker()
+        tracker.set_boundaries([0.0, 0.3333, 0.6667])
+
+        # Tick 1: baseline at 0.1
+        tracker.update([0.1], 10.0, [2], [0], [1])
+        # Tick 2: crosses S1 boundary at 0.3333
+        tracker.update([0.4], 38.5, [2], [0], [1])
+        # Tick 3: crosses S2 boundary at 0.6667
+        tracker.update([0.8], 70.0, [2], [0], [1])
+
+        sectors = tracker.get_fastest_sectors(0)
+        assert 1 in sectors
+        assert abs(sectors[1] - 28.5) < 0.5
+        assert 2 in sectors
+        assert abs(sectors[2] - 31.5) < 0.5
+
+    def test_lap_wraparound(self):
+        """Car wraps from end of lap to start of new lap (0.98 → 0.05)."""
+        tracker = SectorTimeTracker()
+        tracker.set_boundaries([0.0, 0.3333, 0.6667])
+
+        # Build up some state
+        tracker.update([0.8], 10.0, [2], [0], [1])
+        # Car approaches end of lap
+        tracker.update([0.95], 15.0, [2], [0], [1])
+        # Car wraps around (crosses start/finish = boundary 0.0)
+        tracker.update([0.05], 22.0, [2], [0], [1])
+
+        # Sector 3 time should be computed (~12s from 10.0 to 22.0 minus
+        # time spent before entering sector 3)
+        sectors = tracker.get_fastest_sectors(0)
+        # The exact value depends on which sector the car was in,
+        # but sector 3 should have been completed
+        assert 3 in sectors
+        assert sectors[3] > 0
+
+    def test_car_in_pits_ignored(self):
+        """Car on pit road doesn't trigger sector crossings."""
+        tracker = SectorTimeTracker()
+        tracker.set_boundaries([0.0, 0.3333, 0.6667])
+
+        # Baseline
+        tracker.update([0.1], 10.0, [2], [0], [1])
+        # Car enters pits
+        tracker.update([0.4], 38.5, [2], [1], [1])
+        sectors = tracker.get_fastest_sectors(0)
+        # No sector time — was in pits when boundary was crossed
+        assert 1 not in sectors
+
+    def test_car_off_track_ignored(self):
+        """Car with LapDistPct == -1 (off track) is skipped."""
+        tracker = SectorTimeTracker()
+        tracker.set_boundaries([0.0, 0.3333, 0.6667])
+
+        # Baseline
+        tracker.update([0.1], 10.0, [2], [0], [1])
+        # Car goes off track
+        tracker.update([-1.0], 38.5, [0], [0], [1])
+        # Car comes back on track at different position
+        tracker.update([0.5], 50.0, [2], [0], [1])
+        # No sector time from the off-track period
+        sectors = tracker.get_fastest_sectors(0)
+        assert 1 not in sectors
+
+    def test_fastest_sector_updates(self):
+        """Completing a sector faster than previous best updates it."""
+        tracker = SectorTimeTracker()
+        tracker.set_boundaries([0.0, 0.3333, 0.6667])
+
+        # Lap 1: S1 = 30s
+        tracker.update([0.1], 10.0, [2], [0], [1])
+        tracker.update([0.4], 40.0, [2], [0], [1])
+
+        # Continue lap 1: complete S2, S3 and wrap to start new lap
+        tracker.update([0.8], 70.0, [2], [0], [1])
+        tracker.update([0.95], 85.0, [2], [0], [1])
+        # Cross start/finish into new lap
+        tracker.update([0.05], 100.0, [2], [0], [1])
+
+        # Lap 2: S1 = 28s (faster than the ~30s from lap 1)
+        tracker.update([0.4], 128.0, [2], [0], [1])
+
+        sectors = tracker.get_fastest_sectors(0)
+        assert 1 in sectors
+        # The fastest S1 should be ~28s (128.0 - 100.0)
+        assert abs(sectors[1] - 28.0) < 1.0  # Faster time wins
+
+    def test_invalid_position_skipped(self):
+        """Car with position <= 0 is skipped (disconnected)."""
+        tracker = SectorTimeTracker()
+        tracker.set_boundaries([0.0, 0.3333, 0.6667])
+
+        tracker.update([0.1], 10.0, [2], [0], [0])  # pos=0 → invalid
+        assert 0 not in tracker._car_states
+
+    def test_get_fastest_sectors_empty(self):
+        """No data for unknown car returns empty dict."""
+        tracker = SectorTimeTracker()
+        assert tracker.get_fastest_sectors(99) == {}
+
+    def test_snapshot_includes_sector_times(self):
+        """get_snapshot() includes fastest_sector_times for player and nearby cars."""
+        state = make_state()
+        # After update, sector_tracker should have boundaries from SplitTimeInfo
+        assert state.sector_tracker.boundaries is not None
+        snap = state.get_snapshot()
+        assert "fastest_sector_times" in snap["player"]
+        assert isinstance(snap["player"]["fastest_sector_times"], dict)
+        for car in snap["nearby_cars"]:
+            assert "fastest_sector_times" in car

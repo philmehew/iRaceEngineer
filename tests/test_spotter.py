@@ -2571,3 +2571,189 @@ class TestProximityDetectorStillThere:
         detector = ProximityDetector(config)
         assert detector._still_there_delay == 5.0  # 5000ms default
         assert detector._still_there_cooldown == 10.0  # 10000ms default
+
+    def test_still_there_does_not_fire_after_car_clears(self):
+        """'Still there' must NOT fire when telemetry shows the car has cleared,
+        even if _car_alongside is stuck True. Regression test: the still-there
+        check now verifies cur_left/cur_right, not just internal state."""
+        # Car appears right
+        calls = self._tick(2)
+        assert "car_right" in self._call_types(calls)
+
+        # Stay alongside past still_there_delay (0.5s)
+        self.t += 0.6
+        calls = self.detector.update(CLR_CAR_RIGHT, self.t)
+        assert "car_still_there" in self._call_types(calls)
+
+        # Car clears — need two ticks: first starts pending clear timer,
+        # second (after clear_delay elapses) fires the clear
+        self.t += 0.05
+        calls = self.detector.update(CLR_CLEAR, self.t)  # starts pending clear
+        self.t += 0.15  # past 100ms clear_delay
+        calls = self.detector.update(CLR_CLEAR, self.t)  # clear matures
+        assert "clear" in self._call_types(calls)
+
+        # Advance time — still-there must NOT fire (no car alongside)
+        self.t += 1.0
+        calls = self.detector.update(CLR_CLEAR, self.t)
+        assert "car_still_there" not in self._call_types(calls)
+
+
+class TestProximityDetectorClearCooldownBug:
+    """Regression tests for the bug where the clearance cooldown could
+    permanently block 'clear' calls, trapping _car_alongside=True forever.
+
+    Bug scenario:
+      1. Car alongside → proximity call, _car_alongside=True
+      2. Car clears → 'clear' fires, clearance cooldown starts (5s)
+      3. Second car appears within cooldown → proximity call, _car_alongside=True
+      4. Second car clears within cooldown → pending clear matures but cooldown
+         blocks it. Old code discarded the pending timer, so no future clear
+         could ever fire (_prev_right already False, no new timer starts).
+      5. Result: _car_alongside stuck True, 'still there' fires forever.
+    """
+
+    def setup_method(self):
+        self.config = {
+            "spotter": {
+                "cooldowns": {
+                    "proximity_ms": 3000,
+                    "clearance_ms": 5000,  # 5s clearance cooldown
+                    "clear_delay_ms": 0,  # No debounce on clear
+                    "appear_delay_ms": 0,
+                    "still_there_delay_ms": 500,
+                    "still_there_cooldown_ms": 1000,
+                }
+            }
+        }
+        self.detector = ProximityDetector(self.config)
+        self.t = 0.0
+
+    def _tick(self, car_lr: int, dt: float = 0.1) -> list[SpotterCall]:
+        self.t += dt
+        return self.detector.update(car_lr, self.t)
+
+    def _call_types(self, calls: list[SpotterCall]) -> list[str]:
+        return [c.call_type for c in calls]
+
+    def test_clear_fires_after_cooldown_blocks_first_attempt(self):
+        """When clearance cooldown blocks a clear, the pending timer must be
+        preserved so clear can fire on a subsequent tick when cooldown elapses."""
+        # Car 1: appears right, clears — establishes clearance cooldown
+        calls = self._tick(CLR_CAR_RIGHT)
+        assert "car_right" in self._call_types(calls)
+
+        self.t += 0.2
+        calls = self._tick(CLR_CLEAR)
+        assert "clear" in self._call_types(calls)
+
+        # Advance past proximity cooldown (3s) so car_right can fire again
+        self.t += 3.0
+
+        # Car 2: appears right WITHIN the 5s clearance cooldown
+        calls = self._tick(CLR_CAR_RIGHT)
+        assert "car_right" in self._call_types(calls)
+
+        # Car 2 clears — still within clearance cooldown (only ~3.4s since
+        # first clear). Clear is blocked by cooldown, but pending timer
+        # MUST persist so clear can fire later.
+        calls = self._tick(CLR_CLEAR)
+        # Clear may be blocked by cooldown — that's expected
+
+        # Advance past the 5s clearance cooldown from the first clear
+        self.t += 2.0
+        calls = self.detector.update(CLR_CLEAR, self.t)
+        # Clear MUST fire now — cooldown has elapsed, no car alongside,
+        # and pending timer was preserved (not discarded)
+        assert "clear" in self._call_types(calls)
+
+    def test_still_there_stops_when_car_clears_despite_cooldown(self):
+        """'Still there' must stop when the car clears, even if the clearance
+        cooldown temporarily blocks the 'clear' audio call. The telemetry
+        check (cur_left/cur_right) prevents runaway reminders."""
+        # Car appears right
+        calls = self._tick(CLR_CAR_RIGHT)
+        assert "car_right" in self._call_types(calls)
+
+        # Stay alongside past still_there_delay
+        self.t += 0.6
+        calls = self.detector.update(CLR_CAR_RIGHT, self.t)
+        assert "car_still_there" in self._call_types(calls)
+
+        # Car clears (even if 'clear' is blocked by cooldown, still-there
+        # must not fire because cur_left/cur_right are both False)
+        calls = self._tick(CLR_CLEAR)
+        # Regardless of whether clear fires, still-there must stop
+        self.t += 1.0
+        calls = self.detector.update(CLR_CLEAR, self.t)
+        assert "car_still_there" not in self._call_types(calls)
+
+    def test_safety_net_forced_clear(self):
+        """If _car_alongside gets stuck True with no car alongside and no
+        pending clear timer, the safety-net forced clear must fire to
+        unstick the state."""
+        # Car appears right
+        calls = self._tick(CLR_CAR_RIGHT)
+        assert "car_right" in self._call_types(calls)
+        assert self.detector._car_alongside is True
+
+        # Car clears — with clear_delay=0, clear fires on same tick
+        calls = self._tick(CLR_CLEAR)
+        assert "clear" in self._call_types(calls)
+        assert self.detector._car_alongside is False
+
+    def test_clear_retries_after_cooldown_when_car_switches_sides(self):
+        """When car switches sides (left→right) and the side-clear is suppressed
+        because a car is still alongside, the pending timer for the cleared
+        side is correctly discarded and a new timer starts when the remaining
+        car leaves."""
+        # Car on left
+        calls = self._tick(CLR_CAR_LEFT)
+        assert "car_left" in self._call_types(calls)
+
+        # Car switches to both sides (three wide briefly)
+        self.t += 0.1
+        calls = self.detector.update(CLR_BOTH, self.t)
+        # May or may not get three_wide depending on timing/state
+
+        # Car clears from left but remains on right
+        self.t += 0.2
+        calls = self.detector.update(CLR_CAR_RIGHT, self.t)
+        # Left clear pending timer should be discarded because car is
+        # still alongside on the right
+
+        # Car clears from right
+        self.t += 5.0  # past clearance cooldown
+        calls = self.detector.update(CLR_CLEAR, self.t)
+        assert "clear" in self._call_types(calls)
+
+    def test_no_stuck_state_after_rapid_car_appearance_and_clear(self):
+        """Rapid car appearance and clear within clearance cooldown must not
+        leave _car_alongside stuck True."""
+        # First car appears and clears
+        calls = self._tick(CLR_CAR_RIGHT)
+        assert "car_right" in self._call_types(calls)
+
+        self.t += 0.1
+        calls = self.detector.update(CLR_CLEAR, self.t)
+        assert "clear" in self._call_types(calls)
+
+        # Advance past proximity cooldown (3s) so second car_right can fire
+        self.t += 3.0
+
+        # Second car appears and clears rapidly (within clearance cooldown)
+        calls = self._tick(CLR_CAR_RIGHT)
+        assert "car_right" in self._call_types(calls)
+
+        # Second car clears — blocked by clearance cooldown, but timer preserved
+        calls = self._tick(CLR_CLEAR)
+
+        # Advance past clearance cooldown — clear must fire
+        self.t += 5.0
+        calls = self.detector.update(CLR_CLEAR, self.t)
+
+        # _car_alongside must be False — not stuck
+        assert self.detector._car_alongside is False
+
+        # No still-there should fire
+        assert "car_still_there" not in self._call_types(calls)

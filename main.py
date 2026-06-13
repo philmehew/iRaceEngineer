@@ -558,48 +558,70 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
         if stt is not None and voice_trigger_method == "keyboard":
             # Push-to-talk: record while key is held, transcribe on release
             _ptt_recording = threading.Event()
+            _ptt_recording_time = [0.0]  # monotonic time when recording started
             _ptt_stop = threading.Event()
 
             def _on_voice_key_down():
                 """Start recording when voice key is pressed."""
                 if _ptt_recording.is_set():
-                    return  # Already recording
+                    # Previous recording still in progress — could be a stuck
+                    # thread. If it's been running >30s, it's stuck; force-clear.
+                    elapsed = time.monotonic() - _ptt_recording_time[0]
+                    if elapsed > 30:
+                        logger.warning(
+                            f"PTT stuck for {elapsed:.0f}s — force-clearing "
+                            f"(previous recording thread likely hung)"
+                        )
+                        _ptt_recording.clear()
+                        _ptt_stop.set()
+                    else:
+                        logger.debug(
+                            f"PTT still recording ({elapsed:.1f}s) — ignoring press"
+                        )
+                        return
                 _ptt_recording.set()
+                _ptt_recording_time[0] = time.monotonic()
                 _ptt_stop.clear()
 
                 def _record_and_query():
                     """Record, transcribe, and query LLM with timing."""
-                    timing_steps = []
-                    logger.info("Voice key pressed — recording...")
-                    t0 = time.monotonic()
-                    audio = stt.record_until_release(
-                        _ptt_stop,
-                        max_duration_s=voice_trigger_config.get(
-                            "max_record_seconds", 15
-                        ),
-                    )
-                    t1 = time.monotonic()
-                    timing_steps.append(("Recording", t1 - t0))
-
-                    text = stt.transcribe(audio)
-                    t2 = time.monotonic()
-                    timing_steps.append(("Transcription", t2 - t1))
-
-                    _ptt_recording.clear()
-                    if text.strip():
-                        logger.info(f"Transcribed: {text}")
-                        handle_button_press(
-                            state,
-                            context_builder,
-                            llm,
-                            executor,
-                            question=text,
-                            tts=tts,
-                            timing_steps=timing_steps,
+                    try:
+                        timing_steps = []
+                        logger.info("Voice key pressed — recording...")
+                        t0 = time.monotonic()
+                        audio = stt.record_until_release(
+                            _ptt_stop,
+                            max_duration_s=voice_trigger_config.get(
+                                "max_record_seconds", 15
+                            ),
                         )
-                    else:
-                        logger.warning("No speech detected — skipping LLM query")
-                        _print_timing_summary(timing_steps, label="Voice (no speech)")
+                        t1 = time.monotonic()
+                        timing_steps.append(("Recording", t1 - t0))
+
+                        text = stt.transcribe(audio)
+                        t2 = time.monotonic()
+                        timing_steps.append(("Transcription", t2 - t1))
+
+                        if text.strip():
+                            logger.info(f"Transcribed: {text}")
+                            handle_button_press(
+                                state,
+                                context_builder,
+                                llm,
+                                executor,
+                                question=text,
+                                tts=tts,
+                                timing_steps=timing_steps,
+                            )
+                        else:
+                            logger.warning("No speech detected — skipping LLM query")
+                            _print_timing_summary(
+                                timing_steps, label="Voice (no speech)"
+                            )
+                    except Exception:
+                        logger.exception("Voice recording/transcription failed")
+                    finally:
+                        _ptt_recording.clear()
 
                 threading.Thread(target=_record_and_query, daemon=True).start()
 
@@ -628,48 +650,70 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
         else:
             # Push-to-talk: record while button is held, transcribe on release
             _ptt_recording = threading.Event()
+            _ptt_recording_time = [0.0]  # monotonic time when recording started
             _ptt_stop = threading.Event()
 
             def _on_voice_button_down():
                 """Start recording when wheel button is pressed."""
                 if _ptt_recording.is_set():
-                    return  # Already recording
+                    # Previous recording still in progress — could be a stuck
+                    # thread. If it's been running >30s, it's stuck; force-clear.
+                    elapsed = time.monotonic() - _ptt_recording_time[0]
+                    if elapsed > 30:
+                        logger.warning(
+                            f"PTT stuck for {elapsed:.0f}s — force-clearing "
+                            f"(previous recording thread likely hung)"
+                        )
+                        _ptt_recording.clear()
+                        _ptt_stop.set()
+                    else:
+                        logger.debug(
+                            f"PTT still recording ({elapsed:.1f}s) — ignoring press"
+                        )
+                        return
                 _ptt_recording.set()
+                _ptt_recording_time[0] = time.monotonic()
                 _ptt_stop.clear()
 
                 def _record_and_query():
                     """Record, transcribe, and query LLM with timing."""
-                    timing_steps = []
-                    logger.info("Wheel button pressed — recording...")
-                    t0 = time.monotonic()
-                    audio = stt.record_until_release(
-                        _ptt_stop,
-                        max_duration_s=voice_trigger_config.get(
-                            "max_record_seconds", 15
-                        ),
-                    )
-                    t1 = time.monotonic()
-                    timing_steps.append(("Recording", t1 - t0))
-
-                    text = stt.transcribe(audio)
-                    t2 = time.monotonic()
-                    timing_steps.append(("Transcription", t2 - t1))
-
-                    _ptt_recording.clear()
-                    if text.strip():
-                        logger.info(f"Transcribed: {text}")
-                        handle_button_press(
-                            state,
-                            context_builder,
-                            llm,
-                            executor,
-                            question=text,
-                            tts=tts,
-                            timing_steps=timing_steps,
+                    try:
+                        timing_steps = []
+                        logger.info("Wheel button pressed — recording...")
+                        t0 = time.monotonic()
+                        audio = stt.record_until_release(
+                            _ptt_stop,
+                            max_duration_s=voice_trigger_config.get(
+                                "max_record_seconds", 15
+                            ),
                         )
-                    else:
-                        logger.warning("No speech detected — skipping LLM query")
-                        _print_timing_summary(timing_steps, label="Voice (no speech)")
+                        t1 = time.monotonic()
+                        timing_steps.append(("Recording", t1 - t0))
+
+                        text = stt.transcribe(audio)
+                        t2 = time.monotonic()
+                        timing_steps.append(("Transcription", t2 - t1))
+
+                        if text.strip():
+                            logger.info(f"Transcribed: {text}")
+                            handle_button_press(
+                                state,
+                                context_builder,
+                                llm,
+                                executor,
+                                question=text,
+                                tts=tts,
+                                timing_steps=timing_steps,
+                            )
+                        else:
+                            logger.warning("No speech detected — skipping LLM query")
+                            _print_timing_summary(
+                                timing_steps, label="Voice (no speech)"
+                            )
+                    except Exception:
+                        logger.exception("Voice recording/transcription failed")
+                    finally:
+                        _ptt_recording.clear()
 
                 threading.Thread(target=_record_and_query, daemon=True).start()
 
@@ -1041,12 +1085,17 @@ def run_replay_mode(
             result = [""]
 
             def _record():
-                result[0] = stt.listen_push_to_talk(
-                    stop_event,
-                    max_duration_s=voice_config.get("trigger", {}).get(
-                        "max_record_seconds", 15
-                    ),
-                )
+                try:
+                    result[0] = stt.listen_push_to_talk(
+                        stop_event,
+                        max_duration_s=voice_config.get("trigger", {}).get(
+                            "max_record_seconds", 15
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Voice recording/transcription failed (replay mode)"
+                    )
 
             rec_thread = threading.Thread(target=_record)
             rec_thread.start()

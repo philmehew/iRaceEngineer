@@ -33,6 +33,13 @@ def format_gap(seconds: float) -> str:
     return f"{sign}{abs(seconds):.3f}s"
 
 
+def format_sector_time(seconds: float) -> str:
+    """Format a sector time in seconds (e.g. 28.3s)."""
+    if seconds <= 0:
+        return "N/A"
+    return f"{seconds:.1f}s"
+
+
 def format_temp(temp: float) -> str:
     """Format a temperature value to 1 decimal place."""
     if temp <= 0:
@@ -148,7 +155,7 @@ class ContextBuilder:
             "- 'Incidents' are safety points (0x per off-track), NOT car damage. Always report the count when it's in the context.\n"
             "- If tyre data is marked unreliable, still report the values but don't comment on degradation, trends, or whether they're changing. Say 'last known: Left Front 79C...' rather than skipping them.\n"
             "- [ACTION] add_fuel amounts: whole litres only (integers, never decimals), min 1L, max = tank capacity minus current fuel. Never exceed tank capacity.\n"
-            "- When speaking fuel amounts, use 'litres' not 'L'. Example: 'Add 60 litres' not 'Add 60L'.\n"
+            "- When speaking fuel amounts or rates, use 'litres' not 'L'. Example: 'Add 60 litres' not 'Add 60L'; '3.8 litres per lap' not '3.8L/lap'; '34 litres per hour' not '34L/hr'.\n"
             "- Weather data is current conditions only — never predict future weather.\n"
             "- Lap times in the 'Pace' line are the driver's own times. Lap times in the 'Nearby' section are other cars' times.\n"
             "- When fuel burn says 'unknown', do NOT invent a specific L/lap figure. Say 'fuel burn unknown' or estimate from race structure only.\n"
@@ -367,6 +374,17 @@ class ContextBuilder:
         incidents = player.get("incidents", 0)
         if incidents > 0:
             lines.append(f"  Incidents: {incidents}x")
+
+        # Player sector times
+        fastest_sectors = player.get("fastest_sector_times", {})
+        if fastest_sectors:
+            sector_parts = []
+            for sector_num in sorted(fastest_sectors.keys()):
+                t = fastest_sectors[sector_num]
+                if t > 0:
+                    sector_parts.append(f"S{sector_num} {format_sector_time(t)}")
+            if sector_parts:
+                lines.append(f"  Sectors: {' | '.join(sector_parts)}")
 
         return "\n".join(lines)
 
@@ -643,7 +661,7 @@ class ContextBuilder:
         # IS accurate — only the laps estimate depends on having burn rate data.
         if avg_fuel_per_lap > 0 and fuel_est_quality == "good":
             lines.append(
-                f"  Fuel burn: ~{avg_fuel_per_lap:.2f} L/lap (avg over recent laps)"
+                f"  Fuel burn: ~{avg_fuel_per_lap:.2f} litres per lap (avg over recent laps)"
             )
             if fuel_laps > 0:
                 lines.append(
@@ -669,7 +687,7 @@ class ContextBuilder:
                             )
         elif avg_fuel_per_lap > 0 and fuel_est_quality == "rough":
             lines.append(
-                f"  Fuel burn: ~{avg_fuel_per_lap:.2f} L/lap (approx, based on 1-2 laps)"
+                f"  Fuel burn: ~{avg_fuel_per_lap:.2f} litres per lap (approx, based on 1-2 laps)"
             )
             if fuel_laps > 0:
                 lines.append(f"  Fuel range: ~{fuel_laps:.1f} laps (approx)")
@@ -691,8 +709,8 @@ class ContextBuilder:
                             )
         else:
             # No burn rate data yet — make it clear the LLM must NOT invent
-            # a specific L/lap figure. "calculating" was misread as "almost ready"
-            # by the LLM, causing it to fabricate burn rates like "1.3L/lap".
+            # a specific litres-per-lap figure. "calculating" was misread as "almost ready"
+            # by the LLM, causing it to fabricate burn rates like "1.3 litres per lap".
             lines.append("  Fuel burn: unknown — per-lap rate not yet available")
 
         # Fuel recommendation — calculate how much fuel to add at next pit stop.
@@ -926,6 +944,17 @@ class ContextBuilder:
         if lap_time_parts:
             lines.append(f"  Pace: {' | '.join(lap_time_parts)}")
 
+        # Player's fastest sector times
+        fastest_sectors = player.get("fastest_sector_times", {})
+        if fastest_sectors:
+            sector_parts = []
+            for sector_num in sorted(fastest_sectors.keys()):
+                t = fastest_sectors[sector_num]
+                if t > 0:
+                    sector_parts.append(f"S{sector_num} {format_sector_time(t)}")
+            if sector_parts:
+                lines.append(f"  Sector bests: {' | '.join(sector_parts)}")
+
         # Proximity — CarDistAhead/Behind from iRacing are in metres, NOT seconds.
         # Use the nearby cars' gap_seconds (computed from track position) for
         # meaningful time gaps, and show iRacing's distance values as metres.
@@ -1049,6 +1078,49 @@ class ContextBuilder:
                 if on_pit:
                     car_str += on_pit
                 lines.append(car_str)
+
+        # === Sector Times (player + nearby) ===
+        sector_entries = []
+        # Player sector times
+        player_sectors = player.get("fastest_sector_times", {})
+        if player_sectors:
+            sector_parts = []
+            for s_num in sorted(player_sectors.keys()):
+                s_t = player_sectors[s_num]
+                if s_t > 0:
+                    sector_parts.append(f"S{s_num} {format_sector_time(s_t)}")
+            if sector_parts:
+                sector_entries.append(f"  You: {' | '.join(sector_parts)}")
+        # Nearby cars sector times
+        if nearby:
+            for car in nearby[: self.include_nearby_cars]:
+                car_sectors = car.get("fastest_sector_times", {})
+                if not car_sectors:
+                    continue
+                name = car.get("driver_name", f"P{car.get('position', '?')}")
+                pos = car.get("position", "?")
+                # Resolve display name (same logic as nearby section)
+                display_name = name
+                if name in driver_aliases and driver_aliases[name] != name:
+                    display_name = f"{name} / {driver_aliases[name]}"
+                elif (
+                    car.get("is_teammate")
+                    and car.get("real_name")
+                    and car["real_name"] != name
+                ):
+                    display_name = f"{name} / {car['real_name']}"
+                sector_parts = []
+                for s_num in sorted(car_sectors.keys()):
+                    s_t = car_sectors[s_num]
+                    if s_t > 0:
+                        sector_parts.append(f"S{s_num} {format_sector_time(s_t)}")
+                if sector_parts:
+                    sector_entries.append(
+                        f"  P{pos} ({display_name}): {' | '.join(sector_parts)}"
+                    )
+        if sector_entries:
+            lines.append("\nSector Times:")
+            lines.extend(sector_entries)
 
         return "\n".join(lines)
 

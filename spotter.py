@@ -365,21 +365,38 @@ class ProximityDetector:
                 self._last_call_time["clear"] = current_time
                 self._car_alongside = False
                 self._alongside_since = None
-            # Clear the pending timers regardless — we only fire once.
-            # If we suppressed "clear" because a car is alongside on the
-            # other side, we'll get a new pending clear when that car leaves.
-            if left_clear_matured:
-                self._pending_clear_since_left = None
-            if right_clear_matured:
-                self._pending_clear_since_right = None
+                # Only clear pending timers when "clear" actually fires.
+                # If we discard them when the guard fails (e.g. cooldown),
+                # no new timer can ever start because _prev_left/_prev_right
+                # are already False on subsequent ticks, permanently
+                # trapping _car_alongside=True and blocking all future clears.
+                if left_clear_matured:
+                    self._pending_clear_since_left = None
+                if right_clear_matured:
+                    self._pending_clear_since_right = None
+            elif cur_left or cur_right:
+                # Car is alongside on another side — suppress "clear" for now.
+                # We'll get a new pending clear when that car leaves.
+                # Discard the matured timers since they're for a side that's
+                # already gone; the remaining side will start its own timer.
+                if left_clear_matured:
+                    self._pending_clear_since_left = None
+                if right_clear_matured:
+                    self._pending_clear_since_right = None
+            # else: cooldown blocked "clear" — keep pending timers active
+            # so they can fire on a subsequent tick when cooldown elapses.
 
         # === Phase 5: Still-there reminder ===
         # If a car has been continuously alongside for longer than
         # still_there_delay, fire a "still there" reminder. Repeats
         # every still_there_cooldown while the car remains alongside.
+        # Guard: also verify cur_left/cur_right so we never fire "still there"
+        # when telemetry says no car is alongside — prevents runaway reminders
+        # if _car_alongside gets stuck True (e.g. cooldown blocked a "clear").
         if (
             self._alongside_since is not None
             and self._car_alongside
+            and (cur_left or cur_right)
             and (current_time - self._alongside_since) >= self._still_there_delay
         ):
             if self._cooldown_elapsed("still_there", current_time):
@@ -391,6 +408,25 @@ class ProximityDetector:
                     )
                 )
                 self._last_call_time["still_there"] = current_time
+
+        # === Phase 6: Safety-net forced clear ===
+        # If _car_alongside is True but telemetry shows no car alongside
+        # and there's no pending clear timer, the state is stuck — force a
+        # clear. This can happen if a matured pending clear was discarded by
+        # the cooldown guard before the timer-preservation fix, or due to any
+        # other edge case that prevents the normal clear path from firing.
+        if (
+            self._car_alongside
+            and not cur_left
+            and not cur_right
+            and self._pending_clear_since_left is None
+            and self._pending_clear_since_right is None
+            and self._cooldown_elapsed("clear", current_time)
+        ):
+            calls.append(SpotterCall(call_type="clear", priority=0, audio_key="clear"))
+            self._last_call_time["clear"] = current_time
+            self._car_alongside = False
+            self._alongside_since = None
 
         # Update previous state
         self._prev_left = cur_left

@@ -181,10 +181,15 @@ class IRacingClient:
         """
         try:
             info: dict[str, Any] = {}
-            for key in ("WeekendInfo", "SessionInfo", "DriverInfo"):
+            for key in ("WeekendInfo", "SessionInfo", "DriverInfo", "SplitTimeInfo"):
                 section = self._ir[key]
                 if section:
                     info[key] = section
+                elif key == "SplitTimeInfo":
+                    logger.debug(
+                        "SplitTimeInfo not available from iRacing session YAML "
+                        "— sector times will not be tracked"
+                    )
             self._session_info_cache = info
             self._session_info_tick = getattr(self._ir, "session_info_update", -1)
             self._parse_drivers()

@@ -61,7 +61,7 @@ voice:
   stt:
     enabled: true
     model: "small"                    # Whisper model: tiny, small, medium, large-v3, turbo, distil-large-v3
-    device: "cuda"                    # cuda or cpu
+    device: "cuda"                    # cuda or cpu — use "cpu" if iRacing stutters when Whisper runs (GPU contention)
     compute_type: "float16"          # float16 (GPU), int8 (CPU/GPU), int8_float16
     input_device: 1                # null = system default, or device name/index
     input_gain: 1.0                   # Mic input gain multiplier (1.0 = no boost, 2.0 = 2x louder)
@@ -136,7 +136,7 @@ prompt:
     - [ACTION] add_fuel amounts: whole litres only (integers, never decimals), min 1L, max = tank capacity minus current fuel. Never exceed tank capacity.
     - Weather data is current conditions only — never predict future weather.
     - Lap times in the 'Pace' line are the driver's own times. Lap times in the 'Nearby' section are other cars' times.
-    - When fuel burn says 'unknown', do NOT invent a specific L/lap figure. Say 'fuel burn unknown' or estimate from race structure only.
+    - When fuel burn says 'unknown', do NOT invent a specific litres-per-lap figure. Say 'fuel burn unknown' or estimate from race structure only.
     - Never say 'monitor' or 'keep an eye on' — you give one-shot advice, not continuous tracking.
     - Only include [ACTION] when the driver asks about pitting, fuel, tyres, or strategy. Do not add actions to unrelated questions.
     - When 'Fuel to add' is shown in context, use that exact amount in [ACTION] add_fuel. Do not invent different amounts.
