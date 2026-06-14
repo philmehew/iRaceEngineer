@@ -51,10 +51,10 @@ team:
     - Mayhem: Phil Mehew
   car_numbers: []                # Alternative: identify by car number
 
-# Button trigger
+# Button trigger — wheel button to query the LLM
 trigger:
-  method: "keyboard"         # "keyboard" for now; "wheel_button" later via pygame
-  key: "f9"                  # Keyboard key to trigger LLM call
+  device_index: 0            # Joystick device index (use test_wheel.py to find)
+  button_index: 8            # Button index on device (use test_wheel.py to find)
 
 # Voice input/output (requires: uv pip install -e ".[voice]")
 voice:
@@ -78,12 +78,10 @@ voice:
     sentence_silence: 0.2             # Seconds of silence between sentences
 
   trigger:
-    method: "wheel_button"               # "keyboard" or "wheel_button"
-    voice_key: "f10"                  # Keyboard key for voice input (when method: keyboard)
-    push_to_talk: true                # true = hold key/button to record, release to stop (like radio PTT)
+    device_index: 0                # Joystick device index (use test_wheel.py to find)
+    button_index: 9                # Button index on device (use test_wheel.py to find)
+    push_to_talk: true                # true = hold button to record, release to stop (like radio PTT)
     max_record_seconds: 15           # Safety: auto-stop recording after this
-    device_index: 0                # Joystick device index (when method: wheel_button; use test_wheel.py to find)
-    button_index: 9                # Button index on device (when method: wheel_button; use test_wheel.py to find)
 
 # Spotter — real-time audio calls for car proximity and track events
 spotter:

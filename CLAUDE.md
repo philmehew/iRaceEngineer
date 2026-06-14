@@ -11,7 +11,7 @@ iRacing (shared memory) → iracing_client.py → race_state.py → context_buil
                                                  (local audio)                    ↓
                                                                         tts_client.py (Piper TTS → speakers)
 
-F10 key or wheel button (hold) → stt_client.py (mic → Whisper) → transcribed text → context_builder → LLM
+Wheel button (hold) → stt_client.py (mic → Whisper) → transcribed text → context_builder → LLM
 ```
 
 - **iracing_client.py** — pyirsdk wrapper, reads 327 telemetry variables + session info, exposes pit commands
@@ -23,7 +23,7 @@ F10 key or wheel button (hold) → stt_client.py (mic → Whisper) → transcrib
 - **stt_client.py** — speech-to-text via faster-whisper + sounddevice mic capture, push-to-talk
 - **tts_client.py** — text-to-speech via Piper TTS + sounddevice playback, configurable output device
 - **capture.py** — record/replay telemetry JSON for testing without iRacing
-- **main.py** — entry point with CLI: live, --capture, --replay, --generate-samples, --voice; includes WheelButtonListener for steering wheel PTT
+- **main.py** — entry point with CLI: live, --capture, --replay, --generate-samples, --voice; includes WheelButtonListener for steering wheel query and PTT triggers
 
 ## Key Design Decisions
 
@@ -33,7 +33,7 @@ F10 key or wheel button (hold) → stt_client.py (mic → Whisper) → transcrib
 - **Action directives** — LLM can include `[ACTION] pit_this_lap`, `[ACTION] add_fuel: 60` etc. v1 logs but doesn't execute
 - **Testable without iRacing** — `--generate-samples` creates fake data, `--replay <dir>` feeds it through the pipeline
 - **Voice is optional** — voice deps in `[voice]` extra (`uv sync --extra voice`), graceful degradation if not installed
-- **Wheel button is optional** — pygame in `[wheel]` extra (`uv sync --extra wheel`), for push-to-talk via steering wheel button instead of keyboard F10
+- **Wheel button triggers** — pygame in `[wheel]` extra (`uv sync --extra wheel`), used for both LLM query (press) and push-to-talk voice (hold) via steering wheel buttons
 - **Voice tested independently** — `test_stt.py` and `test_tts.py` are standalone scripts for testing each component
 - **Spotter is local and deterministic** — reads CarLeftRight telemetry at 30Hz, plays pre-recorded WAV files on transitions (car appears/clears alongside). Also detects car-behind-closing using lap-time delta comparison (not noisy CarDistBehind derivative). No LLM involved. Edge-detection with cooldown timers prevents repeated calls. Uses sounddevice.OutputStream (not sd.play) to avoid conflicting with TTS.
 - **Still-there reminder** — when a car has been alongside continuously for more than `still_there_delay_ms` (default 5000ms), plays `carstillthere.wav` as a reminder. Repeats every `still_there_cooldown_ms` (default 10000ms) while the car remains alongside. Resets when the car clears.
@@ -44,8 +44,7 @@ F10 key or wheel button (hold) → stt_client.py (mic → Whisper) → transcrib
 - pyirsdk (1.3.5) — iRacing shared memory
 - openai (2.x) — LLM API client
 - pyyaml — config
-- keyboard — F9/F10 trigger (needs admin on Windows)
-- pygame (2.6+) — steering wheel button trigger for push-to-talk (optional `[wheel]` extra)
+- pygame (2.6+) — steering wheel button triggers for LLM query and push-to-talk (optional `[wheel]` extra)
 - faster-whisper (1.2+) — local speech-to-text via Whisper (optional `[voice]` extra)
 - piper-tts (1.4+) — local text-to-speech (optional `[voice]` extra)
 - sounddevice — mic capture + audio playback (optional `[voice]` extra)
@@ -54,7 +53,7 @@ F10 key or wheel button (hold) → stt_client.py (mic → Whisper) → transcrib
 ## Running
 
 ```bash
-python main.py                          # Live mode — connect to iRacing, F9 to query LLM, F10 for voice
+python main.py                          # Live mode — connect to iRacing, wheel button to query LLM / PTT
 python main.py --capture                # Record live telemetry to JSON
 python main.py --replay <dir>           # Replay captured data
 python main.py --generate-samples       # Generate fake Spa 24h stint data

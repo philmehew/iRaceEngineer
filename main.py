@@ -90,10 +90,10 @@ class WheelButtonListener:
     Runs a background thread that polls pygame events and calls
     on_press/on_release callbacks when the target button is triggered.
 
-    This is used for push-to-talk on a steering wheel — hold the button
-    to record, release to transcribe.
+    Used for both LLM query triggers (press to query) and push-to-talk
+    voice input (hold to record, release to transcribe).
 
-    Config keys (under voice.trigger):
+    Config keys:
         device_index: Joystick device index (use test_wheel.py to find)
         button_index: Button index on the device
     """
@@ -281,7 +281,7 @@ llm_query_logger = logging.getLogger("iraceengineer.llm_query")
 llm_query_logger.propagate = False  # Don't double-print to console
 
 # Thread safety for live mode: protects state reads/writes between the main
-# poll loop and the keyboard-hook thread, and prevents double-press.
+# poll loop and the wheel-button-hook thread, and prevents double-press.
 _state_lock = threading.Lock()
 _llm_in_progress = threading.Event()
 
@@ -526,19 +526,11 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
     if tts is not None:
         tts.preload()
 
-    # Set up keyboard trigger
-    trigger_key = config.get("trigger", {}).get("key", "f9")
+    # Set up wheel button triggers
+    query_trigger_config = config.get("trigger", {})
+    query_device = query_trigger_config.get("device_index")
+    query_button = query_trigger_config.get("button_index")
     voice_trigger_config = voice_config.get("trigger", {})
-    voice_trigger_method = voice_trigger_config.get("method", "keyboard")
-    voice_key = voice_trigger_config.get("voice_key", "f10")
-    try:
-        import keyboard  # noqa: F401 — testing availability
-
-        keyboard_available = True
-        logger.info(f"Trigger key: {trigger_key.upper()} (press to query LLM)")
-    except ImportError:
-        keyboard_available = False
-        logger.warning("keyboard module not available — using Enter key for trigger")
 
     # Connect to iRacing
     print("\n🔌 Connecting to iRacing...")
@@ -565,114 +557,35 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
         f"👥 Team detected: {len(team_indices)} cars — {', '.join(driver_names.get(i, f'Car #{i}') for i in team_indices)}\n"
     )
 
-    # Register triggers (keyboard for LLM query, keyboard or wheel for voice PTT)
-    wheel_listener = None
+    # Register triggers (wheel buttons for LLM query and voice PTT)
+    query_listener = None
+    voice_listener = None
 
-    if keyboard_available:
-        import keyboard as kb
-
-        # F9 (or configured key) — LLM query trigger (always keyboard)
-        kb.add_hotkey(
-            trigger_key,
-            lambda: handle_button_press(state, context_builder, llm, executor, tts=tts),
+    # LLM query trigger — wheel button press
+    if query_device is not None and query_button is not None:
+        query_listener = WheelButtonListener(
+            device_index=query_device,
+            button_index=query_button,
+            on_press=lambda: handle_button_press(
+                state, context_builder, llm, executor, tts=tts
+            ),
         )
-        print(f"🎧 Listening for {trigger_key.upper()} key press...")
-        print(f"   Press {trigger_key.upper()} to ask the race engineer a question.")
+        query_listener.start()
+        print(
+            f"🎧 LLM query: press wheel button {query_button} (device {query_device})"
+        )
+    else:
+        logger.warning(
+            "No query trigger configured — set trigger.device_index and "
+            "trigger.button_index in config.yaml. Run test_wheel.py to discover."
+        )
+        print("   ⚠️  No query trigger configured. Edit config.yaml trigger section.")
 
-        # Voice PTT — keyboard method
-        if stt is not None and voice_trigger_method == "keyboard":
-            # Push-to-talk: record while key is held, transcribe on release
-            _ptt_recording = threading.Event()
-            _ptt_recording_time = [0.0]  # monotonic time when recording started
-            _ptt_stop = threading.Event()
-
-            def _on_voice_key_down():
-                """Start recording when voice key is pressed."""
-                if _ptt_recording.is_set():
-                    # Previous recording still in progress — could be a stuck
-                    # thread. If it's been running >30s, it's stuck; force-clear.
-                    elapsed = time.monotonic() - _ptt_recording_time[0]
-                    if elapsed > 30:
-                        logger.warning(
-                            f"PTT stuck for {elapsed:.0f}s — force-clearing "
-                            f"(previous recording thread likely hung)"
-                        )
-                        _ptt_recording.clear()
-                        _ptt_stop.set()
-                    else:
-                        logger.debug(
-                            f"PTT still recording ({elapsed:.1f}s) — ignoring press"
-                        )
-                        return
-                _ptt_recording.set()
-                _ptt_recording_time[0] = time.monotonic()
-                _ptt_stop.clear()
-
-                def _record_and_query():
-                    """Record, transcribe, and query LLM with timing."""
-                    try:
-                        timing_steps = []
-                        logger.info("Voice key pressed — recording...")
-                        t0 = time.monotonic()
-                        audio = stt.record_until_release(
-                            _ptt_stop,
-                            max_duration_s=voice_trigger_config.get(
-                                "max_record_seconds", 15
-                            ),
-                        )
-                        t1 = time.monotonic()
-                        timing_steps.append(("Recording", t1 - t0))
-
-                        text = stt.transcribe(audio)
-                        t2 = time.monotonic()
-                        timing_steps.append(("Transcription", t2 - t1))
-
-                        if text.strip():
-                            logger.info(f"Transcribed: {text}")
-                            handle_button_press(
-                                state,
-                                context_builder,
-                                llm,
-                                executor,
-                                question=text,
-                                tts=tts,
-                                timing_steps=timing_steps,
-                            )
-                        else:
-                            logger.warning("No speech detected — skipping LLM query")
-                            _print_timing_summary(
-                                timing_steps, label="Voice (no speech)"
-                            )
-                    except Exception:
-                        logger.exception("Voice recording/transcription failed")
-                    finally:
-                        _ptt_recording.clear()
-
-                threading.Thread(target=_record_and_query, daemon=True).start()
-
-            def _on_voice_key_up():
-                """Stop recording when voice key is released."""
-                _ptt_stop.set()
-
-            # Register press/release hooks for push-to-talk
-            kb.on_press_key(voice_key, lambda e: _on_voice_key_down())
-            kb.on_release_key(voice_key, lambda e: _on_voice_key_up())
-            print(f"   Hold {voice_key.upper()} to speak your question (push-to-talk).")
-
-    # Voice PTT — wheel button method
-    if stt is not None and voice_trigger_method == "wheel_button":
-        device_index = voice_trigger_config.get("device_index")
-        button_index = voice_trigger_config.get("button_index")
-        if device_index is None or button_index is None:
-            logger.error(
-                "Wheel button trigger configured but device_index or button_index "
-                "not set. Run test_wheel.py to discover your wheel button."
-            )
-            print(
-                "   ⚠️  Wheel button trigger misconfigured — missing device_index/button_index."
-            )
-            print("   Run: python test_wheel.py to discover button indices.")
-        else:
+    # Voice PTT trigger — wheel button hold-to-talk
+    if stt is not None:
+        voice_device = voice_trigger_config.get("device_index")
+        voice_button = voice_trigger_config.get("button_index")
+        if voice_device is not None and voice_button is not None:
             # Push-to-talk: record while button is held, transcribe on release
             _ptt_recording = threading.Event()
             _ptt_recording_time = [0.0]  # monotonic time when recording started
@@ -704,7 +617,7 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                     """Record, transcribe, and query LLM with timing."""
                     try:
                         timing_steps = []
-                        logger.info("Wheel button pressed — recording...")
+                        logger.info("Voice button pressed — recording...")
                         t0 = time.monotonic()
                         audio = stt.record_until_release(
                             _ptt_stop,
@@ -746,16 +659,24 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                 """Stop recording when wheel button is released."""
                 _ptt_stop.set()
 
-            wheel_listener = WheelButtonListener(
-                device_index=device_index,
-                button_index=button_index,
+            voice_listener = WheelButtonListener(
+                device_index=voice_device,
+                button_index=voice_button,
                 on_press=_on_voice_button_down,
                 on_release=_on_voice_button_up,
             )
-            wheel_listener.start()
+            voice_listener.start()
             print(
-                f"   Hold wheel button {button_index} (device {device_index}) "
-                f"to speak your question (push-to-talk)."
+                f"   Voice PTT: hold wheel button {voice_button} (device {voice_device}) "
+                f"to speak your question."
+            )
+        else:
+            logger.warning(
+                "Voice enabled but no wheel button trigger configured — "
+                "set voice.trigger.device_index and voice.trigger.button_index."
+            )
+            print(
+                "   ⚠️  Voice PTT not configured. Edit config.yaml voice.trigger section."
             )
 
     print("   Press Ctrl+C to exit.\n")
@@ -774,7 +695,7 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                 except Exception:
                     units = {}
 
-                # Update race state (under lock to prevent stale reads from F9 handler)
+                # Update race state (under lock to prevent stale reads from button handler)
                 driver_names = {d.car_idx: d.driver_name for d in iracing.drivers}
                 with _state_lock:
                     state.update(telemetry, session_info, driver_names, units=units)
@@ -833,10 +754,10 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
 
     except KeyboardInterrupt:
         print("\n\n👋 Shutting down...")
-        if wheel_listener is not None:
-            wheel_listener.stop()
-        if keyboard_available:
-            kb.unhook_all()
+        if query_listener is not None:
+            query_listener.stop()
+        if voice_listener is not None:
+            voice_listener.stop()
         iracing.shutdown()
 
 
@@ -1092,7 +1013,7 @@ def run_replay_mode(
             break
 
         if not user_input:
-            # Empty input = general strategy query (like pressing F9 in live mode)
+            # Empty input = general strategy query (like pressing the query button in live mode)
             user_input = "What's my current strategy?"
 
         if user_input.lower() in ("quit", "exit", "q"):
@@ -1158,7 +1079,7 @@ def run_replay_mode(
             continue
 
         if not user_input:
-            # Empty input = general strategy query (like pressing F9 in live mode)
+            # Empty input = general strategy query (like pressing the query button in live mode)
             user_input = "What's my current strategy?"
 
         if user_input.lower() == "state":

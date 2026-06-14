@@ -1,13 +1,13 @@
 # iRaceEngineer
 
-Real-time iRacing data collection with on-demand LLM race engineering. Collects telemetry from iRacing via shared memory, maintains an in-memory model of the current race state, and sends a condensed snapshot to an OpenAI-compatible LLM when you press F9 — or speak your question via push-to-talk (F10) and hear the response spoken aloud.
+Real-time iRacing data collection with on-demand LLM race engineering. Collects telemetry from iRacing via shared memory, maintains an in-memory model of the current race state, and sends a condensed snapshot to an OpenAI-compatible LLM when you press a steering wheel button — or speak your question via push-to-talk and hear the response spoken aloud.
 
 ## What It Does
 
 - **Collects** real-time telemetry from iRacing at ~30Hz via pyirsdk (323+ telemetry variables + YAML session info)
 - **Maintains** an in-memory race state model — positions, gaps, fuel, tyres, lap trends, weather, engine health, damage, push-to-pass
 - **Condenses** that state into a ~1-2KB context prompt, filtered by configurable depth (minimal / medium / full)
-- **Sends** the prompt to any OpenAI-compatible LLM endpoint when you press F9 (text query) or hold F10 (voice query)
+- **Sends** the prompt to any OpenAI-compatible LLM endpoint when you press your steering wheel query button (text query) or hold your PTT button (voice query)
 - **Parses** optional `[ACTION]` directives in the LLM response (pit this lap, add fuel, change tyres) — logged in dry-run mode, executable when enabled
 - **Speaks** LLM responses aloud via Piper TTS, and **listens** for voice questions via Whisper STT (optional, fully local)
 - **Spotter** — real-time audio calls for car proximity, car-behind-closing alerts, race flags, fuel, penalties, and pit transitions using pre-recorded WAV files. Deterministic local logic, no LLM involved
@@ -75,7 +75,7 @@ set OLLAMA_API_KEY=your-api-key-here
 ### Run
 
 ```bash
-# Normal mode — connect to iRacing, F9 for text query, F10 for voice query
+# Normal mode — connect to iRacing, wheel buttons for query and voice
 python main.py
 
 # Replay mode — test with captured data, no iRacing needed
@@ -335,12 +335,12 @@ When you press a button, the script prints the device index, button number, and 
 
 ### Voice in Live Mode
 
-In live mode, two triggers are available:
+In live mode, two triggers are available via steering wheel buttons:
 
-- **F9** — Text trigger (no question, general strategy query) — always keyboard
-- **F10 or wheel button** — Push-to-talk voice input (hold to speak, release to transcribe)
+- **Query button** — Press to send a general strategy query to the LLM
+- **Voice PTT button** — Hold to speak your question, release to transcribe
 
-By default, voice push-to-talk uses the F10 key. You can also use a button on your steering wheel:
+Both use pygame to read wheel buttons. Configure in `config.yaml`:
 
 1. Install pygame: `uv sync --extra wheel`
 2. Discover your wheel's device and button indices:
@@ -350,11 +350,16 @@ By default, voice push-to-talk uses the F10 key. You can also use a button on yo
    ```
 3. Configure in `config.yaml`:
    ```yaml
+   # LLM query trigger (press to ask the race engineer)
+   trigger:
+     device_index: 0    # From test_wheel.py --list
+     button_index: 4    # From pressing buttons in test_wheel.py
+
+   # Voice push-to-talk (hold to speak, release to transcribe)
    voice:
      trigger:
-       method: "wheel_button"
-       device_index: 0    # From test_wheel.py --list
-       button_index: 4    # From pressing buttons in test_wheel.py
+       device_index: 0
+       button_index: 9
        push_to_talk: true
        max_record_seconds: 15
    ```
@@ -546,10 +551,10 @@ actions:
     - change_tyres
     - clear_penalty
 
-# Button trigger
+# Button trigger — wheel button to query the LLM
 trigger:
-  method: "keyboard"    # "keyboard" or "wheel_button"
-  key: "f9"
+  device_index: 0    # Joystick device index (use test_wheel.py to find)
+  button_index: 4    # Button index on device
 
 # Voice input/output (optional: uv sync --extra voice)
 voice:
@@ -571,12 +576,10 @@ voice:
     volume: 1.0
     sentence_silence: 0.2
   trigger:
-    method: "keyboard"           # "keyboard" or "wheel_button"
-    voice_key: "f10"             # Keyboard key (when method: keyboard)
+    device_index: 0           # Joystick device index
+    button_index: 9           # Button index on device
     push_to_talk: true
     max_record_seconds: 15
-    device_index: null           # Joystick device index (when method: wheel_button)
-    button_index: null           # Button index (when method: wheel_button)
 
 # Spotter — real-time audio calls for car proximity & race alerts (local, no LLM)
 spotter:
@@ -628,7 +631,7 @@ logging:
 
 ## LLM Query Logging
 
-Every time the LLM is queried (via F9 keypress, `--question`, or interactive replay), the full prompt and response are written to a local log file. This is useful for debugging context quality, reviewing what the LLM received, and auditing responses.
+Every time the LLM is queried (via wheel button press, `--question`, or interactive replay), the full prompt and response are written to a local log file. This is useful for debugging context quality, reviewing what the LLM received, and auditing responses.
 
 Log files are written to `logs/llm_queries.log` by default, with automatic rotation (1 MB per file, 5 backups). The `logs/` directory is gitignored.
 
@@ -658,7 +661,7 @@ Based on current tyre wear and fuel levels, I recommend pitting this lap...
 ```
 
 Log entries are tagged by source:
-- `--- LLM QUERY ---` — live F9 keypress
+- `--- LLM QUERY ---` — live wheel button press
 - `--- LLM QUERY (replay) ---` — one-shot `--question` with `--replay`
 - `--- LLM QUERY (replay interactive) ---` — typed question in interactive replay mode
 
@@ -705,7 +708,7 @@ Interactive commands:
 
 With `--replay-speed > 0`, snapshots feed automatically in the background and the prompt updates with live Lap, Position, Fuel, and snapshot progress. Milestone progress is printed every ~20% of total snapshots. Without it (or `--replay-speed 0`), all snapshots are loaded instantly and you interact with the final state.
 
-Works over SSH — no GUI or physical keyboard needed.
+Works over SSH — no GUI needed.
 
 ### LLM Response Evaluation
 
@@ -749,7 +752,7 @@ Same as `--capture` but always saves to the `tests/sample_data/` folder (from co
 
 | Module | Purpose |
 |--------|---------|
-| `main.py` | Entry point — CLI args, poll loop, keyboard trigger, interactive replay, voice |
+| `main.py` | Entry point — CLI args, poll loop, wheel button triggers, interactive replay, voice |
 | `iracing_client.py` | pyirsdk wrapper — telemetry, session info, pit commands |
 | `race_state.py` | In-memory model — positions, gaps, fuel, tyres, engine health, lap trends |
 | `context_builder.py` | Condenses state → LLM prompt (3 depth levels, format helpers) |
