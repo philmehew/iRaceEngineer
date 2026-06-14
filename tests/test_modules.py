@@ -108,7 +108,7 @@ def sample_telemetry(lap=10, fuel=72.0, flags=4):
         "CarIdxP2P_Status": [0, 0, 1, 0],
         "CarIdxP2P_Count": [2, 4, 1, 3],
         "CarIdxTireCompound": [0, 0, 1, 0],
-        "CarIdxTrackSurface": [2, 2, 2, 2],  # 2 = on track
+        "CarIdxTrackSurface": [3, 3, 3, 3],  # 3 = on track (CarIdxTrackSurface enum)
         "SessionTime": 900.0 + lap * 90,
         "PlayerCarMyIncidentCount": 0,
         "PlayerCarTeamIncidentCount": 2,
@@ -737,7 +737,7 @@ class TestSectorTimeTracker:
         tracker.update(
             lap_dist_pcts=[0.1],
             session_time=10.0,
-            track_surfaces=[2],
+            track_surfaces=[3],
             on_pit_roads=[0],
             positions=[1],
         )
@@ -753,7 +753,7 @@ class TestSectorTimeTracker:
         tracker.update(
             lap_dist_pcts=[0.1],
             session_time=10.0,
-            track_surfaces=[2],
+            track_surfaces=[3],
             on_pit_roads=[0],
             positions=[1],
         )
@@ -761,7 +761,7 @@ class TestSectorTimeTracker:
         tracker.update(
             lap_dist_pcts=[0.4],
             session_time=38.5,
-            track_surfaces=[2],
+            track_surfaces=[3],
             on_pit_roads=[0],
             positions=[1],
         )

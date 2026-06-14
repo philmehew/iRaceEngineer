@@ -302,7 +302,9 @@ class SectorTimeTracker:
             car_state = self._car_states[i]
 
             # Car off track (LapDistPct == -1) or in pits: skip and reset
-            if pct < 0 or in_pits or surface != 2:
+            # CarIdxTrackSurface: -1=not in world, 0=garage, 1=approaching,
+            # 2=on track (rare), 3=on track (common). Both 2 and 3 are valid.
+            if pct < 0 or in_pits or surface not in (2, 3):
                 car_state.prev_lap_dist_pct = -1.0
                 car_state.sector_enter_time.clear()
                 continue
@@ -533,7 +535,7 @@ class DriverState:
     gap_seconds: float = 0.0  # Positive = ahead of player, negative = behind
 
     # Track surface
-    track_surface: int = 0  # 0=off, 1=approaching, 2=on track
+    track_surface: int = 0  # CarIdxTrackSurface: -1=not in world, 0=garage, 1=approaching, 2=on track (rare), 3=on track
 
 
 @dataclass
@@ -1828,4 +1830,59 @@ class RaceState:
             "last_update_time": self._last_update_time,
             "estimated_total_laps": self.estimated_total_laps,
             "driver_aliases": self._driver_aliases,
+            # Strategic competitor sector times (leader, car ahead, car behind)
+            "leader_sector_times": self._get_strategic_car_sector("leader"),
+            "car_ahead_sector_times": self._get_strategic_car_sector("ahead"),
+            "car_behind_sector_times": self._get_strategic_car_sector("behind"),
         }
+
+    def _get_strategic_car_sector(self, which: str) -> dict | None:
+        """Return sector time info for a strategically important car.
+
+        Args:
+            which: "leader" (P1), "ahead" (car directly ahead of player),
+                or "behind" (car directly behind player).
+
+        Returns:
+            Dict with position, driver_name, car_idx, and fastest_sector_times,
+            or None if no car found or no sector data available.
+        """
+        if not self.standings:
+            return None
+
+        player_pos = self.player.position
+        player_idx = self.player.car_idx
+
+        if which == "leader":
+            # Find P1 in standings
+            target_pos = 1
+        elif which == "ahead":
+            # Car directly ahead (position one better than player)
+            if player_pos <= 1:
+                return None  # Player is P1, no car ahead
+            target_pos = player_pos - 1
+        elif which == "behind":
+            # Car directly behind (position one worse than player)
+            target_pos = player_pos + 1
+        else:
+            return None
+
+        # Find the car at target position in standings
+        for entry in self.standings:
+            if entry.get("position") == target_pos:
+                car_idx = entry.get("car_idx")
+                if car_idx is None:
+                    return None
+                # Skip if this is the player
+                if car_idx == player_idx:
+                    return None
+                sector_times = self.sector_tracker.get_fastest_sectors(car_idx)
+                if not sector_times:
+                    return None
+                return {
+                    "position": target_pos,
+                    "driver_name": entry.get("driver_name", f"P{target_pos}"),
+                    "car_idx": car_idx,
+                    "fastest_sector_times": sector_times,
+                }
+        return None

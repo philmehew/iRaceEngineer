@@ -41,7 +41,7 @@ class DriverState:
     lap_completed: int = 0
     lap_dist_pct: float = 0.0
     on_pit_road: bool = False
-    track_surface: int = 0  # 0=off, 1=approaching, 2=on track
+    track_surface: int = 0  # CarIdxTrackSurface: -1=not in world, 0=garage, 1=approaching, 2=on track (rare), 3=on track
     best_lap_time: float = -1.0
     last_lap_time: float = -1.0
     speed: float = 0.0

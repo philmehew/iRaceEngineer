@@ -395,6 +395,31 @@ class ContextBuilder:
             if sector_parts:
                 lines.append(f"  Sectors: {' | '.join(sector_parts)}")
 
+        # Strategic competitor sector times (leader, car ahead, car behind)
+        for key, label in [
+            ("leader_sector_times", "Leader"),
+            ("car_ahead_sector_times", "Car ahead"),
+            ("car_behind_sector_times", "Car behind"),
+        ]:
+            car_info = state.get(key)
+            if not car_info:
+                continue
+            sector_times = car_info.get("fastest_sector_times", {})
+            if not sector_times:
+                continue
+            # Skip if it's the player's own car
+            if car_info.get("car_idx") == player.get("car_idx"):
+                continue
+            sector_parts = []
+            for s_num in sorted(sector_times.keys()):
+                s_t = sector_times[s_num]
+                if s_t > 0:
+                    sector_parts.append(f"S{s_num} {format_sector_time(s_t)}")
+            if sector_parts:
+                pos = car_info.get("position", "?")
+                name = car_info.get("driver_name", f"P{pos}")
+                lines.append(f"  {label} (P{pos} {name}): {' | '.join(sector_parts)}")
+
         return "\n".join(lines)
 
     def _build_full(self, state: dict) -> str:
@@ -1086,8 +1111,11 @@ class ContextBuilder:
                     car_str += on_pit
                 lines.append(car_str)
 
-        # === Sector Times (player + nearby) ===
+        # === Sector Times (player + strategic cars + nearby) ===
         sector_entries = []
+        # Track car indices already shown to avoid duplicates
+        shown_car_indices = set()
+
         # Player sector times
         player_sectors = player.get("fastest_sector_times", {})
         if player_sectors:
@@ -1098,12 +1126,52 @@ class ContextBuilder:
                     sector_parts.append(f"S{s_num} {format_sector_time(s_t)}")
             if sector_parts:
                 sector_entries.append(f"  You: {' | '.join(sector_parts)}")
+            shown_car_indices.add(player.get("car_idx"))
+
+        # Strategic cars: leader, car ahead, car behind
+        strategic_labels = {
+            "leader_sector_times": "Leader",
+            "car_ahead_sector_times": None,  # No special prefix for car ahead
+            "car_behind_sector_times": None,  # No special prefix for car behind
+        }
+        for key, label_prefix in strategic_labels.items():
+            car_info = state.get(key)
+            if not car_info:
+                continue
+            car_idx = car_info.get("car_idx")
+            if car_idx in shown_car_indices:
+                continue  # Already shown (e.g. in nearby list)
+            sector_times = car_info.get("fastest_sector_times", {})
+            if not sector_times:
+                continue
+            sector_parts = []
+            for s_num in sorted(sector_times.keys()):
+                s_t = sector_times[s_num]
+                if s_t > 0:
+                    sector_parts.append(f"S{s_num} {format_sector_time(s_t)}")
+            if not sector_parts:
+                continue
+            pos = car_info.get("position", "?")
+            name = car_info.get("driver_name", f"P{pos}")
+            # Resolve display name
+            display_name = name
+            if name in driver_aliases and driver_aliases[name] != name:
+                display_name = f"{name} / {driver_aliases[name]}"
+            prefix = f"{label_prefix} " if label_prefix else ""
+            sector_entries.append(
+                f"  {prefix}P{pos} ({display_name}): {' | '.join(sector_parts)}"
+            )
+            shown_car_indices.add(car_idx)
+
         # Nearby cars sector times
         if nearby:
             for car in nearby[: self.include_nearby_cars]:
                 car_sectors = car.get("fastest_sector_times", {})
                 if not car_sectors:
                     continue
+                car_idx = car.get("car_idx")
+                if car_idx in shown_car_indices:
+                    continue  # Already shown as leader/ahead/behind
                 name = car.get("driver_name", f"P{car.get('position', '?')}")
                 pos = car.get("position", "?")
                 # Resolve display name (same logic as nearby section)
@@ -1125,6 +1193,7 @@ class ContextBuilder:
                     sector_entries.append(
                         f"  P{pos} ({display_name}): {' | '.join(sector_parts)}"
                     )
+                    shown_car_indices.add(car_idx)
         if sector_entries:
             lines.append("\nSector Times:")
             lines.extend(sector_entries)
