@@ -177,6 +177,6 @@ capture:
 # Logging
 logging:
   llm_query_log_dir: "logs"              # Directory for LLM query log files
-  llm_query_log_file: "llm_queries.log" # Log filename
-  llm_query_max_bytes: 1000000          # Rotate at 1 MB
-  llm_query_backup_count: 5             # Keep 5 rotated files
+  llm_query_log_file: "llm_queries.log" # Base filename (timestamp inserted before .log)
+  console_log_dir: "logs"                # Directory for console mirror log files
+  console_log_file: "console.log"        # Base filename (timestamp inserted before .log)

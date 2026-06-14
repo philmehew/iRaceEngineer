@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import yaml
-from logging.handlers import RotatingFileHandler
+from datetime import datetime
 
 # Fix Windows console encoding for emoji/special characters
 if sys.platform == "win32":
@@ -252,6 +252,22 @@ class WheelButtonListener:
             self._pygame_initialized = False
 
 
+def _session_timestamp() -> str:
+    """Return a timestamp string for log file names (same format as capture sessions)."""
+    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def _insert_timestamp(filename: str, ts: str) -> str:
+    """Insert a timestamp before the .log extension in a filename.
+
+    e.g. _insert_timestamp("llm_queries.log", "2024-06-08_14-30-00")
+         -> "llm_queries_2024-06-08_14-30-00.log"
+    """
+    if filename.endswith(".log"):
+        return f"{filename[:-4]}_{ts}.log"
+    return f"{filename}_{ts}"
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -260,19 +276,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("iraceengineer")
 
-# Dedicated spotter log — writes to file so transitions are visible after the fact
-spotter_logger = logging.getLogger("spotter")
-spotter_file = os.path.join("logs", "spotter.log")
-os.makedirs("logs", exist_ok=True)
-spotter_handler = RotatingFileHandler(spotter_file, maxBytes=1_000_000, backupCount=2)
-spotter_handler.setFormatter(
-    logging.Formatter("%(asctime)s %(levelname)s: %(message)s", datefmt="%H:%M:%S")
-)
-spotter_logger.addHandler(spotter_handler)
-# Keep console output too
-spotter_logger.propagate = True
-
-# Dedicated logger for LLM query data — writes prompt/response to a local file
+# Dedicated logger for LLM query data — handler added in setup_llm_query_log()
 llm_query_logger = logging.getLogger("iraceengineer.llm_query")
 llm_query_logger.propagate = False  # Don't double-print to console
 
@@ -300,31 +304,52 @@ def _print_timing_summary(steps: list[tuple[str, float]], label: str = "Pipeline
     print(f"  {'Total':25s} {total:.3f}s\n")
 
 
-def setup_llm_query_log(config: dict):
+def setup_llm_query_log(config: dict, session_ts: str):
     """Set up the LLM query log file handler.
 
-    Creates a RotatingFileHandler that writes the prompt and response
-    for every LLM call to a local log file. Defaults to logs/llm_queries.log
-    with 5 rotating files of 1 MB each.
+    Creates a FileHandler that writes the prompt and response for every LLM
+    call to a timestamped log file (e.g. logs/llm_queries_2024-06-08_14-30-00.log).
     """
     log_config = config.get("logging", {})
     log_dir = log_config.get("llm_query_log_dir", "logs")
     log_file = log_config.get("llm_query_log_file", "llm_queries.log")
-    max_bytes = log_config.get("llm_query_max_bytes", 1_000_000)
-    backup_count = log_config.get("llm_query_backup_count", 5)
 
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, log_file)
+    stamped_file = _insert_timestamp(log_file, session_ts)
+    log_path = os.path.join(log_dir, stamped_file)
 
-    handler = RotatingFileHandler(
-        log_path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
-    )
+    handler = logging.FileHandler(log_path, encoding="utf-8")
     handler.setFormatter(
         logging.Formatter("%(asctime)s\n%(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     )
     llm_query_logger.addHandler(handler)
     llm_query_logger.setLevel(logging.INFO)
     logger.info(f"LLM query log: {log_path}")
+
+
+def setup_console_log(config: dict, session_ts: str):
+    """Set up a console mirror log that captures all console output to a file.
+
+    Adds a FileHandler to the root logger so anything printed to the console
+    is also written to a timestamped log file (e.g. logs/console_2024-06-08_14-30-00.log).
+    """
+    log_config = config.get("logging", {})
+    log_dir = log_config.get("console_log_dir", "logs")
+    log_file = log_config.get("console_log_file", "console.log")
+
+    os.makedirs(log_dir, exist_ok=True)
+    stamped_file = _insert_timestamp(log_file, session_ts)
+    log_path = os.path.join(log_dir, stamped_file)
+
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S"
+        )
+    )
+    # No explicit level — inherits from root logger, so mirrors whatever the console shows
+    logging.getLogger().addHandler(handler)
+    logger.info(f"Console log: {log_path}")
 
 
 def load_config(config_path: str) -> dict:
@@ -1308,6 +1333,9 @@ def main():
 
     args = parser.parse_args()
 
+    # Generate session timestamp for log file names
+    session_ts = _session_timestamp()
+
     # Set up logging
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -1315,8 +1343,9 @@ def main():
     # Load config
     config = load_config(args.config)
 
-    # Set up LLM query log file
-    setup_llm_query_log(config)
+    # Set up log files (each gets a session timestamp suffix)
+    setup_llm_query_log(config, session_ts)
+    setup_console_log(config, session_ts)
 
     # Override context depth if specified
     if args.depth:
