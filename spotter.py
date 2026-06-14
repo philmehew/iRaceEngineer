@@ -30,8 +30,8 @@ Key design decisions:
   Repeats every still_there_cooldown_ms (default 10s) while the car remains.
 - Guard: only processes CarLeftRight when the player is on the racing surface
   (PlayerTrackSurface >= 3), suppressing false calls in the pit lane.
-- Fuel alert: plays "fuel_two_laps" when estimated laps remaining drops below
-  a configurable threshold (default 2.0 laps).
+- Fuel alert: plays audio when estimated laps remaining drops below configurable
+  thresholds (default: 5, 3, 2, 1 laps).
 - Car behind closing: uses lap-time delta comparison (not CarDistBehind derivative)
   for noise-immune detection. Fires after N consecutive faster laps by the car
   behind, when the gap is within configurable bounds, suppressed during yellow.
@@ -637,6 +637,7 @@ class SpotterAudioPlayer:
         "three_wide": "audio/carthreewide.wav",
         "clear": "audio/carclear.wav",
         "fuel_five_laps": "audio/fuelfivelaps.wav",
+        "fuel_three_laps": "audio/fuelthreelaps.wav",
         "fuel_two_laps": "audio/fueltwolaps.wav",
         "fuel_one_lap": "audio/fuelonelap.wav",
         "flag_yellow": "audio/flagyellow.wav",
@@ -854,6 +855,7 @@ class Spotter:
     # on/off with no hysteresis).
     FUEL_ALERTS = [
         (5.0, "fuel_five_laps"),
+        (3.0, "fuel_three_laps"),
         (2.0, "fuel_two_laps"),
         (1.0, "fuel_one_lap"),
     ]

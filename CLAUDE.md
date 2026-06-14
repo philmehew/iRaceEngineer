@@ -88,7 +88,7 @@ Located in `tests/sample_data/` — 10 snapshots simulating a Spa 24h race stint
 
 - Config: `config.yaml`
 - Wheel button test: `test_wheel.py`
-- Spotter audio: `audio/` (carleft.wav, carright.wav, carthreewide.wav, carclear.wav, carstillthere.wav, carbehindclosing.wav, plus flag/penalty/fuel/pit WAVs)
+- Spotter audio: `audio/` (carleft.wav, carright.wav, carthreewide.wav, carclear.wav, carstillthere.wav, carbehindclosing.wav, plus flag/penalty/fuel/pit WAVs; fuel alerts at 5, 3, 2, 1 laps)
 - Sample data: `tests/sample_data/session_*`
 - Tests: `tests/test_modules.py`, `tests/test_spotter.py` (ProximityDetector, CarBehindTracker, Spotter coordinator, SpotterAudioPlayer)
 - Plan file: `C:\Users\phil\.claude\plans\can-you-review-these-pure-crayon.md`

@@ -875,7 +875,7 @@ class TestSpotterIntegration:
 
 
 class TestSpotterFuelAlert:
-    """Test fuel alerts at multiple lap thresholds (5, 2, 1)."""
+    """Test fuel alerts at multiple lap thresholds (5, 3, 2, 1)."""
 
     def setup_method(self):
         self.config = {
@@ -910,6 +910,17 @@ class TestSpotterFuelAlert:
             CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=4.9
         )
         assert "fuel_five_laps" in played_keys
+
+    def test_fuel_three_lap_alert(self):
+        """Fuel alert should fire at 3-lap threshold."""
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=2.9
+        )
+        assert "fuel_three_laps" in played_keys
 
     def test_fuel_two_lap_alert(self):
         """Fuel alert should fire at 2-lap threshold."""
@@ -948,6 +959,13 @@ class TestSpotterFuelAlert:
             CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=4.5
         )
         assert "fuel_five_laps" in played_keys
+
+        played_keys.clear()
+        # Cross 3-lap threshold
+        spotter.update(
+            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=2.5
+        )
+        assert "fuel_three_laps" in played_keys
 
         played_keys.clear()
         # Cross 2-lap threshold
@@ -1027,6 +1045,7 @@ class TestSpotterFuelAlert:
         )
         assert "fuel_two_laps" not in played_keys
         assert "fuel_five_laps" not in played_keys
+        assert "fuel_three_laps" not in played_keys
         assert "fuel_one_lap" not in played_keys
 
     def test_fuel_alert_does_not_reset_with_zero(self):
@@ -1879,6 +1898,7 @@ class TestSpotterAudioPlayer:
             "three_wide",
             "clear",
             "fuel_five_laps",
+            "fuel_three_laps",
             "fuel_two_laps",
             "fuel_one_lap",
             "flag_yellow",

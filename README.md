@@ -488,6 +488,7 @@ The spotter also detects when the car directly behind you is **closing the gap**
 | Alert | Trigger | Audio File |
 |-------|---------|------------|
 | Fuel — 5 laps | Fuel laps remaining drops below 5 | `audio/fuelfivelaps.wav` |
+| Fuel — 3 laps | Fuel laps remaining drops below 3 | `audio/fuelthreelaps.wav` |
 | Fuel — 2 laps | Fuel laps remaining drops below 2 | `audio/fueltwolaps.wav` |
 | Fuel — 1 lap | Fuel laps remaining drops below 1 | `audio/fuelonelap.wav` |
 | Yellow flag | Yellow/caution flag transition on | `audio/flagyellow.wav` |
