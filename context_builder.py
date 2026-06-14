@@ -348,11 +348,11 @@ class ContextBuilder:
         else:
             fuel_str = f"  Fuel: {fuel_level:.1f} litres ({format_pct(fuel_pct)}"
         if fuel_laps > 0 and fuel_est_quality == "good":
-            lines.append(f"{fuel_str}), ~{fuel_laps:.1f} laps)")
+            lines.append(f"{fuel_str}), ~{fuel_laps:.1f} laps")
         elif fuel_laps > 0 and fuel_est_quality == "rough":
-            lines.append(f"{fuel_str}), ~{fuel_laps:.1f} laps (approx))")
+            lines.append(f"{fuel_str}), ~{fuel_laps:.1f} laps (approx)")
         elif fuel_pct > 0:
-            lines.append(f"{fuel_str}), fuel burn unknown)")
+            lines.append(f"{fuel_str}), fuel burn unknown")
         else:
             lines.append(f"{fuel_str})")
 
@@ -699,16 +699,16 @@ class ContextBuilder:
                         )
                         add_litres = max(1, add_litres)
                         lines.append(
-                            f"  ⚠ FUEL SHORTAGE: {deficit_laps:.0f} laps short{approx}. "
+                            f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx}. "
                             f"Add {add_litres} litres to finish (need ~{fuel_needed:.0f} litres for {race_laps_remain} laps)"
                         )
                     else:
                         lines.append(
-                            f"  ⚠ FUEL SHORTAGE: {deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
+                            f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
                         )
                 else:
                     lines.append(
-                        f"  ⚠ FUEL SHORTAGE: {deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
+                        f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
                     )
             elif fuel_laps < race_laps_remain + 1:
                 margin = fuel_laps - race_laps_remain
@@ -716,7 +716,7 @@ class ContextBuilder:
                 if margin < 0.3:
                     urgency = "will NOT finish if burn rate varies. Pit recommended."
                 else:
-                    urgency = "pit if safety car possible."
+                    urgency = "pit if safety car or incident possible."
                 # Include fuel-to-add if there's a litres deficit even within margin
                 add_str = ""
                 if effective_fuel_max > 0 and fuel_level > 0:
@@ -730,7 +730,7 @@ class ContextBuilder:
                         add_litres = max(1, add_litres)
                         add_str = f" Add {add_litres} litres if pitting."
                 lines.append(
-                    f"  ⚠ FUEL TIGHT: {margin:.1f} laps margin{approx}. {urgency}{add_str}"
+                    f"  ⚠ FUEL TIGHT: only {margin:.1f} laps margin{approx}. {urgency}{add_str}"
                 )
         elif (
             avg_fuel_per_lap > 0
