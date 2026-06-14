@@ -875,6 +875,9 @@ class Spotter:
         # Flag state: track previous flags for transition detection
         self._prev_flags: int | None = None  # None = first tick not yet processed
         self._race_started: bool = False  # True when SessionState >= 3
+        self._first_lap_completed: bool = (
+            False  # True after first lap completed (suppresses blue flag at race start)
+        )
 
         # Session state: track transitions for lights-out detection
         self._prev_session_state: int | None = (
@@ -912,6 +915,7 @@ class Spotter:
         car_behind_gap: float = 0.0,
         car_behind_lap_time: float = -1.0,
         player_last_lap_time: float = -1.0,
+        lap_completed: int = 0,
     ):
         """Process a telemetry tick.
 
@@ -939,9 +943,17 @@ class Spotter:
                 -1.0 = no data available.
             player_last_lap_time: Player's last completed lap time.
                 -1.0 = no completed lap yet.
+            lap_completed: Number of laps the player has completed (0 = none yet).
+                Used to suppress blue flag at race start — blue flags are not
+                meaningful until at least one lap is completed (field hasn't
+                spread out yet).
         """
         if not self._enabled:
             return
+
+        # --- Track first lap completion (blue flag suppression) ---
+        if lap_completed >= 1:
+            self._first_lap_completed = True
 
         # --- Session state: lights-out detection + race started ---
         # iRacing SessionState: 1=GetInCar, 2=ParadeLaps, 3=Racing,
@@ -1032,7 +1044,11 @@ class Spotter:
             if rising & self.FLAG_YELLOW_WAVING:
                 self._player.play("flag_yellow_waving")
                 logger.info("Flag alert: yellow waving")
-            if rising & self.FLAG_BLUE and self._race_started:
+            if (
+                rising & self.FLAG_BLUE
+                and self._race_started
+                and self._first_lap_completed
+            ):
                 self._player.play("flag_blue")
                 logger.info("Flag alert: blue flag")
             if rising & self.FLAG_BLACK:
@@ -1193,6 +1209,7 @@ class Spotter:
         # tick, so it's correct regardless of whether we reconnect mid-race
         # (state >= 3 → True immediately) or between sessions (state 1-2 → False).
         self._race_started = False
+        self._first_lap_completed = False
         self._prev_session_state = None
         self._initial_green = False
         self._prev_incidents = None

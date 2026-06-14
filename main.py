@@ -790,6 +790,7 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                         car_behind_gap=car_behind_gap,
                         car_behind_lap_time=car_behind_lap_time,
                         player_last_lap_time=state.player.last_lap_time,
+                        lap_completed=state.player.lap_completed,
                     )
 
             else:

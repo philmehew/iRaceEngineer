@@ -1230,19 +1230,75 @@ class TestSpotterFlagAlerts:
         assert "flag_white" in played_keys
 
     def test_blue_flag_transition(self):
-        """Blue flag should play audio on transition."""
+        """Blue flag should play audio on transition (after first lap completed)."""
         spotter = Spotter(self.config)
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
         spotter.update(
-            0, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            session_state=3,
+            lap_completed=1,
         )
         spotter.update(
             0,
             is_on_track=True,
             track_surface=3,
             session_flags=self.FLAG_GREEN | self.FLAG_BLUE,
+            session_state=3,
+            lap_completed=1,
+        )
+        assert "flag_blue" in played_keys
+
+    def test_blue_flag_suppressed_before_first_lap_completed(self):
+        """Blue flag should be suppressed until the first lap is completed.
+
+        At race start, iRacing may briefly set the blue flag bit as the field
+        sorts itself. The first-lap-completed guard prevents false alerts.
+        """
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Race has started but no laps completed yet
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            session_state=3,
+            lap_completed=0,
+        )
+        # Blue flag appears — should be suppressed
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN | self.FLAG_BLUE,
+            session_state=3,
+            lap_completed=0,
+        )
+        assert "flag_blue" not in played_keys
+
+        # After completing first lap, blue flag should fire on a new rising edge
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            session_state=3,
+            lap_completed=1,
+        )
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN | self.FLAG_BLUE,
+            session_state=3,
+            lap_completed=1,
         )
         assert "flag_blue" in played_keys
 
