@@ -156,23 +156,18 @@ class ContextBuilder:
     def _default_system_prompt(self) -> str:
         return (
             "You are a race engineer. Speak in short radio-style sentences. No markdown, bullets, or headers.\n"
-            "Example: 'Box this lap. Tyres are gone. Add 60 litres.'\n"
+            "Example: 'Box this lap. Tyres are gone. Add 60 litres. [ACTION] pit_this_lap | add_fuel: 60'\n"
             "If unsure, say so. Never invent data. The 'Your car' section is the driver you're talking to.\n\n"
             "Rules:\n"
-            "- Only respond when asked. Don't promise to monitor or call pit later.\n"
+            "- One-shot advice only. Never promise to monitor, track, or follow up later.\n"
             "- Don't suggest setup changes (pressures, brake bias) without known reference ranges.\n"
-            "- Don't assess temps or pressures as high/low/normal/stable without knowing the car's normal range — just report values.\n"
-            "- Don't name track corners unless that data is in the context.\n"
-            "- 'Incidents' are safety points (0x per off-track), NOT car damage. Always report the count when it's in the context.\n"
-            "- If tyre data is marked unreliable, still report the values but don't comment on degradation, trends, or whether they're changing. Say 'last known: Left Front 79C...' rather than skipping them.\n"
-            "- [ACTION] add_fuel amounts: whole litres only (integers, never decimals), min 1L, max = tank capacity minus current fuel. Never exceed tank capacity.\n"
-            "- When speaking fuel amounts or rates, use 'litres' not 'L'. Example: 'Add 60 litres' not 'Add 60L'; '3.8 litres per lap' not '3.8L/lap'; '34 litres per hour' not '34L/hr'.\n"
-            "- Weather data is current conditions only — never predict future weather.\n"
-            "- Lap times in the 'Pace' line are the driver's own times. Lap times in the 'Nearby' section are other cars' times.\n"
-            "- When fuel burn says 'unknown', do NOT invent a specific L/lap figure. Say 'fuel burn unknown' or estimate from race structure only.\n"
-            "- Never say 'monitor' or 'keep an eye on' — you give one-shot advice, not continuous tracking.\n"
-            "- Only include [ACTION] when the driver asks about pitting, fuel, tyres, or strategy. Do not add actions to unrelated questions.\n"
-            "- When 'Fuel to add' is shown in context, use that exact amount in [ACTION] add_fuel. Do not invent different amounts.\n\n"
+            "- Don't assess temps or pressures as high/low/normal without a baseline — just report values.\n"
+            "- 'Incidents' are safety-rating points, NOT car damage. Always report the count.\n"
+            "- If tyre data is unreliable, report last-known values but don't comment on trends or degradation.\n"
+            "- Fuel rules: Use 'litres' not 'L' when speaking. add_fuel takes whole litres only. "
+            "If context shows 'Fuel to add: N', use that exact amount. If fuel burn is 'unknown', say so — never invent a figure.\n"
+            "- Weather is current conditions only — never predict future weather.\n"
+            "- Only include [ACTION] when asked about pitting, fuel, tyres, or strategy. Don't add actions to unrelated questions.\n\n"
             "Optional actions: [ACTION] pit_this_lap | add_fuel: <litres> | change_tyres | clear_penalty"
         )
 
@@ -347,17 +342,17 @@ class ContextBuilder:
         if effective_fuel_max and fuel_level > 0:
             max_add = effective_fuel_max - fuel_level
             if fuel_max_pct < 1.0 and fuel_max_start > 0:
-                fuel_str = f"  Fuel: {fuel_level:.2f}L/{fuel_max_start:.1f}L (max add: {max_add:.0f}L, {format_pct(fuel_pct)}"
+                fuel_str = f"  Fuel: {fuel_level:.1f} litres/{fuel_max_start:.1f} litre tank (max add {max_add:.0f} litres, {format_pct(fuel_pct)}"
             else:
-                fuel_str = f"  Fuel: {fuel_level:.2f}L/{fuel_max:.0f}L (max add: {max_add:.0f}L, {format_pct(fuel_pct)}"
+                fuel_str = f"  Fuel: {fuel_level:.1f} litres/{fuel_max:.0f} litre tank (max add {max_add:.0f} litres, {format_pct(fuel_pct)}"
         else:
-            fuel_str = f"  Fuel: {fuel_level:.2f}L ({format_pct(fuel_pct)}"
+            fuel_str = f"  Fuel: {fuel_level:.1f} litres ({format_pct(fuel_pct)}"
         if fuel_laps > 0 and fuel_est_quality == "good":
-            lines.append(f"{fuel_str}), ~{fuel_laps:.1f} laps")
+            lines.append(f"{fuel_str}), ~{fuel_laps:.1f} laps)")
         elif fuel_laps > 0 and fuel_est_quality == "rough":
-            lines.append(f"{fuel_str}), ~{fuel_laps:.1f} laps (approx)")
+            lines.append(f"{fuel_str}), ~{fuel_laps:.1f} laps (approx))")
         elif fuel_pct > 0:
-            lines.append(f"{fuel_str}), laps remaining: unreliable")
+            lines.append(f"{fuel_str}), fuel burn unknown)")
         else:
             lines.append(f"{fuel_str})")
 
@@ -532,10 +527,10 @@ class ContextBuilder:
             if fuel_max:
                 if fuel_max_pct < 1.0 and fuel_max_start > 0:
                     cfg_parts.append(
-                        f"tank: {fuel_max:.0f}L (max load: {fuel_max_start:.1f}L / {fuel_max_pct:.0%})"
+                        f"tank: {fuel_max:.0f} litres (max load: {fuel_max_start:.1f} litres / {fuel_max_pct:.0%})"
                     )
                 else:
-                    cfg_parts.append(f"tank: {fuel_max:.0f}L")
+                    cfg_parts.append(f"tank: {fuel_max:.0f} litres")
             lines.append(f"Session: {' | '.join(cfg_parts)}")
 
         # Weather
@@ -563,10 +558,7 @@ class ContextBuilder:
             if wind_vel > 0.5:
                 weather_parts.append(f"wind {wind_vel:.2f}m/s")
             if weather_parts:
-                weather_str = f"Weather: {' | '.join(weather_parts)}"
-                # Make it clear this is current conditions only — no forecast data
-                weather_str += " (current conditions only — NO forecast data, cannot predict future weather)"
-                lines.append(weather_str)
+                lines.append(f"Weather: {' | '.join(weather_parts)}")
 
         # === Engine health ===
         oil_temp = player.get("oil_temp", 0)
@@ -617,12 +609,7 @@ class ContextBuilder:
             if part:
                 engine_parts.append(part)
         if engine_parts:
-            if engine_baseline:
-                lines.append(f"Engine: {' | '.join(engine_parts)}")
-            else:
-                lines.append(
-                    f"Engine: {' | '.join(engine_parts)} (reference ranges not available — report values only)"
-                )
+            lines.append(f"Engine: {' | '.join(engine_parts)}")
 
         if engine_warnings:
             warning_str = format_engine_warnings(engine_warnings)
@@ -652,7 +639,7 @@ class ContextBuilder:
 
         lines.append(f"  Position: P{pos} (Class P{class_pos})")
 
-        # Fuel display with qualitative descriptor and tank capacity
+        # Fuel: compact format combining level, burn rate, range, and warnings.
         # Descriptor bands: critical (<10%), low (10-20%), half (20-50%), adequate (50-80%), full (>80%)
         if fuel_pct >= 0.8:
             fuel_desc = "full"
@@ -665,111 +652,105 @@ class ContextBuilder:
         else:
             fuel_desc = "⚠ CRITICAL"
 
-        fuel_line = f"  Fuel: {fuel_level:.2f}L"
+        # Build fuel amount: level/tank (max add, %, descriptor)
         if effective_fuel_max and fuel_level > 0:
-            if fuel_max_pct < 1.0 and fuel_max_start > 0:
-                fuel_line += f"/{fuel_max_start:.1f}L"
-            else:
-                fuel_line += f"/{fuel_max:.0f}L"
-            # Show max fuel add so the LLM can't suggest more than the tank holds
             max_add = effective_fuel_max - fuel_level
-            if max_add > 0:
-                fuel_line += f" (max add: {max_add:.0f}L,"
+            if fuel_max_pct < 1.0 and fuel_max_start > 0:
+                tank_str = f"{fuel_max_start:.1f} litre"
             else:
-                fuel_line += " ("
+                tank_str = f"{fuel_max:.0f} litre"
+            if max_add > 0:
+                fuel_amt = f"{fuel_level:.1f} litres/{tank_str} tank (max add {max_add:.0f} litres, {format_pct(fuel_pct)}, {fuel_desc})"
+            else:
+                fuel_amt = f"{fuel_level:.1f} litres/{tank_str} tank ({format_pct(fuel_pct)}, {fuel_desc})"
         else:
-            fuel_line += " ("
-        fuel_line += f"{format_pct(fuel_pct)}, {fuel_desc})"
+            fuel_amt = f"{fuel_level:.1f} litres ({format_pct(fuel_pct)}, {fuel_desc})"
 
-        # Fuel urgency warning (shown on the same line for visibility)
+        # Fuel urgency warning
         if 0 < fuel_pct < 0.2 and fuel_laps > 0:
-            fuel_line += " ⚠ FUEL WARNING"
+            fuel_amt += " ⚠ FUEL WARNING"
 
-        lines.append(fuel_line)
-
-        # Per-lap burn rate and laps remaining — shown on a separate line
-        # to avoid the LLM confusing "laps remaining: unreliable" with
-        # "the fuel level is unreliable". The fuel level (e.g. 15.12L, 69%)
-        # IS accurate — only the laps estimate depends on having burn rate data.
+        # Burn rate and range on one line
         if avg_fuel_per_lap > 0 and fuel_est_quality == "good":
-            lines.append(
-                f"  Fuel burn: ~{avg_fuel_per_lap:.2f} litres per lap (avg over recent laps)"
-            )
+            burn_str = f"~{avg_fuel_per_lap:.2f} litres/lap"
             if fuel_laps > 0:
-                lines.append(
-                    f"  Fuel range: ~{fuel_laps:.1f} laps at current burn rate"
-                )
-                # Critical: fuel range vs race laps remaining comparison
-                if race_laps_remain > 0:
-                    if fuel_laps < race_laps_remain:
-                        deficit_laps = race_laps_remain - fuel_laps
-                        lines.append(
-                            f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.1f} laps short — cannot finish without pit stop"
-                        )
-                    elif fuel_laps < race_laps_remain + 1:
-                        # Within 1 lap of shortage — margins are too thin to be safe
-                        margin = fuel_laps - race_laps_remain
-                        if margin < 0.3:
-                            lines.append(
-                                f"  ⚠ FUEL TIGHT: ~{margin:.1f} laps margin — will NOT finish if burn rate varies. Pit recommended."
-                            )
-                        else:
-                            lines.append(
-                                f"  ⚠ FUEL TIGHT: only ~{margin:.1f} laps margin — pit if safety car or incident possible"
-                            )
+                burn_str += f", range ~{fuel_laps:.1f} laps"
         elif avg_fuel_per_lap > 0 and fuel_est_quality == "rough":
-            lines.append(
-                f"  Fuel burn: ~{avg_fuel_per_lap:.2f} litres per lap (approx, based on 1-2 laps)"
-            )
+            burn_str = f"~{avg_fuel_per_lap:.2f} litres/lap (approx)"
             if fuel_laps > 0:
-                lines.append(f"  Fuel range: ~{fuel_laps:.1f} laps (approx)")
-                if race_laps_remain > 0:
-                    if fuel_laps < race_laps_remain:
-                        deficit_laps = race_laps_remain - fuel_laps
-                        lines.append(
-                            f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.1f} laps short (approx) — cannot finish without pit stop"
-                        )
-                    elif fuel_laps < race_laps_remain + 1:
-                        margin = fuel_laps - race_laps_remain
-                        if margin < 0.3:
-                            lines.append(
-                                f"  ⚠ FUEL TIGHT: ~{margin:.1f} laps margin (approx) — will NOT finish if burn rate varies. Pit recommended."
-                            )
-                        else:
-                            lines.append(
-                                f"  ⚠ FUEL TIGHT: only ~{margin:.1f} laps margin (approx) — pit if safety car or incident possible"
-                            )
+                burn_str += f", range ~{fuel_laps:.1f} laps (approx)"
         else:
-            # No burn rate data yet — make it clear the LLM must NOT invent
-            # a specific litres-per-lap figure. "calculating" was misread as "almost ready"
-            # by the LLM, causing it to fabricate burn rates like "1.3 litres per lap".
-            lines.append("  Fuel burn: unknown — per-lap rate not yet available")
+            burn_str = "unknown"
 
-        # Fuel recommendation — calculate how much fuel to add at next pit stop.
-        # Do the math here so the LLM doesn't invent wrong amounts.
-        # Only shown when we have burn rate data AND know how many laps are left.
-        if (
+        lines.append(f"  Fuel: {fuel_amt}. Burn {burn_str}.")
+
+        # Fuel shortage/tight warning — includes fuel-to-add when applicable
+        if avg_fuel_per_lap > 0 and fuel_laps > 0 and race_laps_remain > 0:
+            if fuel_laps < race_laps_remain:
+                deficit_laps = race_laps_remain - fuel_laps
+                approx = "" if fuel_est_quality == "good" else " (approx)"
+                if effective_fuel_max > 0 and fuel_level > 0:
+                    fuel_needed = avg_fuel_per_lap * race_laps_remain
+                    fuel_deficit = fuel_needed - fuel_level
+                    if fuel_deficit > 0:
+                        add_litres = min(
+                            int(fuel_deficit + avg_fuel_per_lap) + 1,
+                            int(effective_fuel_max - fuel_level),
+                        )
+                        add_litres = max(1, add_litres)
+                        lines.append(
+                            f"  ⚠ FUEL SHORTAGE: {deficit_laps:.0f} laps short{approx}. "
+                            f"Add {add_litres} litres to finish (need ~{fuel_needed:.0f} litres for {race_laps_remain} laps)"
+                        )
+                    else:
+                        lines.append(
+                            f"  ⚠ FUEL SHORTAGE: {deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
+                        )
+                else:
+                    lines.append(
+                        f"  ⚠ FUEL SHORTAGE: {deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
+                    )
+            elif fuel_laps < race_laps_remain + 1:
+                margin = fuel_laps - race_laps_remain
+                approx = "" if fuel_est_quality == "good" else " (approx)"
+                if margin < 0.3:
+                    urgency = "will NOT finish if burn rate varies. Pit recommended."
+                else:
+                    urgency = "pit if safety car possible."
+                # Include fuel-to-add if there's a litres deficit even within margin
+                add_str = ""
+                if effective_fuel_max > 0 and fuel_level > 0:
+                    fuel_needed = avg_fuel_per_lap * race_laps_remain
+                    fuel_deficit = fuel_needed - fuel_level
+                    if fuel_deficit > 0:
+                        add_litres = min(
+                            int(fuel_deficit + avg_fuel_per_lap) + 1,
+                            int(effective_fuel_max - fuel_level),
+                        )
+                        add_litres = max(1, add_litres)
+                        add_str = f" Add {add_litres} litres if pitting."
+                lines.append(
+                    f"  ⚠ FUEL TIGHT: {margin:.1f} laps margin{approx}. {urgency}{add_str}"
+                )
+        elif (
             avg_fuel_per_lap > 0
             and race_laps_remain > 0
             and effective_fuel_max > 0
             and fuel_level > 0
         ):
+            # Have burn rate but no range comparison — still show fuel-to-add if needed
             fuel_needed = avg_fuel_per_lap * race_laps_remain
             fuel_deficit = fuel_needed - fuel_level
             if fuel_deficit > 0:
-                # Add 1-lap safety margin to avoid running dry on the last lap,
-                # then round up to whole litres (add_fuel only accepts integers).
                 add_litres = min(
-                    int(fuel_deficit + avg_fuel_per_lap)
-                    + 1,  # deficit + 1 lap margin, ceil
-                    int(effective_fuel_max - fuel_level),  # max fuel capacity
+                    int(fuel_deficit + avg_fuel_per_lap) + 1,
+                    int(effective_fuel_max - fuel_level),
                 )
-                add_litres = max(1, add_litres)  # at least 1L
+                add_litres = max(1, add_litres)
                 quality_note = "" if fuel_est_quality == "good" else " (approx)"
                 lines.append(
-                    f"  Fuel to finish: ~{fuel_needed:.1f}L for {race_laps_remain} laps{quality_note}"
+                    f"  Fuel to add: {add_litres} litres (need ~{fuel_needed:.0f} litres for {race_laps_remain} laps{quality_note})"
                 )
-                lines.append(f"  Fuel to add: {add_litres}L")
 
         # Race duration and time remaining (for time-based races)
         # Show both time and laps — the LLM needs to know the race is e.g. 30 min
@@ -1041,7 +1022,9 @@ class ContextBuilder:
             recent = lap_history[-self.include_lap_history :]
             times = [format_lap_time(r["lap_time"]) for r in recent]
             fuels = [
-                f"{r['fuel_used']:.1f}L" for r in recent if r.get("fuel_used", 0) > 0
+                f"{r['fuel_used']:.1f} litres"
+                for r in recent
+                if r.get("fuel_used", 0) > 0
             ]
             trend = player.get("lap_time_trend", 0)
 
