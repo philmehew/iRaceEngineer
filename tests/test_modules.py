@@ -11,6 +11,7 @@ from race_state import (
 )
 from context_builder import (
     ContextBuilder,
+    TRACK_WETNESS_LABELS,
     format_lap_time,
     format_gap,
     format_temp,
@@ -484,6 +485,44 @@ class TestContextBuilder:
         odometers = snap["player"]["tyre_odometers"]
         assert odometers["LF"] == 1500.0
         assert odometers["RR"] == 1500.0
+
+    def test_track_wetness_labels(self):
+        """iRacing TrackWetness is 0-7 enum, not 0-3 scale.
+        0=unknown, 1=dry, 2=mostly_dry, 3=very_lightly_wet,
+        4=lightly_wet, 5=moderately_wet, 6=very_wet, 7=extremely_wet.
+        """
+        # Dry track (value 1) should say "Dry", not "Damp"
+        assert TRACK_WETNESS_LABELS[1] == "Dry"
+        # Unknown (value 0) should be None — don't report if unknown
+        assert TRACK_WETNESS_LABELS[0] is None
+        # Wet levels
+        assert TRACK_WETNESS_LABELS[2] == "Mostly Dry"
+        assert TRACK_WETNESS_LABELS[3] == "Very Lightly Wet"
+        assert TRACK_WETNESS_LABELS[7] == "Extremely Wet"
+
+    def test_dry_track_not_reported_as_damp(self):
+        """A dry track (TrackWetness=1) must appear as 'Dry', never 'Damp'."""
+        state = make_state()
+        # Set wetness to 1 (dry in iRacing's enum)
+        state.session.track_wetness = 1.0
+        config = {"prompt": {"context_depth": "full", "system": "test"}}
+        builder = ContextBuilder(config)
+        content = builder.build_prompt(state.get_snapshot())[1]["content"]
+        # Must say "Dry", must NOT say "Damp"
+        assert "Dry" in content
+        assert "Damp" not in content
+
+    def test_unknown_wetness_not_reported(self):
+        """TrackWetness=0 (unknown) should not appear in context at all."""
+        state = make_state()
+        state.session.track_wetness = 0.0
+        config = {"prompt": {"context_depth": "full", "system": "test"}}
+        builder = ContextBuilder(config)
+        content = builder.build_prompt(state.get_snapshot())[1]["content"]
+        # Should not mention track wetness condition at all
+        assert "Dry" not in content
+        assert "Damp" not in content
+        assert "Wet" not in content
 
 
 # --- ActionExecutor tests ---

@@ -121,8 +121,19 @@ def format_car_proximity(car_left_right: int) -> str:
     return " | ".join(parts)
 
 
-# iRacing TrackWetness scale (integer, not percentage)
-TRACK_WETNESS_LABELS = {0: "Dry", 1: "Damp", 2: "Wet", 3: "Very Wet"}
+# iRacing TrackWetness enum (from irsdk):
+# 0=unknown, 1=dry, 2=mostly_dry, 3=very_lightly_wet, 4=lightly_wet,
+# 5=moderately_wet, 6=very_wet, 7=extremely_wet
+TRACK_WETNESS_LABELS = {
+    0: None,  # unknown — don't report track condition if unknown
+    1: "Dry",
+    2: "Mostly Dry",
+    3: "Very Lightly Wet",
+    4: "Lightly Wet",
+    5: "Moderately Wet",
+    6: "Very Wet",
+    7: "Extremely Wet",
+}
 
 
 class ContextBuilder:
@@ -314,10 +325,8 @@ class ContextBuilder:
             air_temp = weather.get("air_temp", 0)
             wetness = weather.get("track_wetness", 0)
             wet_str = ""
-            if wetness > 0:
-                wet_label = TRACK_WETNESS_LABELS.get(
-                    int(wetness), f"level {int(wetness)}"
-                )
+            wet_label = TRACK_WETNESS_LABELS.get(int(wetness))
+            if wet_label is not None:
                 wet_str = f", {wet_label}"
             if track_temp > 0 or air_temp > 0:
                 lines.append(
@@ -519,10 +528,8 @@ class ContextBuilder:
                 weather_parts.append(f"Track {format_temp(track_temp)}")
             if air_temp > 0:
                 weather_parts.append(f"Air {format_temp(air_temp)}")
-            if wetness > 0:
-                wet_label = TRACK_WETNESS_LABELS.get(
-                    int(wetness), f"level {int(wetness)}"
-                )
+            wet_label = TRACK_WETNESS_LABELS.get(int(wetness))
+            if wet_label is not None:
                 weather_parts.append(f"track {wet_label}")
             if declared_wet:
                 weather_parts.append("DECLARED WET")
