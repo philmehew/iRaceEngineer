@@ -19,7 +19,6 @@ from context_builder import (
     format_engine_warnings,
     format_car_proximity,
 )
-from action_executor import ActionExecutor
 from capture import TelemetryReplay
 
 
@@ -522,63 +521,52 @@ class TestContextBuilder:
         # Should not mention track wetness condition at all
         assert "Dry" not in content
         assert "Damp" not in content
+
+    def test_race_ending_soon_suppressed_at_lap_zero(self):
+        """RACE ENDING SOON must NOT fire at lap 0 (formation/pre-race).
+
+        At lap 0, iRacing reports near-zero time remaining during the pace lap,
+        which makes lap estimates unreliable. The guard prevents the LLM from
+        getting "DO NOT PIT, stay out and finish" at the start of a 30-min race.
+        """
+        # Create a time-based race state at lap 0 with very few estimated laps
+        config = {"prompt": {"context_depth": "full", "system": "test"}}
+        state = RaceState(config)
+        tel = sample_telemetry(lap=0, fuel=72.0)
+        # Make it a time-based race by setting laps_remain to the sentinel value
+        tel["SessionLapsRemain"] = 32767  # sentinel for time-based race
+        tel["SessionTimeRemain"] = 114.0  # ~1.9 min left (formation lap)
+        tel["RaceLaps"] = 0
+        tel["Lap"] = 0
+        state.update(tel, sample_session_info(), {0: "Test Driver", 1: "Other Driver"})
+        # Force estimated_total_laps to a small number (simulates unreliable estimate)
+        state._estimated_total_laps = 2
+        snap = state.get_snapshot()
+        builder = ContextBuilder(config)
+        content = builder.build_prompt(snap)[1]["content"]
+        # RACE ENDING SOON must NOT appear at lap 0
+        assert "RACE ENDING SOON" not in content
+        assert "DO NOT PIT" not in content
+
+    def test_race_ending_soon_fires_late_race(self):
+        """RACE ENDING SOON SHOULD fire at lap 10+ with ≤2 laps remaining."""
+        config = {"prompt": {"context_depth": "full", "system": "test"}}
+        state = RaceState(config)
+        tel = sample_telemetry(lap=10, fuel=5.0)
+        # Time-based race with very few estimated laps remaining
+        tel["SessionLapsRemain"] = 32767  # sentinel for time-based race
+        tel["SessionTimeRemain"] = 180.0  # 3 min left
+        tel["RaceLaps"] = 10
+        tel["Lap"] = 10
+        state.update(tel, sample_session_info(), {0: "Test Driver", 1: "Other Driver"})
+        # Force estimated_total_laps = 12 → race_laps_remain = 2
+        state._estimated_total_laps = 12
+        snap = state.get_snapshot()
+        builder = ContextBuilder(config)
+        content = builder.build_prompt(snap)[1]["content"]
+        # RACE ENDING SOON SHOULD appear at lap 10 with only 2 laps left
+        assert "RACE ENDING SOON" in content
         assert "Wet" not in content
-
-
-# --- ActionExecutor tests ---
-
-
-class TestActionExecutor:
-    def test_parse_simple_action(self):
-        executor = ActionExecutor(config={"actions": {"enabled": False}})
-        text, actions = executor.parse_response("Pit now.\n[ACTION] pit_this_lap")
-        assert "Pit now." in text
-        assert len(actions) == 1
-        assert actions[0]["action"] == "pit_this_lap"
-
-    def test_parse_action_with_param(self):
-        executor = ActionExecutor(config={"actions": {"enabled": False}})
-        text, actions = executor.parse_response("Box this lap.\n[ACTION] add_fuel: 60")
-        assert len(actions) == 1
-        assert actions[0]["action"] == "add_fuel"
-        assert actions[0]["param"] == "60"
-
-    def test_parse_multiple_actions(self):
-        executor = ActionExecutor(config={"actions": {"enabled": False}})
-        text, actions = executor.parse_response(
-            "Pit now.\n[ACTION] pit_this_lap\n[ACTION] add_fuel: 60\n[ACTION] change_tyres"
-        )
-        assert len(actions) == 3
-
-    def test_parse_no_actions(self):
-        executor = ActionExecutor(config={"actions": {"enabled": False}})
-        text, actions = executor.parse_response("Stay out for 3 more laps.")
-        assert text == "Stay out for 3 more laps."
-        assert len(actions) == 0
-
-    def test_dry_run_mode(self):
-        executor = ActionExecutor(config={"actions": {"enabled": False}})
-        results = executor.execute(
-            [{"action": "pit_this_lap", "param": None, "raw": "[ACTION] pit_this_lap"}]
-        )
-        assert results[0].startswith("[WOULD EXECUTE]")
-
-    def test_blocked_action(self):
-        executor = ActionExecutor(
-            config={"actions": {"enabled": False, "allowed_actions": ["pit_this_lap"]}}
-        )
-        results = executor.execute(
-            [
-                {
-                    "action": "pit_this_lap",
-                    "param": None,
-                    "raw": "[ACTION] pit_this_lap",
-                },
-                {"action": "add_fuel", "param": "60", "raw": "[ACTION] add_fuel: 60"},
-            ]
-        )
-        assert "[WOULD EXECUTE]" in results[0]
-        assert "[BLOCKED]" in results[1]
 
 
 # --- Capture/Replay tests ---
@@ -859,6 +847,34 @@ class TestSectorTimeTracker:
         assert 1 in sectors
         # The fastest S1 should be ~28s (128.0 - 100.0)
         assert abs(sectors[1] - 28.0) < 1.0  # Faster time wins
+
+    def test_partial_sector_rejected(self):
+        """A sector time less than half the existing best is rejected as partial."""
+        tracker = SectorTimeTracker()
+        tracker.set_boundaries([0.0, 0.3333, 0.6667])
+
+        # Set up: enter S3 at 70s, complete it at 117s → S3 = 47s (legitimate)
+        tracker.update([0.1], 10.0, [2], [0], [1])  # S1 enter
+        tracker.update([0.4], 40.0, [2], [0], [1])  # S2 enter, S1 = 30s
+        tracker.update([0.7], 70.0, [2], [0], [1])  # S3 enter, S2 = 30s
+        tracker.update([0.05], 117.0, [2], [0], [1])  # S1 enter, S3 = 47s
+        sectors = tracker.get_fastest_sectors(0)
+        assert 3 in sectors
+        assert abs(sectors[3] - 47.0) < 1.0
+
+        # Now try to update S3 with a partial time of 20s (< 47 * 0.5 = 23.5)
+        # This should be REJECTED — it's from an incomplete sector
+        tracker.update([0.7], 137.0, [2], [0], [1])  # Re-enter S3
+        tracker.update([0.05], 157.0, [2], [0], [1])  # S3 = 20s — should be rejected
+        sectors = tracker.get_fastest_sectors(0)
+        # S3 should still be ~47s, not 20s
+        assert abs(sectors[3] - 47.0) < 1.0
+
+        # But a legitimate improvement (e.g., 45s) should be accepted
+        tracker.update([0.7], 177.0, [2], [0], [1])  # Re-enter S3
+        tracker.update([0.05], 222.0, [2], [0], [1])  # S3 = 45s — should be accepted
+        sectors = tracker.get_fastest_sectors(0)
+        assert abs(sectors[3] - 45.0) < 1.0
 
     def test_invalid_position_skipped(self):
         """Car with position <= 0 is skipped (disconnected)."""

@@ -124,6 +124,109 @@ def load_all_snapshots(session_dir: str):
     return snapshots
 
 
+def check_response_quality(question: str, response: str, context: str) -> list[str]:
+    """Check an LLM response for common quality issues.
+
+    Returns a list of issue descriptions. Empty list means no issues found.
+    """
+    issues = []
+    response_lower = response.lower()
+    context_lower = context.lower()
+
+    # 1. No refusal — the LLM must always provide useful info
+    refusal_phrases = ["i'm busy", "try again", "ask again later", "cannot respond"]
+    for phrase in refusal_phrases:
+        if phrase in response_lower:
+            issues.append(f"Refusal: contains '{phrase}'")
+            break
+
+    # 2. No pit recommendation when RACE ENDING SOON
+    if "race ending soon" in context_lower or "!! race ending soon" in context_lower:
+        pit_phrases = [
+            "box this lap",
+            "box lap",
+            "pit now",
+            "pit this lap",
+            "should pit",
+            "need to pit",
+            "go to pit",
+            "pitting is",
+        ]
+        for phrase in pit_phrases:
+            if phrase in response_lower:
+                issues.append(
+                    "Bad pit advice: recommends pitting during RACE ENDING SOON"
+                )
+                break
+
+    # 3. No tyre assessment when data is stale
+    if "stale" in context_lower or "cannot assess condition" in context_lower:
+        assessment_phrases = [
+            "tyres are fine",
+            "tyres look good",
+            "pressures are good",
+            "pressures stable",
+            "pressures normal",
+            "within normal range",
+            "consider fresh",
+            "if wear",
+            "tyre temps are",
+            "tyre wear is",
+        ]
+        for phrase in assessment_phrases:
+            if phrase in response_lower:
+                issues.append(f"Stale tyre assessment: '{phrase}' despite stale data")
+                break
+
+    # 4. No incident/damage confusion
+    if "fast repair" in response_lower and "incident" in response_lower:
+        # Fast repair fixes body damage, NOT incidents. If the response
+        # connects fast repair to incidents without mentioning body/damage,
+        # that's a confusion.
+        if "damage" not in response_lower and "body" not in response_lower:
+            issues.append(
+                "Incident-damage confusion: mentions fast repair with incidents but no body damage context"
+            )
+
+    # 5. No "monitor" or "watch" language (one-shot advice rule)
+    monitor_phrases = [
+        "keep an eye on",
+        "monitor the",
+        "watch for",
+        "watch the",
+        "track the",
+        "keep monitoring",
+    ]
+    for phrase in monitor_phrases:
+        if phrase in response_lower:
+            issues.append(f"Monitor language: '{phrase}' violates one-shot rule")
+            break
+
+    # 6. Highlight when ENGINE WARNING present but not addressed in response
+    if "engine warning" in context_lower:
+        # Check if the response mentions the warning
+        if (
+            "engine warning" not in response_lower
+            and "fuel pressure" not in response_lower
+        ):
+            issues.append("ENGINE WARNING in context but not highlighted in response")
+
+    # 7. Check for wildly incorrect fuel calculations
+    # If context shows fuel at < 5% and response says "laps of fuel" > 10,
+    # that's a hallucinated calculation
+    if "⚠ critical" in context_lower:
+        # Extract any number like "X laps fuel" in response
+        import re
+
+        laps_match = re.search(r"(\d+)\+?\s*laps\s+(?:of\s+)?fuel", response_lower)
+        if laps_match and int(laps_match.group(1)) > 10:
+            issues.append(
+                f"Wild fuel calc: claims {laps_match.group(1)} laps of fuel despite CRITICAL warning"
+            )
+
+    return issues
+
+
 def run_eval(session_dir: str, count: int, output_file: str, config: dict):
     """Run the evaluation: load snapshots, ask questions, log responses.
 
@@ -200,7 +303,8 @@ def run_eval(session_dir: str, count: int, output_file: str, config: dict):
         except Exception as e:
             response = f"[ERROR: {e}]"
 
-        # Extract context sent
+        # Extract full prompt (system + user)
+        system_prompt = messages[0]["content"]
         context = messages[1]["content"]
 
         # Summary line for the state
@@ -217,6 +321,7 @@ def run_eval(session_dir: str, count: int, output_file: str, config: dict):
             {
                 "snapshot": snap_idx + 1,
                 "question": question or "(general strategy)",
+                "system_prompt": system_prompt,
                 "context": context,
                 "response": response or "(empty)",
                 "state_summary": summary,
@@ -239,7 +344,15 @@ def run_eval(session_dir: str, count: int, output_file: str, config: dict):
             f"Context depth: `{config.get('prompt', {}).get('context_depth', 'full')}`\n"
         )
         f.write(f"Questions: {len(results)}\n\n")
-        f.write("---\n\n")
+
+        # Write system prompt once at the top (it's the same for all queries)
+        if results and results[0].get("system_prompt"):
+            f.write("## System Prompt\n\n")
+            f.write(
+                "<details>\n<summary>System prompt (sent with every query)</summary>\n\n"
+            )
+            f.write(f"```\n{results[0]['system_prompt']}\n```\n\n")
+            f.write("</details>\n\n---\n\n")
 
         for r in results:
             f.write(f"## Snapshot {r['snapshot']} — {r['state_summary']}\n\n")
@@ -249,7 +362,44 @@ def run_eval(session_dir: str, count: int, output_file: str, config: dict):
             f.write(f"```\n{r['context']}\n```\n\n")
             f.write("</details>\n\n")
             f.write(f"**A:** {r['response']}\n\n")
+
+            # Quality checks per response
+            issues = check_response_quality(r["question"], r["response"], r["context"])
+            if issues:
+                f.write(f"**Issues:** {'; '.join(issues)}\n\n")
+            else:
+                f.write("**Quality:** ✅ OK\n\n")
             f.write("---\n\n")
+
+        # Summary section
+        f.write("## Quality Summary\n\n")
+        total = len(results)
+        results_with_issues = sum(
+            1
+            for r in results
+            if check_response_quality(r["question"], r["response"], r["context"])
+        )
+        all_issues = []
+        for r in results:
+            all_issues.extend(
+                check_response_quality(r["question"], r["response"], r["context"])
+            )
+
+        f.write(f"- Total responses: {total}\n")
+        f.write(f"- Responses with issues: {results_with_issues}\n")
+        f.write(f"- Clean responses: {total - results_with_issues}\n\n")
+
+        # Count by issue type
+        issue_counts: dict[str, int] = {}
+        for issue in all_issues:
+            issue_type = issue.split(":")[0] if ":" in issue else issue
+            issue_counts[issue_type] = issue_counts.get(issue_type, 0) + 1
+
+        if issue_counts:
+            f.write("### Issue Breakdown\n\n")
+            for issue_type, count in sorted(issue_counts.items(), key=lambda x: -x[1]):
+                f.write(f"- {issue_type}: {count}\n")
+            f.write("\n")
 
     print(f"\n✅ Evaluation complete. Results written to {output_file}")
     print(f"   {len(results)} questions asked.")

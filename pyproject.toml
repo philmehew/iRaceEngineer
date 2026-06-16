@@ -28,13 +28,13 @@ dev = [
 
 [tool.setuptools]
 py-modules = [
-    "action_executor",
     "capture",
     "context_builder",
     "iracing_client",
     "llm_client",
     "main",
     "race_state",
+    "spotter",
     "stt_client",
     "tts_client",
 ]
@@ -43,3 +43,6 @@ py-modules = [
 dev = [
     "pytest>=9.0.3",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

@@ -31,9 +31,6 @@ iRacing (shared memory)
         │              state →         │            (car left/right, three wide, clear,
         ▼              configurable    ▼             car behind closing, flags, fuel,
  llm_client.py        depth prompt   Pre-recorded WAV files (audio/)  penalties, pit entry/exit)
-        │
-        ▼
- action_executor.py   ← parses [ACTION] directives (dry_run by default)
 ```
 
 ## Quick Start
@@ -166,38 +163,6 @@ team:
 - **DriverState is universal** — the same `DriverState` class is used for the player, teammates, and opponents. Player-only fields (fuel, tyre temps/wear, brakes) default to zero for non-player cars
 
 > **Note:** Team car indices are detected and stored internally, but are not yet used to give teammates special treatment in the prompt (e.g., richer data, explicit team labels, separate team section). This is planned for a future update.
-
-## Action Directives
-
-The LLM can include optional `[ACTION]` directives in its response:
-
-```
-Box this lap — tyres are past their window and you have 8 laps of fuel.
-[ACTION] pit_this_lap
-[ACTION] add_fuel: 60
-[ACTION] change_tyres
-```
-
-In v1, actions are **logged but not executed** (`actions.enabled: false` in config). This ensures the architecture is in place without risking unintended pit commands. To enable real execution:
-
-```yaml
-actions:
-  enabled: true
-  allowed_actions:
-    - pit_this_lap
-    - add_fuel
-    - change_tyres
-    - clear_penalty
-```
-
-Available actions (mapped to pyirsdk `PitCommandMode`):
-
-| Action | iRacing Command | Description |
-|--------|----------------|-------------|
-| `pit_this_lap` | Request pit stop | Pit on the current lap |
-| `add_fuel: N` | Set fuel amount | Add N litres at next pit stop |
-| `change_tyres` | Request tyre change | Change tyres at next pit stop |
-| `clear_penalty` | Clear penalty | Clear a penalty |
 
 ## iRacing SDK Data
 
@@ -542,15 +507,6 @@ llm:
   max_tokens: 300
   temperature: 0.3
 
-# Action execution (dry_run by default)
-actions:
-  enabled: false
-  allowed_actions:
-    - pit_this_lap
-    - add_fuel
-    - change_tyres
-    - clear_penalty
-
 # Button trigger — wheel button to query the LLM
 trigger:
   device_index: 0    # Joystick device index (use test_wheel.py to find)
@@ -757,7 +713,6 @@ Same as `--capture` but always saves to the `tests/sample_data/` folder (from co
 | `race_state.py` | In-memory model — positions, gaps, fuel, tyres, engine health, lap trends |
 | `context_builder.py` | Condenses state → LLM prompt (3 depth levels, format helpers) |
 | `llm_client.py` | OpenAI-compatible API caller (works with any `/v1` endpoint) |
-| `action_executor.py` | Parses `[ACTION]` directives from LLM responses |
 | `spotter.py` | Deterministic car proximity & race alert calls — CarLeftRight transitions, car-behind-closing, flags, fuel, penalties, pit transitions |
 | `stt_client.py` | Speech-to-text — Whisper (faster-whisper) + mic capture (sounddevice) |
 | `tts_client.py` | Text-to-speech — Piper TTS + audio playback (sounddevice) |
@@ -765,7 +720,7 @@ Same as `--capture` but always saves to the `tests/sample_data/` folder (from co
 | `test_stt.py` | Standalone STT test — record + transcribe without iRacing |
 | `test_tts.py` | Standalone TTS test — speak text without iRacing |
 | `test_wheel.py` | Standalone wheel button discovery — find device/button indices for push-to-talk |
-| `tests/test_modules.py` | Unit tests — RaceState, ContextBuilder, ActionExecutor, TelemetryReplay |
+| `tests/test_modules.py` | Unit tests — RaceState, ContextBuilder, TelemetryReplay |
 | `tests/test_spotter.py` | Unit tests — ProximityDetector, CarBehindTracker, SpotterAudioPlayer, Spotter coordinator |
 | `tests/eval_llm_responses.py` | Batch LLM evaluation — asks 50 questions against replay data, logs results |
 
@@ -780,7 +735,7 @@ This is the first working slice of the iRaceEngineer spotter system. Planned nex
 - [ ] **Multi-driver audio** — name-prefixed calls for 7 drivers
 - [x] **Spotter proximity logic** — deterministic 30Hz calls for car proximity (car left/right, three wide, clear)
 - [x] **Spotter car-behind-closing** — lap-time delta detection warns when car behind is consistently faster
-- [ ] **Action execution** — enable real `[ACTION]` commands to iRacing
+- [ ] ~~Action execution~~ — removed for now; may be re-added later as a separate module
 - [ ] **Team-aware prompts** — label teammates explicitly in nearby cars section, show per-teammate data, separate team section in full depth
 
 ## License

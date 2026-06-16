@@ -156,7 +156,7 @@ class ContextBuilder:
     def _default_system_prompt(self) -> str:
         return (
             "You are a race engineer. Speak in short radio-style sentences. No markdown, bullets, or headers.\n"
-            "Example: 'Box this lap. Tyres are gone. Add 60 litres. [ACTION] pit_this_lap | add_fuel: 60'\n"
+            "Example: 'Box this lap. Tyres are gone. Add 60 litres.'\n"
             "If unsure, say so. Never invent data. The 'Your car' section is the driver you're talking to.\n\n"
             "Rules:\n"
             "- One-shot advice only. Never promise to monitor, track, or follow up later.\n"
@@ -164,11 +164,9 @@ class ContextBuilder:
             "- Don't assess temps or pressures as high/low/normal without a baseline — just report values.\n"
             "- 'Incidents' are safety-rating points, NOT car damage. Always report the count.\n"
             "- If tyre data is unreliable, report last-known values but don't comment on trends or degradation.\n"
-            "- Fuel rules: Use 'litres' not 'L' when speaking. add_fuel takes whole litres only. "
+            "- Fuel rules: Use 'litres' not 'L' when speaking. "
             "If context shows 'Fuel to add: N', use that exact amount. If fuel burn is 'unknown', say so — never invent a figure.\n"
-            "- Weather is current conditions only — never predict future weather.\n"
-            "- Only include [ACTION] when asked about pitting, fuel, tyres, or strategy. Don't add actions to unrelated questions.\n\n"
-            "Optional actions: [ACTION] pit_this_lap | add_fuel: <litres> | change_tyres | clear_penalty"
+            "- Weather is current conditions only — never predict future weather."
         )
 
     def build_prompt(self, state: dict, question: str = "") -> list[dict]:
@@ -608,12 +606,14 @@ class ContextBuilder:
             part = _engine_part("Manifold", manifold_press, "bar", "manifold_press")
             if part:
                 engine_parts.append(part)
-        if engine_parts:
-            lines.append(f"Engine: {' | '.join(engine_parts)}")
-
+        # Engine warning — surface BEFORE the engine line so the LLM
+        # doesn't miss it buried in the middle of temperature values
         if engine_warnings:
             warning_str = format_engine_warnings(engine_warnings)
-            lines.append(f"  ⚠ ENGINE WARNING: {warning_str}")
+            lines.append(f"⚠ ENGINE WARNING: {warning_str}")
+
+        if engine_parts:
+            lines.append(f"Engine: {' | '.join(engine_parts)}")
 
         # === Player car ===
         fuel_laps = player.get("fuel_laps_remaining", 0)
@@ -627,6 +627,21 @@ class ContextBuilder:
         effective_fuel_max = fuel_max_start if fuel_max_start > 0 else fuel_max
 
         lines.append("\nYour car:")
+
+        # Race-ending warning — surface this FIRST so the LLM sees it before
+        # anything else. A 3B model reads top-down; burying this after fuel
+        # causes it to recommend pitting when the race is almost over.
+        # Guard: don't fire at lap 0 (formation/pre-race) — estimates are unreliable
+        # and iRacing reports near-zero time remaining during the pace lap.
+        race_ending_soon = (
+            is_time_race
+            and race_laps_remain <= 2
+            and isinstance(race_laps, int)
+            and race_laps >= 1
+        )
+        if race_ending_soon:
+            lines.append("  !! RACE ENDING SOON — DO NOT PIT. Stay out and finish.")
+
         on_track = player.get("is_on_track", True)
         in_garage = player.get("is_in_garage", False)
         status_parts = []
@@ -685,6 +700,15 @@ class ContextBuilder:
         lines.append(f"  Fuel: {fuel_amt}. Burn {burn_str}.")
 
         # Fuel shortage/tight warning — includes fuel-to-add when applicable
+        # When race is ending (≤2 laps), override urgency to discourage pitting
+        # Guard: don't fire at lap 0 (formation/pre-race) — estimates unreliable
+        race_ending_soon = (
+            is_time_race
+            and race_laps_remain <= 2
+            and isinstance(race_laps, int)
+            and race_laps >= 1
+        )
+
         if avg_fuel_per_lap > 0 and fuel_laps > 0 and race_laps_remain > 0:
             if fuel_laps < race_laps_remain:
                 deficit_laps = race_laps_remain - fuel_laps
@@ -698,22 +722,43 @@ class ContextBuilder:
                             int(effective_fuel_max - fuel_level),
                         )
                         add_litres = max(1, add_litres)
+                        if race_ending_soon:
+                            lines.append(
+                                f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx}. "
+                                f"Need ~{fuel_needed:.0f} litres for {race_laps_remain} laps — "
+                                f"conserve fuel and try to finish, do NOT pit (30s+ pit stop loses positions)"
+                            )
+                        else:
+                            lines.append(
+                                f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx}. "
+                                f"Add {add_litres} litres to finish (need ~{fuel_needed:.0f} litres for {race_laps_remain} laps)"
+                            )
+                    else:
+                        if race_ending_soon:
+                            lines.append(
+                                f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx} — "
+                                f"conserve fuel and try to finish, do NOT pit"
+                            )
+                        else:
+                            lines.append(
+                                f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
+                            )
+                else:
+                    if race_ending_soon:
                         lines.append(
-                            f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx}. "
-                            f"Add {add_litres} litres to finish (need ~{fuel_needed:.0f} litres for {race_laps_remain} laps)"
+                            f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx} — "
+                            f"conserve fuel and try to finish, do NOT pit"
                         )
                     else:
                         lines.append(
                             f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
                         )
-                else:
-                    lines.append(
-                        f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
-                    )
             elif fuel_laps < race_laps_remain + 1:
                 margin = fuel_laps - race_laps_remain
                 approx = "" if fuel_est_quality == "good" else " (approx)"
-                if margin < 0.3:
+                if race_ending_soon:
+                    urgency = "conserve fuel and try to finish — do NOT pit, race is almost over."
+                elif margin < 0.3:
                     urgency = "will NOT finish if burn rate varies. Pit recommended."
                 else:
                     urgency = "pit if safety car or incident possible."
@@ -769,19 +814,22 @@ class ContextBuilder:
                 else:
                     lines.append(f"  Time remaining: ~{remain_min:.1f} min")
             if race_laps_remain > 0:
-                if race_laps_remain <= 1:
+                # Don't show RACE ENDING SOON at lap 0 (formation/pre-race)
+                # — time estimates are unreliable before the first completed lap
+                race_ending_display = isinstance(race_laps, int) and race_laps >= 1
+                if race_laps_remain <= 1 and race_ending_display:
                     lines.append(
                         f"  Race laps remaining: ~{race_laps_remain} — RACE ENDING SOON"
                     )
                     lines.append(
-                        "  ⚠ Pit stop costs ~30s+ — do not pit unless car cannot finish"
+                        "  ⚠ Pit stop costs ~30s+ and you will lose multiple positions. Do NOT pit — stay out and finish the race."
                     )
-                elif race_laps_remain <= 3:
+                elif race_laps_remain <= 3 and race_ending_display:
                     lines.append(
                         f"  Race laps remaining: ~{race_laps_remain} laps (estimated) — RACE ENDING SOON"
                     )
                     lines.append(
-                        "  ⚠ Pit stop costs ~30s+ — only pit if absolutely necessary (e.g. fuel shortage)"
+                        "  ⚠ Pit stop costs ~30s+ and will lose you positions. Only pit if fuel cannot last to the finish."
                     )
                 else:
                     lines.append(
@@ -811,12 +859,6 @@ class ContextBuilder:
 
         if tyres:
             is_stale = tyre_staleness != "live"
-            if tyre_staleness == "stale":
-                lines.append("  Tyres: unreliable (on track, data not updating)")
-            elif tyre_staleness == "live":
-                lines.append("  Tyres: (data updating — fresh from pit stop)")
-            else:
-                lines.append("  Tyres: data availability not yet confirmed")
 
             # When tyre data is stale/frozen, check if all pressures are identical
             # and collapse them into one line to avoid the LLM saying "pressures stable"
@@ -831,33 +873,65 @@ class ContextBuilder:
                 len(pressures) == 4 and len(set(f"{p:.2f}" for p in pressures)) == 1
             )
 
-            if is_stale and all_pressures_same and pressures:
-                # Collapse identical stale pressures into one line
-                # Pressures are stored in kPa; convert to PSI for display
-                stale_label = (
-                    "not updating"
-                    if tyre_staleness == "stale"
-                    else "may not be updating"
-                )
+            if is_stale:
+                # Stale tyre data — show collapsed summary with clear "STALE" label
+                # so the LLM cannot ignore it. The word "STALE" and "cannot assess"
+                # appear together, making it much harder for a small model to
+                # proceed with assessment anyway.
+                if all_pressures_same and pressures:
+                    # All pressures identical (frozen) — collapse temps into one line
+                    temp_parts = []
+                    for corner in ["LF", "RF", "LR", "RR"]:
+                        ts = tyres.get(corner, {})
+                        if not ts:
+                            continue
+                        avg_temp = ts.get("temp_center", 0)
+                        if avg_temp > 0:
+                            temp_parts.append(
+                                f"{CORNER_NAMES[corner]} {_tyre_temp_str(corner, avg_temp)}"
+                            )
+                    # Average wear across all corners
+                    wear_values = []
+                    for corner in ["LF", "RF", "LR", "RR"]:
+                        ts = tyres.get(corner, {})
+                        w = ts.get("wear_center", 0)
+                        if w > 0:
+                            wear_values.append(w)
+                    wear_str = (
+                        f" Life: ~{wear_values[0] * 100:.0f}%." if wear_values else ""
+                    )
+
+                    lines.append(
+                        "  Tyres: STALE (on track, values frozen) — cannot assess condition."
+                    )
+                    if temp_parts:
+                        lines.append(f"    Temps: {' | '.join(temp_parts)}.{wear_str}")
+                else:
+                    # Pressures vary — still show per-corner but with STALE label
+                    lines.append(
+                        "  Tyres: STALE (on track, values frozen) — cannot assess condition."
+                    )
+                    for corner in ["LF", "RF", "LR", "RR"]:
+                        ts = tyres.get(corner, {})
+                        if not ts:
+                            continue
+                        avg_temp = ts.get("temp_center", 0)
+                        pressure = ts.get("cold_pressure", 0)
+                        wear_center = ts.get("wear_center", 0)
+                        odo = tyre_odometers.get(corner, 0)
+                        parts = [_tyre_temp_str(corner, avg_temp)]
+                        if pressure > 0:
+                            parts.append(f"{kpa_to_psi(pressure):.1f}PSI")
+                        if wear_center > 0:
+                            parts.append(f"{format_wear(wear_center)}")
+                        if odo > 0:
+                            parts.append(f"{odo:.0f}km")
+                        lines.append(f"    {CORNER_NAMES[corner]}: {' | '.join(parts)}")
+            elif tyre_staleness == "live":
+                # Live data — but iRacing still freezes tyre values on track for most cars
                 lines.append(
-                    f"    All pressures: {kpa_to_psi(pressures[0]):.1f}PSI ({stale_label} — normal for iRacing cars on track)"
+                    "  Tyres: (may not be updating — iRacing freezes tyre values on track)"
                 )
-                # Show per-corner data without pressure
-                for corner in ["LF", "RF", "LR", "RR"]:
-                    ts = tyres.get(corner, {})
-                    if not ts:
-                        continue
-                    avg_temp = ts.get("temp_center", 0)
-                    wear_center = ts.get("wear_center", 0)
-                    odo = tyre_odometers.get(corner, 0)
-                    parts = [_tyre_temp_str(corner, avg_temp)]
-                    if wear_center > 0:
-                        parts.append(f"{format_wear(wear_center)}")
-                    if odo > 0:
-                        parts.append(f"{odo:.0f}km")
-                    lines.append(f"    {CORNER_NAMES[corner]}: {' | '.join(parts)}")
-            else:
-                # Show full per-corner data including pressure
                 for corner in ["LF", "RF", "LR", "RR"]:
                     ts = tyres.get(corner, {})
                     if not ts:
@@ -868,7 +942,25 @@ class ContextBuilder:
                     odo = tyre_odometers.get(corner, 0)
                     parts = [_tyre_temp_str(corner, avg_temp)]
                     if pressure > 0:
-                        # Pressure stored in kPa; convert to PSI for display
+                        parts.append(f"{kpa_to_psi(pressure):.1f}PSI")
+                    if wear_center > 0:
+                        parts.append(f"{format_wear(wear_center)}")
+                    if odo > 0:
+                        parts.append(f"{odo:.0f}km")
+                    lines.append(f"    {CORNER_NAMES[corner]}: {' | '.join(parts)}")
+            else:
+                # Unknown staleness — data availability not yet confirmed
+                lines.append("  Tyres: data availability not yet confirmed")
+                for corner in ["LF", "RF", "LR", "RR"]:
+                    ts = tyres.get(corner, {})
+                    if not ts:
+                        continue
+                    avg_temp = ts.get("temp_center", 0)
+                    pressure = ts.get("cold_pressure", 0)
+                    wear_center = ts.get("wear_center", 0)
+                    odo = tyre_odometers.get(corner, 0)
+                    parts = [_tyre_temp_str(corner, avg_temp)]
+                    if pressure > 0:
                         parts.append(f"{kpa_to_psi(pressure):.1f}PSI")
                     if wear_center > 0:
                         parts.append(f"{format_wear(wear_center)}")
@@ -904,7 +996,7 @@ class ContextBuilder:
         incident_parts = []
         if incidents > 0 or team_incidents > 0:
             incident_parts.append(
-                f"⚠ {incidents}x incidents (team {team_incidents}x) — safety-rating points, not car damage"
+                f"⚠ {incidents}x incidents (team {team_incidents}x) — penalty points only, NOT car damage. Fast repair does NOT clear these."
             )
         damage_parts = []
         if weight_penalty > 0:
@@ -923,7 +1015,7 @@ class ContextBuilder:
             # Only show this when there's no damage data at all — prevents the
             # LLM from saying "no damage reported" when it simply doesn't have data
             lines.append(
-                "  Body/aero damage: not available (only incident points tracked)"
+                "  Body/aero damage: not available — only penalty points tracked (not car damage)"
             )
 
         # Push-to-pass
@@ -1065,7 +1157,7 @@ class ContextBuilder:
             driver_aliases = merged_aliases
 
         if nearby:
-            lines.append("\nNearby:")
+            lines.append("\nNearby (+ ahead, − behind):")
             for car in nearby[: self.include_nearby_cars]:
                 name = car.get("driver_name", f"P{car.get('position', '?')}")
                 pos = car.get("position", "?")
@@ -1085,7 +1177,11 @@ class ContextBuilder:
                 ):
                     display_name = f"{name} / {car['real_name']}"
 
-                car_str = f"  P{pos} ({display_name}): {format_gap(gap)}"
+                # Add "ahead"/"behind" suffix to gap to make direction unambiguous
+                # for small models that can't remember the sign convention from the header
+                gap_str = format_gap(gap)
+                gap_dir = " ahead" if gap > 0 else " behind" if gap < 0 else ""
+                car_str = f"  P{pos} ({display_name}): {gap_str}{gap_dir}"
                 if lap_time > 0:
                     car_str += f", last lap {format_lap_time(lap_time)}"
                 if p2p:
@@ -1182,27 +1278,3 @@ class ContextBuilder:
             lines.extend(sector_entries)
 
         return "\n".join(lines)
-
-    def build_action_prompt_addition(
-        self, available_actions: list[str] | None = None
-    ) -> str:
-        """Return additional prompt text describing available actions.
-
-        Args:
-            available_actions: List of action names the LLM can use.
-                If None, uses the default set.
-        """
-        if available_actions is None:
-            available_actions = [
-                "pit_this_lap",
-                "add_fuel: <litres>",
-                "change_tyres",
-                "clear_penalty",
-            ]
-
-        actions_str = "\n".join(f"  - [ACTION] {a}" for a in available_actions)
-        return (
-            f"\n\nYou may include action directives in your response using this format:\n"
-            f"{actions_str}\n\n"
-            f"Actions are optional — give text advice unless an action is clearly warranted."
-        )

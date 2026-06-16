@@ -31,7 +31,6 @@ from iracing_client import IRacingClient
 from race_state import RaceState, TyreState
 from context_builder import ContextBuilder
 from llm_client import LLMClient
-from action_executor import ActionExecutor
 from capture import TelemetryCapture, TelemetryReplay, create_sample_data
 from stt_client import STTClient
 from tts_client import TTSClient
@@ -368,7 +367,6 @@ def handle_button_press(
     state: RaceState,
     context_builder: ContextBuilder,
     llm: LLMClient,
-    executor: ActionExecutor,
     question: str = "",
     tts: TTSClient | None = None,
     timing_steps: list[tuple[str, float]] | None = None,
@@ -433,26 +431,16 @@ def handle_button_press(
             _print_timing_summary(steps)
             return
 
-        # Parse actions from response
-        t0 = time.monotonic()
-        clean_text, actions = executor.parse_response(response_text)
-        steps.append(("Action parse", time.monotonic() - t0))
-
         # Display response
         print("\n" + "=" * 60)
         print(f"🏁 RACE ENGINEER (depth={depth})")
         print("=" * 60)
-        print(clean_text)
-        if actions:
-            print("\n--- Actions ---")
-            results = executor.execute(actions)
-            for result in results:
-                print(f"  {result}")
+        print(response_text)
         print("=" * 60)
 
         # Speak the response if TTS is enabled
         if tts is not None:
-            tts.speak_async(clean_text)
+            tts.speak_async(response_text)
 
         # Print timing summary
         _print_timing_summary(steps)
@@ -467,7 +455,6 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
     state = RaceState(config)
     context_builder = ContextBuilder(config)
     llm = LLMClient(config)
-    executor = ActionExecutor(iracing, config)
 
     # Set up voice clients (graceful if not installed)
     voice_config = config.get("voice", {})
@@ -566,9 +553,7 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
         query_listener = WheelButtonListener(
             device_index=query_device,
             button_index=query_button,
-            on_press=lambda: handle_button_press(
-                state, context_builder, llm, executor, tts=tts
-            ),
+            on_press=lambda: handle_button_press(state, context_builder, llm, tts=tts),
         )
         query_listener.start()
         print(
@@ -638,7 +623,6 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                                 state,
                                 context_builder,
                                 llm,
-                                executor,
                                 question=text,
                                 tts=tts,
                                 timing_steps=timing_steps,
@@ -832,7 +816,6 @@ def run_replay_mode(
     """
     context_builder = ContextBuilder(config)
     llm = LLMClient(config)
-    executor = ActionExecutor(config=config)  # No iRacing client in replay mode
     state = RaceState(config)
 
     # Set up TTS for replay mode
@@ -904,19 +887,13 @@ def run_replay_mode(
             "--- END ---"
         )
 
-        clean_text, actions = executor.parse_response(response)
         print("=" * 60)
         print("🏁 RACE ENGINEER")
         print("=" * 60)
-        print(clean_text)
-        if actions:
-            print("\n--- Actions ---")
-            results = executor.execute(actions)
-            for r in results:
-                print(f"  {r}")
+        print(response)
         print("=" * 60)
         if tts is not None:
-            tts.speak_async(clean_text)
+            tts.speak_async(response)
         return
 
     # Interactive mode — type questions, get answers
@@ -1148,20 +1125,14 @@ def run_replay_mode(
         )
 
         if response:
-            clean_text, actions = executor.parse_response(response)
             print("  " + "=" * 56)
             print("  🏁 RACE ENGINEER")
             print("  " + "=" * 56)
-            for line in clean_text.split("\n"):
+            for line in response.split("\n"):
                 print(f"  {line}")
-            if actions:
-                print("\n  --- Actions ---")
-                results = executor.execute(actions)
-                for r in results:
-                    print(f"  {r}")
             print("  " + "=" * 56 + "\n")
             if tts is not None:
-                tts.speak_async(clean_text)
+                tts.speak_async(response)
         else:
             print("  ❌ No response from LLM.\n")
 

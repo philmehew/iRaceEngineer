@@ -753,7 +753,7 @@ class IRacingClient:
                 return d.driver_name
         return f"Car #{car_idx}"
 
-    # --- Command methods (for action_executor) ---
+    # --- Command methods (for future pit command support) ---
 
     def pit_command(self, command: str, param: int = 0):
         """Send a pit command to iRacing.

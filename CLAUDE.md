@@ -6,10 +6,9 @@ Real-time iRacing data collection with on-demand LLM race engineering. Reads tel
 
 ```
 iRacing (shared memory) → iracing_client.py → race_state.py → context_builder.py → llm_client.py → response
-                                                        ↓                      ↓
-                                                  spotter.py             action_executor.py (dry_run by default)
-                                                 (local audio)                    ↓
-                                                                        tts_client.py (Piper TTS → speakers)
+                                                        ↓
+                                                  spotter.py
+                                                 (local audio)
 
 Wheel button (hold) → stt_client.py (mic → Whisper) → transcribed text → context_builder → LLM
 ```
@@ -18,7 +17,6 @@ Wheel button (hold) → stt_client.py (mic → Whisper) → transcribed text →
 - **race_state.py** — DriverState (universal per-car class), SessionState, RaceState with per-lap history
 - **context_builder.py** — condenses state into ~0.2-2KB prompt at 3 depth levels (minimal/medium/full)
 - **llm_client.py** — OpenAI-compatible API caller, works with Ollama Cloud, OpenAI, LM Studio, etc.
-- **action_executor.py** — parses [ACTION] directives from LLM responses, dry_run by default (v1)
 - **spotter.py** — deterministic real-time audio calls for car proximity (car left/right, three wide, clear) and car-behind-closing alerts using pre-recorded WAV files; no LLM involved
 - **stt_client.py** — speech-to-text via faster-whisper + sounddevice mic capture, push-to-talk
 - **tts_client.py** — text-to-speech via Piper TTS + sounddevice playback, configurable output device
@@ -30,7 +28,6 @@ Wheel button (hold) → stt_client.py (mic → Whisper) → transcribed text →
 - **DriverState is universal** — used for player, teammates, and nearby cars. Player-only fields (fuel, tyre temps/wear, brakes) are left at defaults for other cars
 - **Team detection** — auto-detect by iRacing TeamName, with config fallback for explicit username/car number lists
 - **Config-driven context depth** — minimal (~200B), medium (~500B), full (~1-2KB), controlled by config.yaml
-- **Action directives** — LLM can include `[ACTION] pit_this_lap`, `[ACTION] add_fuel: 60` etc. v1 logs but doesn't execute
 - **Testable without iRacing** — `--generate-samples` creates fake data, `--replay <dir>` feeds it through the pipeline
 - **Voice is optional** — voice deps in `[voice]` extra (`uv sync --extra voice`), graceful degradation if not installed
 - **Wheel button triggers** — pygame in `[wheel]` extra (`uv sync --extra wheel`), used for both LLM query (press) and push-to-talk voice (hold) via steering wheel buttons

@@ -6,22 +6,16 @@ iracing:
 
 # LLM API (OpenAI-compatible — works with Ollama Cloud, OpenAI, LM Studio, etc.)
 llm:
-  base_url: "https://ollama.com/v1"         # Ollama Cloud endpoint
-  api_key_env: "2d037788fae94179ba526b56ec4f1dea.J6EUKATFFsHZMzykGG_cVfog"            # Reads from environment variable
+  #base_url: "https://ollama.com/v1"         # Ollama Cloud endpoint
+  #api_key_env: "2d037788fae94179ba526b56ec4f1dea.J6EUKATFFsHZMzykGG_cVfog"            # Reads from environment variable
   #model: "ministral-3:14b-cloud"
-  model: "gemma4:31b-cloud"
+  #model: "gemma4:31b-cloud"
+  base_url: "http://192.168.0.115:8000/v1"
+  api_key_env: ""
+  model: "granite-4.1-3b"
   max_tokens: 300
   temperature: 0.3
   timeout: 5.0                              # Seconds to wait for LLM response before giving up
-
-# Action execution (v1: dry_run only — actions are logged but not sent to iRacing)
-actions:
-  enabled: false             # Set to true to actually execute [ACTION] directives
-  allowed_actions:           # Whitelist of actions that can be executed when enabled
-    - pit_this_lap
-    - add_fuel
-    - change_tyres
-    - clear_penalty
 
 # Team identification — how to recognise your teammates
 # AUTO-DETECT (default): iRacing assigns each driver a TeamName in session info.
@@ -122,20 +116,16 @@ spotter:
 prompt:
   system: |
     You are a race engineer. Speak in short radio-style sentences. No markdown, bullets, or headers.
-    Example: 'Box this lap. Tyres are gone. Add 60 litres. [ACTION] pit_this_lap | add_fuel: 60'
+    Example: 'Box this lap. Tyres are gone. Add 60 litres.'
     If unsure, say so. Never invent data. The 'Your car' section is the driver you're talking to.
 
     Rules:
-    - One-shot advice only. Never promise to monitor, track, or follow up later.
-    - Don't suggest setup changes (pressures, brake bias) without known reference ranges.
-    - Don't assess temps or pressures as high/low/normal without a baseline — just report values.
-    - 'Incidents' are safety-rating points, NOT car damage. Always report the count.
-    - If tyre data is unreliable, report last-known values but don't comment on trends or degradation.
-    - Fuel rules: Use 'litres' not 'L' when speaking. add_fuel takes whole litres only. If context shows 'Fuel to add: N', use that exact amount. If fuel burn is 'unknown', say so — never invent a figure.
-    - Weather is current conditions only — never predict future weather.
-    - Only include [ACTION] when asked about pitting, fuel, tyres, or strategy. Don't add actions to unrelated questions.
-
-    Optional actions: [ACTION] pit_this_lap | add_fuel: <litres> | change_tyres | clear_penalty
+    - One-shot advice only. Never promise to monitor or follow up.
+    - Don't assess temps or pressures without a baseline — just report values.
+    - If fuel burn is 'unknown' or 'approx', say 'burn rate unknown' — NEVER guess a figure.
+    - Weather is current conditions only — never predict future weather or race events.
+    - If context shows '!! RACE ENDING SOON', say 'Do NOT pit' first, then explain why.
+    - Never start responses with prefixes. Start directly with the answer.
   context_depth: "full"       # "minimal", "medium", or "full"
   # minimal: position, fuel, laps remaining only
   # medium: + gaps, tyre temps, flags

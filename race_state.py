@@ -224,6 +224,7 @@ class SectorTimeTracker:
     """
 
     MAX_SECTOR_TIME = 300.0  # Sanity cap: ignore sectors > 5 minutes
+    MIN_SECTOR_TIME = 5.0  # Minimum valid sector time (below this = spurious crossing)
     LARGE_JUMP_THRESHOLD = 0.5  # % of lap: jump > this without wraparound = reset
 
     def __init__(self):
@@ -402,11 +403,22 @@ class SectorTimeTracker:
             enter_time = car_state.sector_enter_time[completed_sector]
             sector_time = session_time - enter_time
 
-            if 0 < sector_time < self.MAX_SECTOR_TIME:
+            if self.MIN_SECTOR_TIME < sector_time < self.MAX_SECTOR_TIME:
                 current_best = car_state.fastest_sector_times.get(
                     completed_sector, -1.0
                 )
-                if current_best < 0 or sector_time < current_best:
+                # Reject likely partial-sector times: a time less than half
+                # the existing best is almost certainly from an incomplete sector
+                # (e.g., car entering track mid-sector). This prevents e.g. a
+                # 20s partial S3 from overwriting a legitimate 47s best.
+                if current_best > 0 and sector_time < current_best * 0.5:
+                    logger.debug(
+                        f"Car {car_state.car_idx} S{completed_sector}: "
+                        f"rejecting {sector_time:.3f}s (too short vs best "
+                        f"{current_best:.3f}s, likely partial sector)"
+                    )
+                    # Still record enter time so next sector is correct
+                elif current_best < 0 or sector_time < current_best:
                     car_state.fastest_sector_times[completed_sector] = sector_time
                     logger.debug(
                         f"Car {car_state.car_idx} new best S{completed_sector}: "
