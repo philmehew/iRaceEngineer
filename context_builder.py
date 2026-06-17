@@ -161,12 +161,14 @@ class ContextBuilder:
             "Rules:\n"
             "- One-shot advice only. Never promise to monitor, track, or follow up later.\n"
             "- Don't suggest setup changes (pressures, brake bias) without known reference ranges.\n"
-            "- Don't assess temps or pressures as high/low/normal without a baseline — just report values.\n"
+            "- Don't assess temps or pressures as high/low/normal without a baseline - just report values.\n"
             "- 'Incidents' are safety-rating points, NOT car damage. Always report the count.\n"
             "- If tyre data is unreliable, report last-known values but don't comment on trends or degradation.\n"
             "- Fuel rules: Use 'litres' not 'L' when speaking. "
-            "If context shows 'Fuel to add: N', use that exact amount. If fuel burn is 'unknown', say so — never invent a figure.\n"
-            "- Weather is current conditions only — never predict future weather."
+            "If context shows 'Fuel to add: N', use that exact amount. If fuel burn is 'unknown', say so - never invent a figure.\n"
+            "- Weather is current conditions only - never predict future weather.\n"
+            "- If context shows '!! FUEL SHORTAGE' and does NOT show '!! RACE ENDING SOON', recommend pitting. Add the litres shown in the shortage message.\n"
+            "- Never start responses with prefixes. Start directly with the answer."
         )
 
     def build_prompt(self, state: dict, question: str = "") -> list[dict]:
@@ -217,7 +219,7 @@ class ContextBuilder:
         )
 
         if is_time_race and estimated_total:
-            total_laps_str = f"~{estimated_total}"
+            total_laps_str = f"approx {estimated_total}"
         elif (
             isinstance(race_laps, int)
             and isinstance(laps_remain, int)
@@ -238,10 +240,10 @@ class ContextBuilder:
         fuel_pct = player.get("fuel_pct", 0)
         fuel_est_quality = player.get("fuel_est_quality", "unreliable")
         if fuel_laps > 0 and fuel_est_quality == "good":
-            lines.append(f"Fuel: {format_pct(fuel_pct)} (~{fuel_laps:.1f} laps)")
+            lines.append(f"Fuel: {format_pct(fuel_pct)} (approx {fuel_laps:.1f} laps)")
         elif fuel_laps > 0 and fuel_est_quality == "rough":
             lines.append(
-                f"Fuel: {format_pct(fuel_pct)} (~{fuel_laps:.1f} laps, approx)"
+                f"Fuel: {format_pct(fuel_pct)} (approx {fuel_laps:.1f} laps, approx)"
             )
         elif fuel_pct > 0:
             lines.append(f"Fuel: {format_pct(fuel_pct)} (laps remaining: unreliable)")
@@ -274,7 +276,7 @@ class ContextBuilder:
         )
 
         if is_time_race and estimated_total:
-            total_laps_str = f"~{estimated_total}"
+            total_laps_str = f"approx {estimated_total}"
         elif (
             isinstance(race_laps, int)
             and isinstance(laps_remain, int)
@@ -346,9 +348,9 @@ class ContextBuilder:
         else:
             fuel_str = f"  Fuel: {fuel_level:.1f} litres ({format_pct(fuel_pct)}"
         if fuel_laps > 0 and fuel_est_quality == "good":
-            lines.append(f"{fuel_str}), ~{fuel_laps:.1f} laps")
+            lines.append(f"{fuel_str}), approx {fuel_laps:.1f} laps")
         elif fuel_laps > 0 and fuel_est_quality == "rough":
-            lines.append(f"{fuel_str}), ~{fuel_laps:.1f} laps (approx)")
+            lines.append(f"{fuel_str}), approx {fuel_laps:.1f} laps (approx)")
         elif fuel_pct > 0:
             lines.append(f"{fuel_str}), fuel burn unknown")
         else:
@@ -358,7 +360,7 @@ class ContextBuilder:
         engine_warnings = player.get("engine_warnings", 0)
         if engine_warnings:
             warning_str = format_engine_warnings(engine_warnings)
-            lines.append(f"  ⚠ ENGINE WARNING: {warning_str}")
+            lines.append(f"  !! ENGINE WARNING: {warning_str}")
 
         # Tyre temps
         tyres = player.get("tyres", {})
@@ -448,7 +450,7 @@ class ContextBuilder:
 
         # Determine total laps display
         if is_time_race and estimated_total:
-            total_laps_str = f"~{estimated_total}"
+            total_laps_str = f"approx {estimated_total}"
         elif is_time_race:
             total_laps_str = "?"
         elif isinstance(race_laps, int) and isinstance(laps_remain_raw, int):
@@ -610,7 +612,7 @@ class ContextBuilder:
         # doesn't miss it buried in the middle of temperature values
         if engine_warnings:
             warning_str = format_engine_warnings(engine_warnings)
-            lines.append(f"⚠ ENGINE WARNING: {warning_str}")
+            lines.append(f"!! ENGINE WARNING: {warning_str}")
 
         if engine_parts:
             lines.append(f"Engine: {' | '.join(engine_parts)}")
@@ -665,7 +667,7 @@ class ContextBuilder:
         elif fuel_pct >= 0.1:
             fuel_desc = "low"
         else:
-            fuel_desc = "⚠ CRITICAL"
+            fuel_desc = "!! CRITICAL"
 
         # Build fuel amount: level/tank (max add, %, descriptor)
         if effective_fuel_max and fuel_level > 0:
@@ -683,17 +685,17 @@ class ContextBuilder:
 
         # Fuel urgency warning
         if 0 < fuel_pct < 0.2 and fuel_laps > 0:
-            fuel_amt += " ⚠ FUEL WARNING"
+            fuel_amt += " !! FUEL WARNING"
 
         # Burn rate and range on one line
         if avg_fuel_per_lap > 0 and fuel_est_quality == "good":
-            burn_str = f"~{avg_fuel_per_lap:.2f} litres/lap"
+            burn_str = f"approx {avg_fuel_per_lap:.2f} litres/lap"
             if fuel_laps > 0:
-                burn_str += f", range ~{fuel_laps:.1f} laps"
+                burn_str += f", range approx {fuel_laps:.1f} laps"
         elif avg_fuel_per_lap > 0 and fuel_est_quality == "rough":
-            burn_str = f"~{avg_fuel_per_lap:.2f} litres/lap (approx)"
+            burn_str = f"approx {avg_fuel_per_lap:.2f} litres/lap (approx)"
             if fuel_laps > 0:
-                burn_str += f", range ~{fuel_laps:.1f} laps (approx)"
+                burn_str += f", range approx {fuel_laps:.1f} laps (approx)"
         else:
             burn_str = "unknown"
 
@@ -724,34 +726,34 @@ class ContextBuilder:
                         add_litres = max(1, add_litres)
                         if race_ending_soon:
                             lines.append(
-                                f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx}. "
-                                f"Need ~{fuel_needed:.0f} litres for {race_laps_remain} laps — "
+                                f"  !! FUEL SHORTAGE: approx {deficit_laps:.0f} laps short{approx}. "
+                                f"Need approx {fuel_needed:.0f} litres for {race_laps_remain} laps — "
                                 f"conserve fuel and try to finish, do NOT pit (30s+ pit stop loses positions)"
                             )
                         else:
                             lines.append(
-                                f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx}. "
-                                f"Add {add_litres} litres to finish (need ~{fuel_needed:.0f} litres for {race_laps_remain} laps)"
+                                f"  !! FUEL SHORTAGE: approx {deficit_laps:.0f} laps short{approx}. "
+                                f"Add {add_litres} litres to finish (need approx {fuel_needed:.0f} litres for {race_laps_remain} laps)"
                             )
                     else:
                         if race_ending_soon:
                             lines.append(
-                                f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx} — "
+                                f"  !! FUEL SHORTAGE: approx {deficit_laps:.0f} laps short{approx} — "
                                 f"conserve fuel and try to finish, do NOT pit"
                             )
                         else:
                             lines.append(
-                                f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
+                                f"  !! FUEL SHORTAGE: approx {deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
                             )
                 else:
                     if race_ending_soon:
                         lines.append(
-                            f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx} — "
+                            f"  !! FUEL SHORTAGE: approx {deficit_laps:.0f} laps short{approx} — "
                             f"conserve fuel and try to finish, do NOT pit"
                         )
                     else:
                         lines.append(
-                            f"  ⚠ FUEL SHORTAGE: ~{deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
+                            f"  !! FUEL SHORTAGE: approx {deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
                         )
             elif fuel_laps < race_laps_remain + 1:
                 margin = fuel_laps - race_laps_remain
@@ -775,7 +777,7 @@ class ContextBuilder:
                         add_litres = max(1, add_litres)
                         add_str = f" Add {add_litres} litres if pitting."
                 lines.append(
-                    f"  ⚠ FUEL TIGHT: only {margin:.1f} laps margin{approx}. {urgency}{add_str}"
+                    f"  !! FUEL TIGHT: only {margin:.1f} laps margin{approx}. {urgency}{add_str}"
                 )
         elif (
             avg_fuel_per_lap > 0
@@ -794,7 +796,7 @@ class ContextBuilder:
                 add_litres = max(1, add_litres)
                 quality_note = "" if fuel_est_quality == "good" else " (approx)"
                 lines.append(
-                    f"  Fuel to add: {add_litres} litres (need ~{fuel_needed:.0f} litres for {race_laps_remain} laps{quality_note})"
+                    f"  Fuel to add: {add_litres} litres (need approx {fuel_needed:.0f} litres for {race_laps_remain} laps{quality_note})"
                 )
 
         # Race duration and time remaining (for time-based races)
@@ -812,28 +814,28 @@ class ContextBuilder:
                 if remain_min < 1:
                     lines.append(f"  Time remaining: {int(time_remain_sec)}s")
                 else:
-                    lines.append(f"  Time remaining: ~{remain_min:.1f} min")
+                    lines.append(f"  Time remaining: approx {remain_min:.1f} min")
             if race_laps_remain > 0:
                 # Don't show RACE ENDING SOON at lap 0 (formation/pre-race)
                 # — time estimates are unreliable before the first completed lap
                 race_ending_display = isinstance(race_laps, int) and race_laps >= 1
                 if race_laps_remain <= 1 and race_ending_display:
                     lines.append(
-                        f"  Race laps remaining: ~{race_laps_remain} — RACE ENDING SOON"
+                        f"  Race laps remaining: approx {race_laps_remain} — RACE ENDING SOON"
                     )
                     lines.append(
-                        "  ⚠ Pit stop costs ~30s+ and you will lose multiple positions. Do NOT pit — stay out and finish the race."
+                        "  !! Pit stop costs approx 30s+ and you will lose multiple positions. Do NOT pit — stay out and finish the race."
                     )
                 elif race_laps_remain <= 3 and race_ending_display:
                     lines.append(
-                        f"  Race laps remaining: ~{race_laps_remain} laps (estimated) — RACE ENDING SOON"
+                        f"  Race laps remaining: approx {race_laps_remain} laps (estimated) — RACE ENDING SOON"
                     )
                     lines.append(
-                        "  ⚠ Pit stop costs ~30s+ and will lose you positions. Only pit if fuel cannot last to the finish."
+                        "  !! Pit stop costs approx 30s+ and will lose you positions. Only pit if fuel cannot last to the finish."
                     )
                 else:
                     lines.append(
-                        f"  Race laps remaining: ~{race_laps_remain} laps (estimated)"
+                        f"  Race laps remaining: approx {race_laps_remain} laps (estimated)"
                     )
 
         # Tyres — show staleness indicator
@@ -898,7 +900,9 @@ class ContextBuilder:
                         if w > 0:
                             wear_values.append(w)
                     wear_str = (
-                        f" Life: ~{wear_values[0] * 100:.0f}%." if wear_values else ""
+                        f" Life: approx {wear_values[0] * 100:.0f}%."
+                        if wear_values
+                        else ""
                     )
 
                     lines.append(
@@ -996,7 +1000,7 @@ class ContextBuilder:
         incident_parts = []
         if incidents > 0 or team_incidents > 0:
             incident_parts.append(
-                f"⚠ {incidents}x incidents (team {team_incidents}x) — penalty points only, NOT car damage. Fast repair does NOT clear these."
+                f"!! {incidents}x incidents (team {team_incidents}x) — penalty points only, NOT car damage. Fast repair does NOT clear these."
             )
         damage_parts = []
         if weight_penalty > 0:

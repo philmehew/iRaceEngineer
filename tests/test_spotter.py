@@ -10,7 +10,7 @@ track_surface guard, and the fuel alert feature.
 from unittest.mock import MagicMock
 
 
-from spotter import CarBehindTracker, ProximityDetector, Spotter, SpotterCall
+from spotter import CarBehindClosingDetector, ProximityDetector, Spotter, SpotterCall
 
 # iRacing CarLeftRight enum values (from irsdk.CarLeftRight — ordinal, NOT bitmask)
 CLR_OFF = 0
@@ -1932,231 +1932,261 @@ class TestSpotterAudioPlayer:
 
 
 # ---------------------------------------------------------------------------
-# CarBehindTracker — Car Behind Closing Alert Tests
+# CarBehindClosingDetector — Car Behind Closing Alert Tests
 # ---------------------------------------------------------------------------
 
 
-class TestCarBehindTracker:
-    """Test the CarBehindTracker lap-time delta detection."""
+class TestCarBehindClosingDetector:
+    """Test the CarBehindClosingDetector EMA-based gap-trend detection."""
 
     def setup_method(self):
-        self.tracker = CarBehindTracker({})
+        self.detector = CarBehindClosingDetector({})
+
+    def _feed_gap_sequence(
+        self, gaps_metres, gaps_seconds, times, player_best=98.0, car_lap=95.0
+    ):
+        """Helper: feed a sequence of gap data and return whether alert fires."""
+        alert_fired = False
+        for gm, gs, t in zip(gaps_metres, gaps_seconds, times):
+            self.detector.update(
+                gap_seconds=gs,
+                gap_metres=gm,
+                car_on_pit_road=False,
+                player_best_lap_time=player_best,
+                car_behind_lap_time=car_lap,
+                is_yellow=False,
+                current_time=t,
+            )
+            if self.detector.should_alert(current_time=t):
+                alert_fired = True
+        return alert_fired
 
     def test_no_alert_when_no_car_behind(self):
         """No alert when gap_seconds is 0 (no car behind)."""
-        self.tracker.update(
-            gap_seconds=0.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+        self.detector.update(
+            gap_seconds=0.0,
+            gap_metres=10000.0,  # sentinel
+            car_on_pit_road=False,
+            player_best_lap_time=98.0,
+            car_behind_lap_time=95.0,
+            is_yellow=False,
+            current_time=1.0,
         )
-        assert not self.tracker.should_alert(current_time=1.0)
+        assert not self.detector.should_alert(current_time=1.0)
 
-    def test_no_alert_when_car_behind_is_slower(self):
-        """No alert when the car behind is running slower laps."""
-        # Lap 1: car behind is slower
-        self.tracker.update(
-            gap_seconds=5.0, car_behind_faster=False, is_yellow=False, current_time=1.0
+    def test_no_alert_when_gap_stable(self):
+        """No alert when gap is stable (not shrinking)."""
+        # Gap stays at ~50m - not closing
+        alert = self._feed_gap_sequence(
+            gaps_metres=[50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0],
+            gaps_seconds=[5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0],
+            times=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         )
-        assert not self.tracker.should_alert(current_time=1.0)
-        # Lap 2: still slower
-        self.tracker.update(
-            gap_seconds=5.5, car_behind_faster=False, is_yellow=False, current_time=2.0
-        )
-        assert not self.tracker.should_alert(current_time=2.0)
+        assert not alert
 
-    def test_alert_after_consecutive_faster_laps(self):
-        """Alert fires after car behind is faster for 2 consecutive laps within gap."""
-        # Lap 1: car behind is faster
-        self.tracker.update(
-            gap_seconds=5.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+    def test_no_alert_when_gap_growing(self):
+        """No alert when gap is growing (car behind is falling back)."""
+        # Gap grows from 30m to 65m - car behind is falling back
+        alert = self._feed_gap_sequence(
+            gaps_metres=[30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 65.0],
+            gaps_seconds=[3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5],
+            times=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         )
-        assert not self.tracker.should_alert(current_time=1.0)  # only 1 lap faster
+        assert not alert
 
-        # Lap 2: car behind is faster again
-        self.tracker.update(
-            gap_seconds=4.0, car_behind_faster=True, is_yellow=False, current_time=2.0
+    def test_alert_when_gap_shrinking_consistently(self):
+        """Alert fires when gap is shrinking consistently (car closing)."""
+        # Gap shrinks from 50m to 30m over several ticks - car is closing
+        alert = self._feed_gap_sequence(
+            gaps_metres=[50.0, 48.0, 45.0, 42.0, 39.0, 36.0, 33.0, 30.0],
+            gaps_seconds=[5.0, 4.8, 4.5, 4.2, 3.9, 3.6, 3.3, 3.0],
+            times=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            player_best=98.0,
+            car_lap=95.0,  # genuinely faster
         )
-        assert self.tracker.should_alert(current_time=2.0)  # 2 laps faster — fire!
+        assert alert
 
-    def test_no_alert_when_gap_too_large(self):
-        """No alert when gap exceeds max_gap threshold (default 10s)."""
-        # Car behind is faster but too far away
-        self.tracker.update(
-            gap_seconds=15.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+    def test_no_alert_when_slower_than_player_best(self):
+        """No alert when car behind is slower than player's best lap time."""
+        # Gap shrinks, but car behind (1:42) is slower than player's best (1:38)
+        alert = self._feed_gap_sequence(
+            gaps_metres=[50.0, 48.0, 45.0, 42.0, 39.0, 36.0],
+            gaps_seconds=[5.0, 4.8, 4.5, 4.2, 3.9, 3.6],
+            times=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            player_best=98.0,  # 1:38
+            car_lap=102.0,  # 1:42 - slower than player's best
         )
-        self.tracker.update(
-            gap_seconds=14.0, car_behind_faster=True, is_yellow=False, current_time=2.0
-        )
-        assert not self.tracker.should_alert(current_time=2.0)
+        assert not alert
 
-    def test_no_alert_when_gap_too_small(self):
-        """No alert when gap is below min_gap (car already alongside — CarLeftRight's job)."""
-        # Car behind is faster and very close (alongside)
-        self.tracker.update(
-            gap_seconds=1.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+    def test_no_alert_when_car_on_pit_road(self):
+        """Car on pit road should not trigger closing alerts."""
+        self.detector.update(
+            gap_seconds=5.0,
+            gap_metres=50.0,
+            car_on_pit_road=True,
+            player_best_lap_time=98.0,
+            car_behind_lap_time=95.0,
+            is_yellow=False,
+            current_time=1.0,
         )
-        self.tracker.update(
-            gap_seconds=0.8, car_behind_faster=True, is_yellow=False, current_time=2.0
-        )
-        assert not self.tracker.should_alert(current_time=2.0)
-
-    def test_alert_resets_when_gap_grows(self):
-        """Alert resets when gap grows above reset threshold (12s default)."""
-        # Lap 1 & 2: car behind is faster — alert fires
-        self.tracker.update(
-            gap_seconds=5.0, car_behind_faster=True, is_yellow=False, current_time=1.0
-        )
-        self.tracker.update(
-            gap_seconds=4.0, car_behind_faster=True, is_yellow=False, current_time=2.0
-        )
-        assert self.tracker.should_alert(current_time=2.0)
-
-        # Gap grows beyond reset threshold — tracker resets
-        self.tracker.update(
-            gap_seconds=13.0, car_behind_faster=False, is_yellow=False, current_time=3.0
-        )
-
-        # Car behind closes again — should be able to fire again
-        # Advance time past the 30s cooldown
-        self.tracker.update(
-            gap_seconds=8.0, car_behind_faster=True, is_yellow=False, current_time=40.0
-        )
-        self.tracker.update(
-            gap_seconds=7.0, car_behind_faster=True, is_yellow=False, current_time=41.0
-        )
-        assert self.tracker.should_alert(
-            current_time=41.0
-        )  # Can re-alert after gap grew
-
-    def test_alert_resets_when_car_behind_slows(self):
-        """Alert resets when car behind stops being faster (slower lap)."""
-        # Lap 1 & 2: faster — alert fires
-        self.tracker.update(
-            gap_seconds=5.0, car_behind_faster=True, is_yellow=False, current_time=1.0
-        )
-        self.tracker.update(
-            gap_seconds=4.0, car_behind_faster=True, is_yellow=False, current_time=2.0
-        )
-        assert self.tracker.should_alert(current_time=2.0)
-
-        # Car behind slows down — resets alert_fired and consecutive count
-        self.tracker.update(
-            gap_seconds=4.5, car_behind_faster=False, is_yellow=False, current_time=3.0
-        )
-
-        # Must rebuild consecutive count (time past cooldown)
-        self.tracker.update(
-            gap_seconds=4.0, car_behind_faster=True, is_yellow=False, current_time=40.0
-        )
-        assert not self.tracker.should_alert(
-            current_time=40.0
-        )  # Only 1 consecutive faster lap
+        assert not self.detector.should_alert(current_time=1.0)
 
     def test_no_alert_during_yellow(self):
-        """No alert accumulation during yellow flag (field closure bunched up)."""
-        # Lap 1: faster, but yellow flag
-        self.tracker.update(
-            gap_seconds=5.0, car_behind_faster=True, is_yellow=True, current_time=1.0
+        """No alert accumulation during yellow flag."""
+        self.detector.update(
+            gap_seconds=5.0,
+            gap_metres=50.0,
+            car_on_pit_road=False,
+            player_best_lap_time=98.0,
+            car_behind_lap_time=95.0,
+            is_yellow=True,
+            current_time=1.0,
         )
-        # Lap 2: faster, still yellow
-        self.tracker.update(
-            gap_seconds=4.0, car_behind_faster=True, is_yellow=True, current_time=2.0
-        )
-        assert not self.tracker.should_alert(
-            current_time=2.0
-        )  # Yellow suppresses counting
+        assert not self.detector.should_alert(current_time=1.0)
 
-        # After yellow clears, must start counting fresh
-        self.tracker.update(
-            gap_seconds=3.0, car_behind_faster=True, is_yellow=False, current_time=3.0
+    def test_no_alert_when_gap_too_small(self):
+        """No alert when gap is below min_gap (car alongside - CarLeftRight's job)."""
+        # Gap only 0.8s / 8m - car is alongside
+        self.detector.update(
+            gap_seconds=0.8,
+            gap_metres=8.0,
+            car_on_pit_road=False,
+            player_best_lap_time=98.0,
+            car_behind_lap_time=95.0,
+            is_yellow=False,
+            current_time=1.0,
         )
-        assert not self.tracker.should_alert(
-            current_time=3.0
-        )  # Only 1 lap after yellow
+        self.detector.update(
+            gap_seconds=0.7,
+            gap_metres=7.0,
+            car_on_pit_road=False,
+            player_best_lap_time=98.0,
+            car_behind_lap_time=95.0,
+            is_yellow=False,
+            current_time=2.0,
+        )
+        assert not self.detector.should_alert(current_time=2.0)
 
-    def test_no_repeated_alerts(self):
-        """Alert should not fire again until reset conditions are met."""
-        # Build up to alert
-        self.tracker.update(
-            gap_seconds=5.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+    def test_no_alert_when_gap_too_large(self):
+        """No alert when gap exceeds max_gap (default 10s)."""
+        # Gap 12s / 120m - too far away
+        self.detector.update(
+            gap_seconds=12.0,
+            gap_metres=120.0,
+            car_on_pit_road=False,
+            player_best_lap_time=98.0,
+            car_behind_lap_time=95.0,
+            is_yellow=False,
+            current_time=1.0,
         )
-        self.tracker.update(
-            gap_seconds=4.0, car_behind_faster=True, is_yellow=False, current_time=2.0
+        self.detector.update(
+            gap_seconds=11.0,
+            gap_metres=110.0,
+            car_on_pit_road=False,
+            player_best_lap_time=98.0,
+            car_behind_lap_time=95.0,
+            is_yellow=False,
+            current_time=2.0,
         )
-        assert self.tracker.should_alert(current_time=2.0)
+        assert not self.detector.should_alert(current_time=2.0)
 
-        # Continuing ticks should not re-alert (within 30s cooldown)
-        self.tracker.update(
-            gap_seconds=3.5, car_behind_faster=True, is_yellow=False, current_time=3.0
+    def test_no_repeated_alerts_within_cooldown(self):
+        """Alert should not fire again within cooldown period."""
+        # Build up closing trend
+        alert = self._feed_gap_sequence(
+            gaps_metres=[50.0, 48.0, 45.0, 42.0, 39.0, 36.0, 33.0, 30.0],
+            gaps_seconds=[5.0, 4.8, 4.5, 4.2, 3.9, 3.6, 3.3, 3.0],
+            times=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            player_best=98.0,
+            car_lap=95.0,
         )
-        assert not self.tracker.should_alert(current_time=3.0)
-        self.tracker.update(
-            gap_seconds=3.0, car_behind_faster=True, is_yellow=False, current_time=4.0
-        )
-        assert not self.tracker.should_alert(current_time=4.0)
+        assert alert
+
+        # Continue closing - should not re-alert within 30s cooldown
+        for gm, gs, t in [(28.0, 2.8, 9.0), (26.0, 2.6, 10.0), (24.0, 2.4, 11.0)]:
+            self.detector.update(
+                gap_seconds=gs,
+                gap_metres=gm,
+                car_on_pit_road=False,
+                player_best_lap_time=98.0,
+                car_behind_lap_time=95.0,
+                is_yellow=False,
+                current_time=t,
+            )
+            assert not self.detector.should_alert(current_time=t)
 
     def test_reset_clears_state(self):
-        """Reset should clear all tracking state so alerts can re-fire."""
-        # Build up to alert
-        self.tracker.update(
-            gap_seconds=5.0, car_behind_faster=True, is_yellow=False, current_time=1.0
+        """Reset should clear all EMA state so alerts can re-fire."""
+        # Build up closing trend
+        alert = self._feed_gap_sequence(
+            gaps_metres=[50.0, 48.0, 45.0, 42.0, 39.0, 36.0],
+            gaps_seconds=[5.0, 4.8, 4.5, 4.2, 3.9, 3.6],
+            times=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            player_best=98.0,
+            car_lap=95.0,
         )
-        self.tracker.update(
-            gap_seconds=4.0, car_behind_faster=True, is_yellow=False, current_time=2.0
-        )
-        assert self.tracker.should_alert(current_time=2.0)
+        assert alert
 
-        self.tracker.reset()
+        self.detector.reset()
 
-        # After reset, must build up consecutive count again
-        self.tracker.update(
-            gap_seconds=5.0, car_behind_faster=True, is_yellow=False, current_time=3.0
+        # After reset, must build up EMA again - one tick is not enough
+        self.detector.update(
+            gap_seconds=5.0,
+            gap_metres=50.0,
+            car_on_pit_road=False,
+            player_best_lap_time=98.0,
+            car_behind_lap_time=95.0,
+            is_yellow=False,
+            current_time=7.0,
         )
-        assert not self.tracker.should_alert(current_time=3.0)  # Only 1 lap
-
-    def test_no_car_behind_resets_tracker(self):
-        """Passing gap_seconds=0 resets tracker state completely."""
-        # Build up to alert
-        self.tracker.update(
-            gap_seconds=5.0, car_behind_faster=True, is_yellow=False, current_time=1.0
-        )
-        self.tracker.update(
-            gap_seconds=4.0, car_behind_faster=True, is_yellow=False, current_time=2.0
-        )
-        assert self.tracker.should_alert(current_time=2.0)
-
-        # Car behind pits/disappears
-        self.tracker.update(
-            gap_seconds=0.0, car_behind_faster=False, is_yellow=False, current_time=3.0
-        )
-
-        # Must rebuild consecutive count
-        self.tracker.update(
-            gap_seconds=6.0, car_behind_faster=True, is_yellow=False, current_time=4.0
-        )
-        assert not self.tracker.should_alert(current_time=4.0)
+        assert not self.detector.should_alert(current_time=7.0)
 
     def test_custom_thresholds_from_config(self):
-        """CarBehindTracker should use custom thresholds from config."""
+        """CarBehindClosingDetector should use custom thresholds from config."""
         config = {
             "spotter": {
                 "closing": {
-                    "consecutive_faster_laps": 3,
+                    "closing_threshold_mps": 0.3,
+                    "ema_fast_seconds": 2.0,
+                    "ema_slow_seconds": 5.0,
                     "max_gap_seconds": 15.0,
                     "min_gap_seconds": 2.0,
-                    "reset_gap_seconds": 18.0,
                     "cooldown_seconds": 60.0,
                 }
             }
         }
-        tracker = CarBehindTracker(config)
-        assert tracker._consecutive_threshold == 3
-        assert tracker._max_gap == 15.0
-        assert tracker._min_gap == 2.0
-        assert tracker._reset_gap == 18.0
-        assert tracker._cooldown == 60.0
+        detector = CarBehindClosingDetector(config)
+        assert detector._closing_threshold == 0.3
+        assert detector._ema_fast_tau == 2.0
+        assert detector._ema_slow_tau == 5.0
+        assert detector._max_gap == 15.0
+        assert detector._min_gap == 2.0
+        assert detector._cooldown == 60.0
+
+    def test_deprecated_config_keys_accepted(self):
+        """Deprecated config keys should be accepted without error."""
+        config = {
+            "spotter": {
+                "closing": {
+                    "consecutive_faster_laps": 3,  # deprecated
+                    "reset_gap_seconds": 15.0,  # deprecated
+                    "closing_threshold_mps": 0.2,
+                }
+            }
+        }
+        # Should not raise, just log a warning
+        detector = CarBehindClosingDetector(config)
+        assert detector._closing_threshold == 0.2
 
 
 class TestSpotterCarBehindClosing:
-    """Integration test for car-behind-closing alert through the Spotter class."""
+    """Integration test for car-behind-closing alert through the Spotter class.
+
+    Uses EMA-based gap-trend detection via CarDistBehind (metres).
+    The EMA needs multiple ticks with time progression to converge, so tests
+    that expect an alert must feed enough shrinking-gap ticks.
+    current_time is passed to Spotter.update() to simulate time progression.
+    """
 
     # iRacing SessionFlags bitmasks
     FLAG_GREEN = 0x0004
@@ -2177,6 +2207,38 @@ class TestSpotterCarBehindClosing:
                 "volume": 1.0,
             }
         }
+        self.t = 100.0  # Start at a high base time to avoid conflicts
+
+    def _tick_closing(
+        self,
+        spotter,
+        gap_seconds,
+        gap_metres,
+        car_behind_lap_time=95.0,
+        player_best_lap_time=98.0,
+        player_last_lap_time=-1.0,
+        car_behind_on_pit_road=False,
+        session_flags=None,
+        is_on_track=True,
+        track_surface=3,
+    ):
+        """Helper: send one spotter tick with car-behind data and time progression."""
+        self.t += 1.0  # 1 second between ticks for EMA convergence
+        if session_flags is None:
+            session_flags = self.FLAG_GREEN
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=is_on_track,
+            track_surface=track_surface,
+            session_flags=session_flags,
+            car_behind_gap=-gap_seconds,  # negative = behind
+            car_behind_lap_time=car_behind_lap_time,
+            car_behind_gap_metres=gap_metres,
+            player_last_lap_time=player_last_lap_time,
+            player_best_lap_time=player_best_lap_time,
+            car_behind_on_pit_road=car_behind_on_pit_road,
+            current_time=self.t,
+        )
 
     def test_no_alert_without_car_behind_data(self):
         """No alert when car_behind_gap=0 (default — no data)."""
@@ -2185,11 +2247,17 @@ class TestSpotterCarBehindClosing:
         spotter._player.play = lambda key: played_keys.append(key)
 
         # Start green flag — race is on
+        self.t += 1.0
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            current_time=self.t,
         )
 
         # Tick with no car behind data — should not crash or alert
+        self.t += 1.0
         spotter.update(
             CLR_CLEAR,
             is_on_track=True,
@@ -2198,43 +2266,47 @@ class TestSpotterCarBehindClosing:
             car_behind_gap=0.0,
             car_behind_lap_time=-1.0,
             player_last_lap_time=-1.0,
+            current_time=self.t,
         )
         assert "car_behind_closing" not in played_keys
 
     def test_car_behind_closing_alert_fires(self):
-        """Alert fires when car behind is consistently faster within gap threshold."""
+        """Alert fires when gap is consistently shrinking (EMA crossover)."""
         spotter = Spotter(self.config)
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
         # Prime: green flag, on track
-        spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
-        )
-
-        # Tick 1: car behind is faster (gap = 5s, their lap = 91s, our lap = 92s)
+        self.t += 1.0
         spotter.update(
             CLR_CLEAR,
             is_on_track=True,
             track_surface=3,
             session_flags=self.FLAG_GREEN,
-            car_behind_gap=-5.0,  # negative = behind
-            car_behind_lap_time=91.0,
-            player_last_lap_time=92.0,
+            current_time=self.t,
         )
-        assert "car_behind_closing" not in played_keys  # 1st faster lap, not enough
 
-        # Tick 2: car behind still faster (gap shrinking)
-        spotter.update(
-            CLR_CLEAR,
-            is_on_track=True,
-            track_surface=3,
-            session_flags=self.FLAG_GREEN,
-            car_behind_gap=-4.0,
-            car_behind_lap_time=91.0,
-            player_last_lap_time=92.0,
-        )
-        assert "car_behind_closing" in played_keys  # 2 consecutive faster laps
+        # Feed shrinking gap data over 8 ticks (1s intervals)
+        # Gap shrinks from 50m to 30m — car is closing
+        gaps = [
+            (5.0, 50.0),
+            (4.8, 48.0),
+            (4.5, 45.0),
+            (4.2, 42.0),
+            (3.9, 39.0),
+            (3.6, 36.0),
+            (3.3, 33.0),
+            (3.0, 30.0),
+        ]
+        for gap_s, gap_m in gaps:
+            self._tick_closing(
+                spotter,
+                gap_s,
+                gap_m,
+                car_behind_lap_time=95.0,
+                player_best_lap_time=98.0,
+            )
+        assert "car_behind_closing" in played_keys
 
     def test_no_alert_when_not_on_track(self):
         """No alert when player is not on track."""
@@ -2243,29 +2315,31 @@ class TestSpotterCarBehindClosing:
         spotter._player.play = lambda key: played_keys.append(key)
 
         # Prime
+        self.t += 1.0
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            current_time=self.t,
         )
 
-        # Not on track — no alert even though car behind is closing
-        spotter.update(
-            CLR_CLEAR,
-            is_on_track=False,  # NOT on track
-            track_surface=0,
-            session_flags=self.FLAG_GREEN,
-            car_behind_gap=-5.0,
-            car_behind_lap_time=91.0,
-            player_last_lap_time=92.0,
-        )
-        spotter.update(
-            CLR_CLEAR,
-            is_on_track=False,
-            track_surface=0,
-            session_flags=self.FLAG_GREEN,
-            car_behind_gap=-4.0,
-            car_behind_lap_time=91.0,
-            player_last_lap_time=92.0,
-        )
+        # Not on track — no alert even though gap is shrinking
+        gaps = [(5.0, 50.0), (4.5, 45.0), (4.0, 40.0), (3.5, 35.0)]
+        for gap_s, gap_m in gaps:
+            self.t += 1.0
+            spotter.update(
+                CLR_CLEAR,
+                is_on_track=False,
+                track_surface=0,
+                session_flags=self.FLAG_GREEN,
+                car_behind_gap=-gap_s,
+                car_behind_lap_time=95.0,
+                car_behind_gap_metres=gap_m,
+                player_last_lap_time=-1.0,
+                player_best_lap_time=98.0,
+                current_time=self.t,
+            )
         assert "car_behind_closing" not in played_keys
 
     def test_no_alert_during_yellow_flag(self):
@@ -2275,29 +2349,24 @@ class TestSpotterCarBehindClosing:
         spotter._player.play = lambda key: played_keys.append(key)
 
         # Prime: green flag
+        self.t += 1.0
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            current_time=self.t,
         )
 
-        # Yellow flag — car behind is faster but yellow suppresses
-        spotter.update(
-            CLR_CLEAR,
-            is_on_track=True,
-            track_surface=3,
-            session_flags=self.FLAG_GREEN | self.FLAG_YELLOW,
-            car_behind_gap=-5.0,
-            car_behind_lap_time=91.0,
-            player_last_lap_time=92.0,
-        )
-        spotter.update(
-            CLR_CLEAR,
-            is_on_track=True,
-            track_surface=3,
-            session_flags=self.FLAG_GREEN | self.FLAG_YELLOW,
-            car_behind_gap=-4.0,
-            car_behind_lap_time=91.0,
-            player_last_lap_time=92.0,
-        )
+        # Yellow flag — shrinking gap should not trigger alert
+        gaps = [(5.0, 50.0), (4.5, 45.0), (4.0, 40.0), (3.5, 35.0)]
+        for gap_s, gap_m in gaps:
+            self._tick_closing(
+                spotter,
+                gap_s,
+                gap_m,
+                session_flags=self.FLAG_GREEN | self.FLAG_YELLOW,
+            )
         assert "car_behind_closing" not in played_keys
 
     def test_no_alert_when_car_alongside(self):
@@ -2307,79 +2376,191 @@ class TestSpotterCarBehindClosing:
         spotter._player.play = lambda key: played_keys.append(key)
 
         # Prime
+        self.t += 1.0
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            current_time=self.t,
         )
 
-        # Gap only 0.8s — car alongside, not closing
-        spotter.update(
-            CLR_CLEAR,
-            is_on_track=True,
-            track_surface=3,
-            session_flags=self.FLAG_GREEN,
-            car_behind_gap=-0.8,
-            car_behind_lap_time=91.0,
-            player_last_lap_time=92.0,
-        )
-        spotter.update(
-            CLR_CLEAR,
-            is_on_track=True,
-            track_surface=3,
-            session_flags=self.FLAG_GREEN,
-            car_behind_gap=-0.8,
-            car_behind_lap_time=91.0,
-            player_last_lap_time=92.0,
-        )
+        # Gap only 0.8s / 8m — car alongside, not closing
+        self._tick_closing(spotter, 0.8, 8.0)
+        self._tick_closing(spotter, 0.7, 7.0)
         assert "car_behind_closing" not in played_keys
 
     def test_reset_clears_car_behind_tracker(self):
-        """Spotter.reset() should clear car-behind tracker state."""
+        """Spotter.reset() should clear car-behind EMA state."""
         spotter = Spotter(self.config)
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        # Prime and trigger alert
-        spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
-        )
+        # Prime and build up closing trend
+        self.t += 1.0
         spotter.update(
             CLR_CLEAR,
             is_on_track=True,
             track_surface=3,
             session_flags=self.FLAG_GREEN,
-            car_behind_gap=-5.0,
-            car_behind_lap_time=91.0,
-            player_last_lap_time=92.0,
+            current_time=self.t,
         )
-        spotter.update(
-            CLR_CLEAR,
-            is_on_track=True,
-            track_surface=3,
-            session_flags=self.FLAG_GREEN,
-            car_behind_gap=-4.0,
-            car_behind_lap_time=91.0,
-            player_last_lap_time=92.0,
-        )
+        gaps = [
+            (5.0, 50.0),
+            (4.8, 48.0),
+            (4.5, 45.0),
+            (4.2, 42.0),
+            (3.9, 39.0),
+            (3.6, 36.0),
+            (3.3, 33.0),
+            (3.0, 30.0),
+        ]
+        for gap_s, gap_m in gaps:
+            self._tick_closing(
+                spotter,
+                gap_s,
+                gap_m,
+                car_behind_lap_time=95.0,
+                player_best_lap_time=98.0,
+            )
         assert "car_behind_closing" in played_keys
 
         # Reset
         spotter.reset()
 
-        # Should need to rebuild consecutive count after reset
+        # After reset, must build up EMA again — one tick is not enough
         played_keys.clear()
-        spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, session_flags=self.FLAG_GREEN
-        )
+        self.t += 1.0
         spotter.update(
             CLR_CLEAR,
             is_on_track=True,
             track_surface=3,
             session_flags=self.FLAG_GREEN,
-            car_behind_gap=-5.0,
-            car_behind_lap_time=91.0,
-            player_last_lap_time=92.0,
+            current_time=self.t,
         )
-        assert "car_behind_closing" not in played_keys  # Only 1 lap, need 2
+        self._tick_closing(spotter, 5.0, 50.0)
+        assert "car_behind_closing" not in played_keys
+
+    def test_no_alert_when_car_slower_than_player_best(self):
+        """No closing alert when car behind is slower than player's best lap.
+
+        Even if the gap is shrinking in metres, the car behind is not genuinely
+        faster — they might be closing due to traffic or draft, not pace.
+        """
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Prime
+        self.t += 1.0
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            current_time=self.t,
+        )
+
+        # Player best = 98.0s, car behind = 102.0s — slower than player's best
+        gaps = [(5.0, 50.0), (4.5, 45.0), (4.0, 40.0), (3.5, 35.0)]
+        for gap_s, gap_m in gaps:
+            self._tick_closing(
+                spotter,
+                gap_s,
+                gap_m,
+                car_behind_lap_time=102.0,  # Slower than player's best
+                player_best_lap_time=98.0,
+            )
+        assert "car_behind_closing" not in played_keys
+
+    def test_alert_when_car_genuinely_faster_than_best(self):
+        """Alert should fire when car behind is genuinely faster than player's best."""
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Prime
+        self.t += 1.0
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            current_time=self.t,
+        )
+
+        # Player best = 98.0s, car behind = 95.0s — genuinely faster
+        # Gap shrinks from 50m to 30m over 8 ticks
+        gaps = [
+            (5.0, 50.0),
+            (4.8, 48.0),
+            (4.5, 45.0),
+            (4.2, 42.0),
+            (3.9, 39.0),
+            (3.6, 36.0),
+            (3.3, 33.0),
+            (3.0, 30.0),
+        ]
+        for gap_s, gap_m in gaps:
+            self._tick_closing(
+                spotter,
+                gap_s,
+                gap_m,
+                car_behind_lap_time=95.0,
+                player_best_lap_time=98.0,
+                player_last_lap_time=105.6,  # outlier lap — should be ignored
+            )
+        assert "car_behind_closing" in played_keys
+
+    def test_no_alert_when_car_behind_on_pit_road(self):
+        """No closing alert when car behind is on pit road (unreliable data)."""
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Prime
+        self.t += 1.0
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            current_time=self.t,
+        )
+
+        # Shrinking gap but car behind is on pit road — suppressed
+        gaps = [(5.0, 50.0), (4.5, 45.0), (4.0, 40.0), (3.5, 35.0)]
+        for gap_s, gap_m in gaps:
+            self._tick_closing(
+                spotter,
+                gap_s,
+                gap_m,
+                car_behind_lap_time=95.0,
+                player_best_lap_time=98.0,
+                car_behind_on_pit_road=True,
+            )
+        assert "car_behind_closing" not in played_keys
+
+    def test_no_alert_when_gap_stable(self):
+        """No alert when gap is stable (not shrinking)."""
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Prime
+        self.t += 1.0
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            current_time=self.t,
+        )
+
+        # Gap stays at ~50m — not closing
+        for gap_m in [50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0]:
+            self._tick_closing(spotter, 5.0, gap_m)
+        assert "car_behind_closing" not in played_keys
 
 
 class TestProximityDetectorStillThere:

@@ -11,7 +11,7 @@ Architecture:
     ProximityDetector   ← edge-detect CarLeftRight transitions, enforce cooldowns
            │
            ▼
-    CarBehindTracker    ← lap-time delta detection for car-behind-closing alert
+    CarBehindClosingDetector  ← EMA gap-trend detection for car-behind-closing alert
            │
            ▼
          Spotter           ← coordinator: owns detector + tracker + audio player, called each tick
@@ -38,6 +38,7 @@ Key design decisions:
 """
 
 import logging
+import math
 import os
 import threading
 import time
@@ -469,141 +470,193 @@ class ProximityDetector:
         self._last_still_there_time = 0.0
 
 
-class CarBehindTracker:
-    """Tracks whether the car behind is closing on the player.
+class CarBehindClosingDetector:
+    """Detects when the car behind is genuinely closing on the player.
 
-    Uses lap-time comparison: if the car behind consistently runs faster
-    laps than the player, they're closing. This is more reliable than
-    computing a derivative from CarDistBehind (which is noisy at 30Hz)
-    and uses data already computed in nearby_cars.
+    Uses iRacing's CarDistBehind (metres) smoothed via EMA to detect
+    a shrinking gap. More reliable than lap-time comparison which
+    produces false positives when the player has an off-track excursion.
 
-    The tracker counts consecutive laps where the car behind was faster.
-    After a configurable threshold (default 2), it fires a "car behind
-    closing" alert. The alert resets when the gap grows back above a
-    hysteresis threshold, the car behind slows down, or yellow flag
-    bunches the field.
+    Two EMAs are maintained:
+    - Fast EMA (~1.5s) tracks recent gap changes
+    - Slow EMA (~4.0s) tracks the established gap trend
 
-    Cooldown prevents repeated alerts within a configurable window.
+    When the gap is shrinking fast enough (fast_ema < slow_ema by
+    more than the threshold), the car is considered closing.
     """
 
     # Configurable thresholds (can be overridden via config spotter.closing)
-    DEFAULT_CONSECUTIVE_FASTER = 2  # Laps of faster pace before alerting
+    DEFAULT_CLOSING_THRESHOLD_MPS = 0.15  # Min closing rate in m/s to alert
+    DEFAULT_EMA_FAST_TAU = 1.5  # Fast EMA time constant (seconds)
+    DEFAULT_EMA_SLOW_TAU = 4.0  # Slow EMA time constant (seconds)
     DEFAULT_MAX_GAP = 10.0  # Only alert if gap < this (seconds)
     DEFAULT_MIN_GAP = 1.5  # Don't alert if car is already alongside
-    DEFAULT_RESET_GAP = 12.0  # Reset alert when gap grows above this
     DEFAULT_COOLDOWN = 30.0  # Seconds between repeated alerts
+
+    # Sentinel value for "no car behind" in metres
+    NO_CAR_BEHIND = 10000.0
 
     def __init__(self, config: dict):
         closing_config = config.get("spotter", {}).get("closing", {})
-        self._consecutive_threshold = closing_config.get(
-            "consecutive_faster_laps", self.DEFAULT_CONSECUTIVE_FASTER
+        self._closing_threshold = closing_config.get(
+            "closing_threshold_mps", self.DEFAULT_CLOSING_THRESHOLD_MPS
+        )
+        self._ema_fast_tau = closing_config.get(
+            "ema_fast_seconds", self.DEFAULT_EMA_FAST_TAU
+        )
+        self._ema_slow_tau = closing_config.get(
+            "ema_slow_seconds", self.DEFAULT_EMA_SLOW_TAU
         )
         self._max_gap = closing_config.get("max_gap_seconds", self.DEFAULT_MAX_GAP)
         self._min_gap = closing_config.get("min_gap_seconds", self.DEFAULT_MIN_GAP)
-        self._reset_gap = closing_config.get(
-            "reset_gap_seconds", self.DEFAULT_RESET_GAP
-        )
         self._cooldown = closing_config.get("cooldown_seconds", self.DEFAULT_COOLDOWN)
 
-        # State
-        self._consecutive_faster: int = (
-            0  # How many consecutive laps car behind was faster
-        )
-        self._alert_fired: bool = (
-            False  # Whether the closing alert has been fired for this approach
-        )
-        self._last_alert_time: float = 0.0  # Monotonic time of last alert
-        self._car_behind_present: bool = False  # Whether we're tracking a car behind
+        # Warn about deprecated config keys
+        for old_key in ("consecutive_faster_laps", "reset_gap_seconds"):
+            if old_key in closing_config:
+                logger.warning(
+                    f"Spotter config 'spotter.closing.{old_key}' is deprecated "
+                    f"and ignored — using EMA-based gap detection instead"
+                )
+
+        # EMA state (gap in metres)
+        self._ema_fast: float = 0.0
+        self._ema_slow: float = 0.0
+        self._initialized: bool = False
+        self._last_update_time: float = 0.0
+        self._last_gap_metres: float = 0.0  # For logging
+
+        # Alert state
+        self._alert_fired: bool = False
+        self._last_alert_time: float = 0.0
+        self._car_behind_present: bool = False
 
     def update(
         self,
         gap_seconds: float,
-        car_behind_faster: bool,
+        gap_metres: float,
+        car_on_pit_road: bool,
+        player_best_lap_time: float,
+        car_behind_lap_time: float,
         is_yellow: bool,
         current_time: float,
     ) -> None:
-        """Process a tick of car-behind data.
+        """Process a tick of car-behind gap data.
 
         Args:
-            gap_seconds: Absolute gap to car behind in seconds (positive value).
+            gap_seconds: Absolute gap to car behind in seconds (positive).
                 0 means no car behind.
-            car_behind_faster: True if car behind's last lap time is less than
-                the player's (they're running faster laps).
-            is_yellow: True if yellow/caution flag is active (suppress alerts).
-            current_time: Monotonic time for cooldown tracking.
+            gap_metres: Gap to car behind in metres from iRacing CarDistBehind.
+                Use NO_CAR_BEHIND sentinel if no car behind.
+            car_on_pit_road: True if the car behind is on pit road.
+            player_best_lap_time: Player's best lap time (0 = no data).
+                Used to gate alerts: don't alert if car behind is slower
+                than player's best pace.
+            car_behind_lap_time: Last lap time of car behind (-1 = no data).
+            is_yellow: True if yellow/caution flag is active.
+            current_time: Monotonic time for EMA and cooldown tracking.
         """
         # No car behind — reset tracking state
-        if gap_seconds <= 0:
+        if gap_seconds <= 0 or gap_metres >= self.NO_CAR_BEHIND:
             if self._car_behind_present:
-                logger.debug("Car behind: no car behind, resetting tracker")
-            self._consecutive_faster = 0
+                logger.debug("Car behind: no car behind, resetting detector")
+            self._initialized = False
             self._alert_fired = False
             self._car_behind_present = False
             return
 
         self._car_behind_present = True
 
-        # Yellow flag — don't accumulate "faster" laps during caution
+        # Car on pit road — their distance data is unreliable (in/out lap)
+        if car_on_pit_road:
+            if self._initialized:
+                logger.debug("Car behind: on pit road, skipping update")
+            return
+
+        # Yellow flag — don't accumulate gap data during caution
         if is_yellow:
-            self._consecutive_faster = 0
+            self._initialized = False
             self._alert_fired = False
             return
 
         # Car alongside or very close — that's CarLeftRight's job
         if gap_seconds < self._min_gap:
-            self._consecutive_faster = 0
+            self._initialized = False
             self._alert_fired = False
             return
 
         # Gap too large — not closing on us meaningfully
-        if gap_seconds > self._reset_gap:
-            self._consecutive_faster = 0
+        if gap_seconds > self._max_gap:
+            self._initialized = False
             self._alert_fired = False
             return
 
-        # Track consecutive faster laps
-        if car_behind_faster:
-            self._consecutive_faster += 1
-            logger.debug(
-                f"Car behind: faster (consecutive={self._consecutive_faster}, "
-                f"gap={gap_seconds:.1f}s)"
-            )
-        else:
-            # Car behind is not faster — they've stopped closing
-            if self._consecutive_faster > 0:
-                logger.debug(
-                    f"Car behind: slower (was {self._consecutive_faster} faster, resetting)"
-                )
-            self._consecutive_faster = 0
-            # They stopped closing — allow a new alert next time they speed up
-            self._alert_fired = False
+        # Gate: don't alert if car behind is slower than player's best pace
+        if player_best_lap_time > 0 and car_behind_lap_time > 0:
+            if car_behind_lap_time > player_best_lap_time:
+                # Car behind is slower than player's best — not genuinely closing
+                self._initialized = False
+                self._alert_fired = False
+                return
+
+        # Update EMAs with new gap data
+        if not self._initialized:
+            # First data point — initialise both EMAs to current gap
+            self._ema_fast = gap_metres
+            self._ema_slow = gap_metres
+            self._initialized = True
+            self._last_update_time = current_time
+            self._last_gap_metres = gap_metres
+            return
+
+        # Compute time since last update for EMA alpha
+        dt = current_time - self._last_update_time
+        if dt <= 0:
+            return  # No time elapsed, skip
+        self._last_update_time = current_time
+        self._last_gap_metres = gap_metres
+
+        # EMA alpha: alpha = 1 - exp(-dt / tau)
+        alpha_fast = 1.0 - math.exp(-dt / self._ema_fast_tau)
+        alpha_slow = 1.0 - math.exp(-dt / self._ema_slow_tau)
+
+        self._ema_fast = self._ema_fast + alpha_fast * (gap_metres - self._ema_fast)
+        self._ema_slow = self._ema_slow + alpha_slow * (gap_metres - self._ema_slow)
+
+        logger.debug(
+            f"Car behind: gap={gap_seconds:.1f}s ({gap_metres:.1f}m), "
+            f"ema_fast={self._ema_fast:.1f}m, ema_slow={self._ema_slow:.1f}m, "
+            f"trend={(self._ema_slow - self._ema_fast) / self._ema_slow_tau:.3f}m/s"
+        )
 
     def should_alert(self, current_time: float | None = None) -> bool:
         """Whether a 'car behind closing' alert should fire this tick.
 
         Returns True when:
-        - Car behind has been faster for ≥ consecutive_threshold laps
+        - Car behind's gap is shrinking (fast EMA < slow EMA by threshold)
         - Gap is within [min_gap, max_gap]
-        - Alert hasn't already been fired for this approach
+        - Alert hasn't already been fired for this closing approach
         - Cooldown since last alert has elapsed
-
-        Args:
-            current_time: Monotonic time for cooldown check. Defaults to
-                time.monotonic() if not provided (for production use).
-                Pass explicit values in tests for deterministic timing.
+        - Car behind is faster than player's best pace
         """
         if not self._car_behind_present:
             return False
 
-        if self._consecutive_faster < self._consecutive_threshold:
+        if not self._initialized:
             return False
 
         if self._alert_fired:
             return False
 
-        # Cooldown check — only enforce if a previous alert was actually fired
-        # (i.e. _last_alert_time > 0, which is set when the first alert fires).
-        # This avoids the initial _last_alert_time=0 from blocking the first alert.
+        # Check if gap is shrinking fast enough
+        # macd = slow_ema - fast_ema; when positive, gap is shrinking
+        macd = self._ema_slow - self._ema_fast
+        closing_rate = macd / self._ema_slow_tau  # Approximate m/s closing rate
+
+        if closing_rate < self._closing_threshold:
+            return False
+
+        # Cooldown check
         now = current_time if current_time is not None else time.monotonic()
         if self._last_alert_time > 0 and (now - self._last_alert_time) < self._cooldown:
             return False
@@ -615,7 +668,11 @@ class CarBehindTracker:
 
     def reset(self):
         """Reset all tracking state (e.g. on session start/reconnect)."""
-        self._consecutive_faster = 0
+        self._ema_fast = 0.0
+        self._ema_slow = 0.0
+        self._initialized = False
+        self._last_update_time = 0.0
+        self._last_gap_metres = 0.0
         self._alert_fired = False
         self._last_alert_time = 0.0
         self._car_behind_present = False
@@ -865,7 +922,7 @@ class Spotter:
         self._enabled = spotter_config.get("enabled", True)
         self._detector = ProximityDetector(config)
         self._player = SpotterAudioPlayer(config)
-        self._car_behind_tracker = CarBehindTracker(config)
+        self._car_behind_tracker = CarBehindClosingDetector(config)
         self._config = config
 
         # Fuel alert state: track which alerts have been fired
@@ -916,8 +973,12 @@ class Spotter:
         on_pit_road: bool = False,
         car_behind_gap: float = 0.0,
         car_behind_lap_time: float = -1.0,
+        car_behind_gap_metres: float = 10000.0,
         player_last_lap_time: float = -1.0,
+        player_best_lap_time: float = 0.0,
+        car_behind_on_pit_road: bool = False,
         lap_completed: int = 0,
+        current_time: float | None = None,
     ):
         """Process a telemetry tick.
 
@@ -943,15 +1004,32 @@ class Spotter:
                 = behind player). 0 = no car behind.
             car_behind_lap_time: Last lap time of the car directly behind.
                 -1.0 = no data available.
+            car_behind_gap_metres: Gap to car behind in metres from iRacing
+                CarDistBehind. 10000.0 = no car behind (iRacing sentinel).
+                Used for EMA-based closing detection.
             player_last_lap_time: Player's last completed lap time.
                 -1.0 = no completed lap yet.
+            player_best_lap_time: Player's best lap time in this session.
+                0.0 = no valid lap yet. Used to gate closing alerts —
+                don't alert if car behind is slower than player's best pace.
+            car_behind_on_pit_road: True if the car behind is on pit road.
+                Their lap time is an in/out lap and not representative.
             lap_completed: Number of laps the player has completed (0 = none yet).
                 Used to suppress blue flag at race start — blue flags are not
                 meaningful until at least one lap is completed (field hasn't
                 spread out yet).
+            current_time: Monotonic time for EMA and cooldown tracking.
+                Defaults to time.monotonic() if not provided. Pass explicit
+                values in tests to simulate time progression.
         """
         if not self._enabled:
             return
+
+        now = current_time if current_time is not None else time.monotonic()
+
+        # Store for use in car-behind-closing logic
+        self._player_best_lap_time = player_best_lap_time
+        self._car_behind_on_pit_road = car_behind_on_pit_road
 
         # --- Track first lap completion (blue flag suppression) ---
         if lap_completed >= 1:
@@ -998,7 +1076,7 @@ class Spotter:
 
         # --- Proximity calls (only on racing surface) ---
         if is_on_track and track_surface >= 3 and 0 <= car_left_right <= 6:
-            calls = self._detector.update(car_left_right, time.monotonic())
+            calls = self._detector.update(car_left_right, now)
             for call in calls:
                 self._player.play(call.audio_key)
 
@@ -1156,16 +1234,16 @@ class Spotter:
             self._prev_on_pit_road = on_pit_road_confirmed
 
         # --- Car behind closing alert ---
-        # Detects when the car directly behind is consistently running faster
-        # laps than the player (closing the gap). Uses lap-time comparison
-        # rather than CarDistBehind derivative for noise immunity.
-        # Only active when on track, racing, and with valid lap data.
+        # Detects when the car directly behind is closing the gap using
+        # iRacing's CarDistBehind (metres) smoothed via EMA. This is more
+        # reliable than lap-time comparison, which produces false positives
+        # when the player has an off-track excursion.
+        # Only active when on track, racing, and with valid data.
         if (
             is_on_track
             and self._race_started
             and car_behind_gap < 0  # negative = behind player
-            and player_last_lap_time > 0
-            and car_behind_lap_time > 0
+            and player_best_lap_time > 0
         ):
             abs_gap = abs(car_behind_gap)
             is_yellow = bool(
@@ -1177,27 +1255,44 @@ class Spotter:
                     | self.FLAG_YELLOW_WAVING
                 )
             )
-            car_is_faster = car_behind_lap_time < player_last_lap_time
+            # Check if the car behind is on pit road
+            car_behind_on_pit = getattr(self, "_car_behind_on_pit_road", False)
             self._car_behind_tracker.update(
                 gap_seconds=abs_gap,
-                car_behind_faster=car_is_faster,
+                gap_metres=car_behind_gap_metres,
+                car_on_pit_road=car_behind_on_pit,
+                player_best_lap_time=player_best_lap_time,
+                car_behind_lap_time=car_behind_lap_time,
                 is_yellow=is_yellow,
-                current_time=time.monotonic(),
+                current_time=now,
             )
-            if self._car_behind_tracker.should_alert(current_time=time.monotonic()):
+            if self._car_behind_tracker.should_alert(current_time=now):
                 self._player.play("car_behind_closing")
+                best = self._player_best_lap_time
+                ema_fast = self._car_behind_tracker._ema_fast
+                ema_slow = self._car_behind_tracker._ema_slow
+                closing_rate = (
+                    (ema_slow - ema_fast) / self._car_behind_tracker._ema_slow_tau
+                    if self._car_behind_tracker._ema_slow_tau > 0
+                    else 0
+                )
                 logger.info(
-                    f"Car behind closing: gap={abs_gap:.1f}s, "
+                    f"Car behind closing: gap={abs_gap:.1f}s "
+                    f"({ema_slow:.1f}m→{ema_fast:.1f}m), "
+                    f"trend=-{closing_rate:.2f}m/s, "
                     f"their_lap={car_behind_lap_time:.1f}s, "
-                    f"our_lap={player_last_lap_time:.1f}s"
+                    f"our_best={best:.1f}s"
                 )
         elif car_behind_gap >= 0:
             # No car behind — reset tracker
             self._car_behind_tracker.update(
                 gap_seconds=0.0,
-                car_behind_faster=False,
+                gap_metres=CarBehindClosingDetector.NO_CAR_BEHIND,
+                car_on_pit_road=False,
+                player_best_lap_time=0.0,
+                car_behind_lap_time=-1.0,
                 is_yellow=False,
-                current_time=time.monotonic(),
+                current_time=now,
             )
 
     def reset(self):

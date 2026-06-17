@@ -275,6 +275,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("iraceengineer")
 
+
+def _clean_response(text: str) -> str:
+    """Post-process LLM response text for common model quirks."""
+    # Replace tildes with "about" (small models often output ~2 instead of "about 2")
+    text = text.replace("~", "about ")
+    return text
+
+
 # Dedicated logger for LLM query data — handler added in setup_llm_query_log()
 llm_query_logger = logging.getLogger("iraceengineer.llm_query")
 llm_query_logger.propagate = False  # Don't double-print to console
@@ -431,6 +439,9 @@ def handle_button_press(
             _print_timing_summary(steps)
             return
 
+        # Post-process: clean common model quirks
+        response_text = _clean_response(response_text)
+
         # Display response
         print("\n" + "=" * 60)
         print(f"🏁 RACE ENGINEER (depth={depth})")
@@ -514,9 +525,6 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
         tts.preload()
 
     # Set up wheel button triggers
-    query_trigger_config = config.get("trigger", {})
-    query_device = query_trigger_config.get("device_index")
-    query_button = query_trigger_config.get("button_index")
     voice_trigger_config = voice_config.get("trigger", {})
 
     # Connect to iRacing
@@ -544,27 +552,8 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
         f"👥 Team detected: {len(team_indices)} cars — {', '.join(driver_names.get(i, f'Car #{i}') for i in team_indices)}\n"
     )
 
-    # Register triggers (wheel buttons for LLM query and voice PTT)
-    query_listener = None
+    # Register triggers (wheel button for voice PTT)
     voice_listener = None
-
-    # LLM query trigger — wheel button press
-    if query_device is not None and query_button is not None:
-        query_listener = WheelButtonListener(
-            device_index=query_device,
-            button_index=query_button,
-            on_press=lambda: handle_button_press(state, context_builder, llm, tts=tts),
-        )
-        query_listener.start()
-        print(
-            f"🎧 LLM query: press wheel button {query_button} (device {query_device})"
-        )
-    else:
-        logger.warning(
-            "No query trigger configured — set trigger.device_index and "
-            "trigger.button_index in config.yaml. Run test_wheel.py to discover."
-        )
-        print("   ⚠️  No query trigger configured. Edit config.yaml trigger section.")
 
     # Voice PTT trigger — wheel button hold-to-talk
     if stt is not None:
@@ -698,6 +687,7 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                     # Find car directly behind player for closing-approach alert
                     car_behind_gap = 0.0
                     car_behind_lap_time = -1.0
+                    car_behind_on_pit_road = False
                     for car in state.nearby_cars:
                         if car.gap_seconds < 0:  # negative = behind player
                             # Closest behind = least negative gap
@@ -707,6 +697,9 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                             ):
                                 car_behind_gap = car.gap_seconds
                                 car_behind_lap_time = car.last_lap_time
+                                car_behind_on_pit_road = getattr(
+                                    car, "on_pit_road", False
+                                )
 
                     spotter.update(
                         car_lr,
@@ -719,7 +712,10 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                         on_pit_road=on_pit_road,
                         car_behind_gap=car_behind_gap,
                         car_behind_lap_time=car_behind_lap_time,
+                        car_behind_gap_metres=state.player.car_dist_behind,
                         player_last_lap_time=state.player.last_lap_time,
+                        player_best_lap_time=state.player.best_lap_time,
+                        car_behind_on_pit_road=car_behind_on_pit_road,
                         lap_completed=state.player.lap_completed,
                     )
 
@@ -738,8 +734,6 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
 
     except KeyboardInterrupt:
         print("\n\n👋 Shutting down...")
-        if query_listener is not None:
-            query_listener.stop()
         if voice_listener is not None:
             voice_listener.stop()
         iracing.shutdown()
@@ -890,6 +884,7 @@ def run_replay_mode(
         print("=" * 60)
         print("🏁 RACE ENGINEER")
         print("=" * 60)
+        response = _clean_response(response)
         print(response)
         print("=" * 60)
         if tts is not None:
@@ -1125,6 +1120,7 @@ def run_replay_mode(
         )
 
         if response:
+            response = _clean_response(response)
             print("  " + "=" * 56)
             print("  🏁 RACE ENGINEER")
             print("  " + "=" * 56)

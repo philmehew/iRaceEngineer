@@ -45,12 +45,8 @@ team:
     - Mayhem: Phil Mehew
   car_numbers: []                # Alternative: identify by car number
 
-# Button trigger — wheel button to query the LLM
-trigger:
-  device_index: 0            # Joystick device index (use test_wheel.py to find)
-  button_index: 8            # Button index on device (use test_wheel.py to find)
 
-# Voice input/output (requires: uv pip install -e ".[voice]")
+# Voice input/output (requires: uv sync)
 voice:
   stt:
     enabled: true
@@ -72,14 +68,21 @@ voice:
     sentence_silence: 0.2             # Seconds of silence between sentences
 
   trigger:
-    device_index: 0                # Joystick device index (use test_wheel.py to find)
-    button_index: 9                # Button index on device (use test_wheel.py to find)
+    device_index: 0              # Joystick device index (use test_wheel.py to find)
+    button_index: 9              # Button index on device (use test_wheel.py to find)
     push_to_talk: true                # true = hold button to record, release to stop (like radio PTT)
     max_record_seconds: 15           # Safety: auto-stop recording after this
 
 # Spotter — real-time audio calls for car proximity and track events
 spotter:
   enabled: true                           # Enable/disable spotter audio calls
+  closing:
+    closing_threshold_mps: 0.15           # Min closing rate (m/s) to trigger alert
+    ema_fast_seconds: 1.5                 # Fast EMA time constant (seconds)
+    ema_slow_seconds: 4.0                 # Slow EMA time constant (seconds)
+    max_gap_seconds: 10.0                  # Only alert if gap < this (seconds)
+    min_gap_seconds: 1.5                   # Don't alert if car alongside (seconds)
+    cooldown_seconds: 30.0                 # Min time between repeated alerts
   audio_paths:
     car_left: "audio/carleft.wav"         # Car appears on left
     car_right: "audio/carright.wav"       # Car appears on right
@@ -107,7 +110,7 @@ spotter:
   cooldowns:
     proximity_ms: 3000                    # Don't repeat proximity calls within 3s
     clearance_ms: 5000                    # Don't repeat clearance calls within 5s
-    clear_delay_ms: 0                      # No debounce on "clear" — fire immediately
+    clear_delay_ms: 200                    # Debounce "clear" — 200ms to confirm car has cleared
     appear_delay_ms: 200                  # Debounce: car must be alongside this long before proximity fires
   output_device: null                     # null = system default, or device name/index
   volume: 1.0                             # Volume multiplier (independent of TTS)
@@ -121,10 +124,10 @@ prompt:
 
     Rules:
     - One-shot advice only. Never promise to monitor or follow up.
-    - Don't assess temps or pressures without a baseline — just report values.
-    - If fuel burn is 'unknown' or 'approx', say 'burn rate unknown' — NEVER guess a figure.
-    - Weather is current conditions only — never predict future weather or race events.
-    - If context shows '!! RACE ENDING SOON', say 'Do NOT pit' first, then explain why.
+    - Don't assess temps or pressures without a baseline - just report values.
+    - If fuel burn is 'unknown' or 'approx', say 'burn rate unknown' - NEVER guess a figure.
+    - Weather is current conditions only - never predict future weather or race events.
+    - If context shows '!! FUEL SHORTAGE' and does NOT show '!! RACE ENDING SOON', recommend pitting. Add the litres shown in the shortage message.
     - Never start responses with prefixes. Start directly with the answer.
   context_depth: "full"       # "minimal", "medium", or "full"
   # minimal: position, fuel, laps remaining only
