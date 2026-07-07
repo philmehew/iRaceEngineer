@@ -10,12 +10,12 @@ llm:
   #api_key_env: "2d037788fae94179ba526b56ec4f1dea.J6EUKATFFsHZMzykGG_cVfog"            # Reads from environment variable
   #model: "ministral-3:14b-cloud"
   #model: "gemma4:31b-cloud"
-  base_url: "http://192.168.0.115:8000/v1"
+  base_url: "http://192.168.0.117:8006/v1/"
   api_key_env: ""
-  model: "granite-4.1-3b"
-  max_tokens: 300
+  model: "qwen3-8b"
+  max_tokens: 1024
   temperature: 0.3
-  timeout: 5.0                              # Seconds to wait for LLM response before giving up
+  timeout: 5.0                             # Seconds to wait for LLM response before giving up
 
 # Team identification — how to recognise your teammates
 # AUTO-DETECT (default): iRacing assigns each driver a TeamName in session info.
@@ -112,6 +112,7 @@ spotter:
     clearance_ms: 5000                    # Don't repeat clearance calls within 5s
     clear_delay_ms: 200                    # Debounce "clear" — 200ms to confirm car has cleared
     appear_delay_ms: 200                  # Debounce: car must be alongside this long before proximity fires
+  fuel_cooldown_seconds: 120             # Min seconds between repeated fuel alerts of same type
   output_device: null                     # null = system default, or device name/index
   volume: 1.0                             # Volume multiplier (independent of TTS)
 

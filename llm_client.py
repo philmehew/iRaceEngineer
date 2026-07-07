@@ -90,7 +90,19 @@ class LLMClient:
             )
             t_done = time.monotonic()
 
-            content = response.choices[0].message.content.strip()
+            message = response.choices[0].message
+            content = (message.content or "").strip()
+
+            # Handle "thinking" models (e.g. DeepSeek R1, ornith1) that put
+            # reasoning in a separate field — fall back to reasoning_content
+            # if the main content is empty.
+            if not content:
+                reasoning = getattr(message, "reasoning_content", None)
+                if reasoning:
+                    content = reasoning.strip()
+                    logger.info(
+                        "LLM response was in reasoning_content (thinking model)"
+                    )
 
             # Log token usage and timing
             if hasattr(response, "usage") and response.usage:
@@ -140,8 +152,13 @@ class LLMClient:
             )
 
             for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                # Handle thinking models that send reasoning_content separately
+                text = delta.content or getattr(delta, "reasoning_content", None) or ""
+                if text:
+                    yield text
 
         except Exception as e:
             logger.error(f"LLM streaming call failed: {e}")

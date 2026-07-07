@@ -982,44 +982,85 @@ class TestSpotterFuelAlert:
         assert "fuel_one_lap" in played_keys
 
     def test_fuel_alert_fires_once(self):
-        """Fuel alert should only fire once per fuel window."""
+        """Fuel alert should only fire once per fuel window (fired flag prevents re-fire)."""
         spotter = Spotter(self.config)
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=1.5,
+            current_time=0.0,
         )
         assert "fuel_two_laps" in played_keys
 
-        # Subsequent ticks should NOT fire again
+        # Subsequent ticks should NOT fire again (fired flag + hysteresis)
         played_keys.clear()
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.3
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=1.3,
+            current_time=1.0,
         )
         assert "fuel_two_laps" not in played_keys
 
-    def test_fuel_alert_resets_above_threshold(self):
-        """Fuel alert should reset when laps remaining goes back above threshold."""
+    def test_fuel_alert_resets_above_threshold_with_hysteresis(self):
+        """Fuel alert should only reset when laps rise above threshold + hysteresis."""
         spotter = Spotter(self.config)
         played_keys = []
         spotter._player.play = lambda key: played_keys.append(key)
 
-        # Fire alert
+        # Fire alert (2-lap threshold, hysteresis=0.3)
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=1.5,
+            current_time=0.0,
         )
         assert "fuel_two_laps" in played_keys
 
-        # Pit stop — fuel goes above threshold
+        # Fuel rises to exactly the threshold (2.0) — NOT above hysteresis (2.3)
+        # Alert should NOT reset yet
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=5.0
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=2.0,
+            current_time=10.0,
         )
 
-        # Fuel drops below threshold again — should fire again
+        # Fuel drops again — should NOT fire (alert not reset)
         played_keys.clear()
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.8
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=1.8,
+            current_time=20.0,
+        )
+        assert "fuel_two_laps" not in played_keys
+
+        # Pit stop — fuel rises above threshold + hysteresis (2.3)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=5.0,
+            current_time=30.0,
+        )
+
+        # Fuel drops below threshold again — should fire again (past cooldown)
+        played_keys.clear()
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=1.8,
+            current_time=200.0,
         )
         assert "fuel_two_laps" in played_keys
 
@@ -1041,7 +1082,11 @@ class TestSpotterFuelAlert:
         spotter._player.play = lambda key: played_keys.append(key)
 
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=0.0
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=0.0,
+            current_time=0.0,
         )
         assert "fuel_two_laps" not in played_keys
         assert "fuel_five_laps" not in played_keys
@@ -1056,19 +1101,31 @@ class TestSpotterFuelAlert:
 
         # Fire alert
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=1.5,
+            current_time=0.0,
         )
         assert "fuel_two_laps" in played_keys
 
         # Unknown fuel (0) should NOT reset the alert
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=0.0
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=0.0,
+            current_time=10.0,
         )
 
         # Should NOT fire again (alert was not reset)
         played_keys.clear()
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.3
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=1.3,
+            current_time=20.0,
         )
         assert "fuel_two_laps" not in played_keys
 
@@ -1080,7 +1137,11 @@ class TestSpotterFuelAlert:
 
         # Fire alert
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=1.5,
+            current_time=0.0,
         )
         assert "fuel_two_laps" in played_keys
 
@@ -1090,9 +1151,198 @@ class TestSpotterFuelAlert:
         # Should fire again after reset
         played_keys.clear()
         spotter.update(
-            CLR_CLEAR, is_on_track=True, track_surface=3, fuel_laps_remaining=1.5
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=1.5,
+            current_time=0.0,
         )
         assert "fuel_two_laps" in played_keys
+
+    def test_fuel_hysteresis_prevents_oscillation_retrigger(self):
+        """Fuel alert should NOT re-fire when fuel oscillates around threshold.
+
+        When fuel bounces between 5.0 and 4.9 (iRacing noise), the 5-lap alert
+        should fire once and not re-fire until fuel rises well above 5.5 (pit stop).
+        """
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Fuel drops below 5.0 — alert fires
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=4.9,
+            current_time=0.0,
+        )
+        assert "fuel_five_laps" in played_keys
+
+        # Fuel bounces back to 5.0 (exactly threshold, but NOT above 5.5 hysteresis)
+        # Alert should NOT reset — so the fired flag stays True
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=5.0,
+            current_time=1.0,
+        )
+
+        # Fuel drops below 5.0 again — should NOT re-fire (fired flag still True)
+        played_keys.clear()
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=4.9,
+            current_time=2.0,
+        )
+        assert "fuel_five_laps" not in played_keys
+
+        # Fuel bounces to 5.2 — still not above 5.5 hysteresis
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=5.2,
+            current_time=3.0,
+        )
+
+        # Fuel drops below 5.0 again — still should NOT fire
+        played_keys.clear()
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=4.8,
+            current_time=4.0,
+        )
+        assert "fuel_five_laps" not in played_keys
+
+    def test_fuel_hysteresis_resets_after_pit_stop(self):
+        """After a pit stop (fuel rises well above threshold + hysteresis), alerts reset."""
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Fire 5-lap alert
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=4.9,
+            current_time=0.0,
+        )
+        assert "fuel_five_laps" in played_keys
+
+        # Pit stop — fuel rises well above threshold + hysteresis (5.5)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=10.0,
+            current_time=10.0,
+        )
+
+        # Fuel drops below threshold again — past cooldown — should fire
+        played_keys.clear()
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=4.8,
+            current_time=200.0,
+        )
+        assert "fuel_five_laps" in played_keys
+
+    def test_fuel_cooldown_prevents_rapid_retrigger(self):
+        """Fuel alert cooldown prevents re-fire even after hysteresis reset."""
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Fire 5-lap alert
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=4.9,
+            current_time=0.0,
+        )
+        assert "fuel_five_laps" in played_keys
+
+        # Pit stop resets hysteresis (fuel above 5.5)
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=10.0,
+            current_time=10.0,
+        )
+
+        # Fuel drops below threshold again, but within cooldown (120s default)
+        # Should NOT fire because cooldown hasn't elapsed
+        played_keys.clear()
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=4.8,
+            current_time=50.0,
+        )
+        assert "fuel_five_laps" not in played_keys
+
+        # After cooldown elapses, should fire
+        played_keys.clear()
+        spotter.update(
+            CLR_CLEAR,
+            is_on_track=True,
+            track_surface=3,
+            fuel_laps_remaining=4.8,
+            current_time=200.0,
+        )
+        assert "fuel_five_laps" in played_keys
+
+    def test_fuel_oscillation_no_spam(self):
+        """Simulates the real-world bug: fuel oscillating around 5.0 should not spam alerts.
+
+        This was the actual pattern seen in logs where fuel_five_laps fired
+        every few seconds due to fuel_laps_remaining bouncing between 4.9 and 5.1.
+        """
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+
+        # Simulate the exact pattern from the Jul 7 log
+        times_and_fuel = [
+            (0.0, 5.1),  # above threshold, no alert yet
+            (0.5, 5.0),  # at threshold, no alert (5.0 < 5.0 is False)
+            (1.0, 4.9),  # below threshold — FIRES
+            (1.5, 5.0),  # bounces back — hysteresis prevents reset (5.0 < 5.5)
+            (2.0, 4.9),  # below threshold — does NOT re-fire (fired flag still True)
+            (2.5, 5.0),  # bounces — no reset (5.0 < 5.5)
+            (3.0, 4.9),  # below threshold — does NOT re-fire
+            (3.5, 5.1),  # bounces — no reset (5.1 < 5.5)
+            (4.0, 4.8),  # below threshold — does NOT re-fire
+            (4.5, 5.0),  # bounces — no reset
+            (5.0, 4.9),  # below threshold — does NOT re-fire
+        ]
+
+        fuel_alert_count = 0
+        for t, fuel in times_and_fuel:
+            played_keys.clear()
+            spotter.update(
+                CLR_CLEAR,
+                is_on_track=True,
+                track_surface=3,
+                fuel_laps_remaining=fuel,
+                current_time=t,
+            )
+            fuel_alert_count += len([k for k in played_keys if "fuel" in k])
+
+        # Should have fired exactly ONCE (at the first 4.9 reading)
+        assert fuel_alert_count == 1
 
 
 class TestSpotterFlagAlerts:

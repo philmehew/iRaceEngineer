@@ -906,15 +906,16 @@ class Spotter:
     FLAG_FURLED = 0x080000
     FLAG_REPAIR = 0x100000
 
-    # Fuel alert thresholds (laps remaining): (threshold, audio_key, reset_threshold)
-    # Each alert fires once when laps drop below threshold, resets when laps
-    # rise back above reset_threshold (which equals the threshold — simple
-    # on/off with no hysteresis).
+    # Fuel alert thresholds (laps remaining): (threshold, audio_key, hysteresis)
+    # Each alert fires once when laps drop below threshold, and only resets
+    # when laps rise back above (threshold + hysteresis). This prevents
+    # rapid re-triggering when fuel laps remaining oscillates around a
+    # threshold (e.g. 5.0 ↔ 4.9 due to iRacing telemetry noise).
     FUEL_ALERTS = [
-        (5.0, "fuel_five_laps"),
-        (3.0, "fuel_three_laps"),
-        (2.0, "fuel_two_laps"),
-        (1.0, "fuel_one_lap"),
+        (5.0, "fuel_five_laps", 0.5),  # fires at <5.0, resets only at ≥5.5
+        (3.0, "fuel_three_laps", 0.5),  # fires at <3.0, resets only at ≥3.5
+        (2.0, "fuel_two_laps", 0.3),  # fires at <2.0, resets only at ≥2.3
+        (1.0, "fuel_one_lap", 0.3),  # fires at <1.0, resets only at ≥1.3
     ]
 
     def __init__(self, config: dict):
@@ -928,7 +929,15 @@ class Spotter:
         # Fuel alert state: track which alerts have been fired
         # Key is the threshold value, value is whether it's been fired this stint
         self._fuel_alerts_fired: dict[float, bool] = {
-            threshold: False for threshold, _ in self.FUEL_ALERTS
+            threshold: False for threshold, _, _ in self.FUEL_ALERTS
+        }
+        # Fuel alert cooldown: minimum seconds between repeated fuel alerts
+        # of the same type. Safety net against noise even with hysteresis.
+        self._fuel_cooldown = spotter_config.get("fuel_cooldown_seconds", 120.0)
+        # Track last fire time per threshold for cooldown enforcement.
+        # Initial value of None means "never fired" — bypasses cooldown.
+        self._fuel_alert_last_time: dict[float, float | None] = {
+            threshold: None for threshold, _, _ in self.FUEL_ALERTS
         }
 
         # Flag state: track previous flags for transition detection
@@ -1082,20 +1091,28 @@ class Spotter:
 
         # --- Fuel alerts (always active when on track) ---
         # Fire once when laps remaining drops below each threshold.
-        # Reset when laps go back above the threshold (e.g. after pit stop).
+        # Reset only when laps rise back above (threshold + hysteresis) — this
+        # prevents rapid re-triggering when fuel oscillates around a threshold.
+        # A per-threshold cooldown also prevents repeated alerts within a stint.
         # Don't fire or reset when fuel_laps_remaining is 0 (unknown/unreliable).
         if fuel_laps_remaining > 0:
-            for threshold, audio_key in self.FUEL_ALERTS:
+            for threshold, audio_key, hysteresis in self.FUEL_ALERTS:
+                last_time = self._fuel_alert_last_time[threshold]
                 if (
                     fuel_laps_remaining < threshold
                     and not self._fuel_alerts_fired[threshold]
+                    and (
+                        last_time is None  # never fired
+                        or (now - last_time) >= self._fuel_cooldown
+                    )
                 ):
                     self._player.play(audio_key)
                     self._fuel_alerts_fired[threshold] = True
+                    self._fuel_alert_last_time[threshold] = now
                     logger.info(
                         f"Fuel alert: {fuel_laps_remaining:.1f} laps remaining ({audio_key})"
                     )
-                elif fuel_laps_remaining >= threshold:
+                elif fuel_laps_remaining >= threshold + hysteresis:
                     self._fuel_alerts_fired[threshold] = False
 
         # --- Flag transition alerts ---
@@ -1301,6 +1318,8 @@ class Spotter:
         self._car_behind_tracker.reset()
         for threshold in self._fuel_alerts_fired:
             self._fuel_alerts_fired[threshold] = False
+        for threshold in self._fuel_alert_last_time:
+            self._fuel_alert_last_time[threshold] = None
         self._prev_flags = None
         # _race_started will be re-derived from SessionState on the next
         # tick, so it's correct regardless of whether we reconnect mid-race
