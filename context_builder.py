@@ -157,18 +157,9 @@ class ContextBuilder:
         return (
             "You are a race engineer. Speak in short radio-style sentences. No markdown, bullets, or headers.\n"
             "Example: 'Box this lap. Tyres are gone. Add 60 litres.'\n"
-            "If unsure, say so. Never invent data. The 'Your car' section is the driver you're talking to.\n\n"
-            "Rules:\n"
-            "- One-shot advice only. Never promise to monitor, track, or follow up later.\n"
-            "- Don't suggest setup changes (pressures, brake bias) without known reference ranges.\n"
-            "- Don't assess temps or pressures as high/low/normal without a baseline - just report values.\n"
-            "- 'Incidents' are safety-rating points, NOT car damage. Always report the count.\n"
-            "- If tyre data is unreliable, report last-known values but don't comment on trends or degradation.\n"
-            "- Fuel rules: Use 'litres' not 'L' when speaking. "
-            "If context shows 'Fuel to add: N', use that exact amount. If fuel burn is 'unknown', say so - never invent a figure.\n"
-            "- Weather is current conditions only - never predict future weather.\n"
-            "- If context shows '!! FUEL SHORTAGE' and does NOT show '!! RACE ENDING SOON', recommend pitting. Add the litres shown in the shortage message.\n"
-            "- Never start responses with prefixes. Start directly with the answer."
+            "If unsure, say so. Never invent data. The 'Your car' section is the driver you're talking to.\n"
+            "When 'Action:' is present, lead with that advice. "
+            "Report values as-is — if data says 'STALE' or 'frozen', do not assess trends from it."
         )
 
     def build_prompt(self, state: dict, question: str = "") -> list[dict]:
@@ -560,6 +551,9 @@ class ContextBuilder:
             if weather_parts:
                 lines.append(f"Weather: {' | '.join(weather_parts)}")
 
+        # Collect alert items throughout — emitted after position/action as a summary.
+        alert_items = []
+
         # === Engine health ===
         oil_temp = player.get("oil_temp", 0)
         oil_press = player.get("oil_press", 0)
@@ -569,52 +563,64 @@ class ContextBuilder:
         manifold_press = player.get("manifold_press", 0)
         engine_baseline = player.get("engine_baseline")
 
-        # Helper: format a value with delta from baseline if available
+        # Helper: format a value with delta from baseline if available.
+        # Returns (formatted_string, is_anomaly) tuple.
         def _engine_part(
             label: str, value: float, unit: str, bl_key: str
-        ) -> str | None:
+        ) -> tuple[str | None, bool]:
             if value <= 0:
-                return None
+                return None, False
             base_val = (
                 f"{label} {format_temp(value)}"
                 if unit == "C"
                 else f"{label} {value:.2f}{unit}"
             )
+            is_anomaly = False
             if engine_baseline and bl_key in engine_baseline:
                 bl = engine_baseline[bl_key]
                 if bl > 0:
                     delta = value - bl
                     pct = abs(delta) / bl if bl > 0 else 0
                     if pct > 0.15:  # ±15% threshold
+                        is_anomaly = True
                         arrow = "↑" if delta > 0 else "↓"
                         delta_unit = "°C" if unit == "C" else unit
                         base_val += f" ({arrow}{abs(delta):.1f}{delta_unit} from avg)"
-            return base_val
+            return base_val, is_anomaly
 
+        # Only show engine line when there's a warning or anomaly.
+        # Normal engine values are noise that invite unnecessary commentary
+        # from small models ("Oil temp high. Monitor closely." on 69°C).
+        has_engine_anomaly = bool(engine_warnings)
         engine_parts = []
-        part = _engine_part("Oil", oil_temp, "C", "oil_temp")
-        if part:
-            engine_parts.append(part)
-        part = _engine_part("OilP", oil_press, "bar", "oil_press")
-        if part:
-            engine_parts.append(part)
-        part = _engine_part("Water", water_temp, "C", "water_temp")
-        if part:
-            engine_parts.append(part)
-        part = _engine_part("Volt", voltage, "V", "voltage")
-        if part:
-            engine_parts.append(part)
-        if manifold_press > 0 and manifold_press < 5:
-            part = _engine_part("Manifold", manifold_press, "bar", "manifold_press")
+        for label, value, unit, bl_key in [
+            ("Oil", oil_temp, "C", "oil_temp"),
+            ("OilP", oil_press, "bar", "oil_press"),
+            ("Water", water_temp, "C", "water_temp"),
+            ("Volt", voltage, "V", "voltage"),
+        ]:
+            part, is_anom = _engine_part(label, value, unit, bl_key)
             if part:
                 engine_parts.append(part)
-        # Engine warning — surface BEFORE the engine line so the LLM
-        # doesn't miss it buried in the middle of temperature values
+                if is_anom:
+                    has_engine_anomaly = True
+        if manifold_press > 0 and manifold_press < 5:
+            part, is_anom = _engine_part(
+                "Manifold", manifold_press, "bar", "manifold_press"
+            )
+            if part:
+                engine_parts.append(part)
+                if is_anom:
+                    has_engine_anomaly = True
+
+        # Engine warning — add to alerts and show engine line only when anomalous
         if engine_warnings:
             warning_str = format_engine_warnings(engine_warnings)
+            alert_items.append(f"ENGINE: {warning_str}")
+            # Keep the warning line visible in context too
             lines.append(f"!! ENGINE WARNING: {warning_str}")
 
-        if engine_parts:
+        if has_engine_anomaly and engine_parts:
             lines.append(f"Engine: {' | '.join(engine_parts)}")
 
         # === Player car ===
@@ -635,14 +641,25 @@ class ContextBuilder:
         # causes it to recommend pitting when the race is almost over.
         # Guard: don't fire at lap 0 (formation/pre-race) — estimates are unreliable
         # and iRacing reports near-zero time remaining during the pace lap.
+        # Note: threshold must match the display threshold (≤3 laps) so fuel
+        # urgency messages are consistent with "RACE ENDING SOON" banners.
         race_ending_soon = (
             is_time_race
-            and race_laps_remain <= 2
+            and race_laps_remain <= 3
+            and race_laps_remain > 0
             and isinstance(race_laps, int)
             and race_laps >= 1
         )
+        # Action recommendation — computed here, inserted near top of "Your car:"
+        action_line = None
+
         if race_ending_soon:
             lines.append("  !! RACE ENDING SOON — DO NOT PIT. Stay out and finish.")
+            # Race-ending always means STAY OUT
+            if fuel_pct > 0 and fuel_pct < 0.15:
+                action_line = "STAY OUT — race ending, conserve fuel"
+            else:
+                action_line = "STAY OUT — race ending, finish as is"
 
         on_track = player.get("is_on_track", True)
         in_garage = player.get("is_in_garage", False)
@@ -655,6 +672,75 @@ class ContextBuilder:
             lines.append(f"  Status: {' | '.join(status_parts)}")
 
         lines.append(f"  Position: P{pos} (Class P{class_pos})")
+
+        # Pre-compute fuel urgency action (overrides race-ending if shortage requires pit)
+        # Only override race-ending action if there's a genuine fuel shortage that
+        # means the car CAN'T finish — in that case pit even if race is ending soon.
+        if not race_ending_soon:
+            # Normal race — compute action from fuel status
+            if avg_fuel_per_lap > 0 and fuel_laps > 0 and race_laps_remain > 0:
+                fuel_deficit = fuel_laps - race_laps_remain
+                if fuel_deficit < -1:
+                    # Severe shortage — can't finish without pitting
+                    if effective_fuel_max > 0 and fuel_level > 0:
+                        fuel_needed = avg_fuel_per_lap * race_laps_remain
+                        add_amount = (
+                            int(fuel_needed - fuel_level + avg_fuel_per_lap) + 1
+                        )
+                        add_amount = min(
+                            add_amount, int(effective_fuel_max - fuel_level)
+                        )
+                        add_amount = max(1, add_amount)
+                        action_line = (
+                            f"PIT this lap — add {add_amount} litres, fuel shortage"
+                        )
+                    else:
+                        action_line = "PIT this lap — fuel shortage"
+                elif fuel_deficit < 0:
+                    # Marginal — pit soon
+                    if effective_fuel_max > 0 and fuel_level > 0:
+                        fuel_needed = avg_fuel_per_lap * race_laps_remain
+                        fuel_def = fuel_needed - fuel_level
+                        if fuel_def > 0:
+                            add_amount = min(
+                                int(fuel_def + avg_fuel_per_lap) + 1,
+                                int(effective_fuel_max - fuel_level),
+                            )
+                            add_amount = max(1, add_amount)
+                            action_line = (
+                                f"PIT soon — add {add_amount} litres, tight on fuel"
+                            )
+                        else:
+                            action_line = "PIT soon — tight on fuel"
+                    else:
+                        action_line = "PIT soon — tight on fuel"
+            if action_line is None and 0 < fuel_pct < 0.1:
+                # Critical fuel but no burn rate data
+                action_line = "PIT soon — fuel critical"
+
+        # Append engine warning to action line if present.
+        # This forces the LLM to lead with engine warnings regardless of
+        # the question topic — the system prompt says "When 'Action:' is present,
+        # lead with that advice."
+        # Use a short label ("engine issue") rather than the full warning list
+        # because long Action lines get truncated by small models.
+        # Full details are already in !! ENGINE WARNING: and !! ALERTS: lines.
+        if engine_warnings:
+            if action_line:
+                action_line += ", engine issue"
+            else:
+                # No fuel/pit action, but engine warning exists — create standalone
+                action_line = "ENGINE WARNING — check engine"
+
+        # Emit Action line if we have one — positioned right after position
+        # so the LLM sees it before all the detail that follows.
+        if action_line:
+            lines.append(f"  Action: {action_line}")
+
+        # Collect alerts throughout — emitted after position/action as a summary.
+        # Engine warning already added in engine section; incidents added later.
+        if 0 < fuel_pct < 0.1:
+            alert_items.append(f"FUEL CRITICAL ({format_pct(fuel_pct)})")
 
         # Fuel: compact format combining level, burn rate, range, and warnings.
         # Descriptor bands: critical (<10%), low (10-20%), half (20-50%), adequate (50-80%), full (>80%)
@@ -702,11 +788,14 @@ class ContextBuilder:
         lines.append(f"  Fuel: {fuel_amt}. Burn {burn_str}.")
 
         # Fuel shortage/tight warning — includes fuel-to-add when applicable
-        # When race is ending (≤2 laps), override urgency to discourage pitting
+        # When race is ending (≤3 laps), override urgency to discourage pitting.
+        # Threshold matches the "RACE ENDING SOON" display so fuel messages
+        # never contradict the "DO NOT PIT" banner.
         # Guard: don't fire at lap 0 (formation/pre-race) — estimates unreliable
         race_ending_soon = (
             is_time_race
-            and race_laps_remain <= 2
+            and race_laps_remain <= 3
+            and race_laps_remain > 0
             and isinstance(race_laps, int)
             and race_laps >= 1
         )
@@ -910,6 +999,12 @@ class ContextBuilder:
                     )
                     if temp_parts:
                         lines.append(f"    Temps: {' | '.join(temp_parts)}.{wear_str}")
+                    # Collapse identical pressures to a single line instead of
+                    # per-corner — prevents the LLM from saying "pressures stable"
+                    # on data that's actually frozen and not updating.
+                    lines.append(
+                        f"    Pressures: all {kpa_to_psi(pressures[0]):.1f}PSI (frozen, not updating)"
+                    )
                 else:
                     # Pressures vary — still show per-corner but with STALE label
                     lines.append(
@@ -989,7 +1084,8 @@ class ContextBuilder:
             # Only show if value is plausible (10-90% range)
             lines.append(f"  Brake bias: {brake_bias:.1f}%")
 
-        # Incidents (safety-rating points, NOT car damage) / penalties
+        # Incidents (safety-rating points) — keep brief so the LLM doesn't
+        # confuse them with car damage. Add to alerts if significant.
         incidents = player.get("incidents", 0)
         team_incidents = player.get("team_incidents", 0)
         weight_penalty = player.get("weight_penalty", 0)
@@ -997,11 +1093,10 @@ class ContextBuilder:
         repair_time = player.get("pit_repair_time_left", 0)
         opt_repair_time = player.get("pit_opt_repair_time_left", 0)
 
-        incident_parts = []
         if incidents > 0 or team_incidents > 0:
-            incident_parts.append(
-                f"!! {incidents}x incidents (team {team_incidents}x) — penalty points only, NOT car damage. Fast repair does NOT clear these."
-            )
+            lines.append(f"  Incidents: {incidents}x (safety rating — no car damage)")
+            if incidents >= 4:
+                alert_items.append(f"{incidents}x incidents")
         damage_parts = []
         if weight_penalty > 0:
             damage_parts.append(f"+{weight_penalty:.2f}kg damage weight")
@@ -1011,16 +1106,10 @@ class ContextBuilder:
             damage_parts.append(f"{repair_time:.0f}s repair time needed")
         if opt_repair_time > 0:
             damage_parts.append(f"{opt_repair_time:.0f}s opt repair time")
-        if incident_parts:
-            lines.append(f"  Incidents: {' | '.join(incident_parts)}")
         if damage_parts:
             lines.append(f"  Damage: {' | '.join(damage_parts)}")
-        elif not weight_penalty and not repair_time and not opt_repair_time:
-            # Only show this when there's no damage data at all — prevents the
-            # LLM from saying "no damage reported" when it simply doesn't have data
-            lines.append(
-                "  Body/aero damage: not available — only penalty points tracked (not car damage)"
-            )
+        # Omit "Body/aero damage: not available" line — it's noise that invites
+        # "no damage reported" responses when we simply don't have the data.
 
         # Push-to-pass
         p2p_remaining = player.get("p2p_remaining", 0)
@@ -1195,18 +1284,40 @@ class ContextBuilder:
                 lines.append(car_str)
 
         # === Sector Times (player + strategic cars + nearby) ===
+        # Filter partial sector times: if a car's sector time is suspiciously
+        # fast (< 70% of the player's best for that sector), it's likely a
+        # partial sector from a car mid-lap. Mark it as (partial) so the LLM
+        # doesn't draw wrong conclusions like "P8 is faster in S1".
+        player_sectors = player.get("fastest_sector_times", {})
+
+        def _format_sector_times(
+            sector_times: dict, ref_sectors: dict | None = None
+        ) -> list[str]:
+            """Format sector times, marking partial sectors as (partial)."""
+            parts = []
+            for s_num in sorted(sector_times.keys()):
+                s_t = sector_times[s_num]
+                if s_t <= 0:
+                    continue
+                # Check if this sector time is suspiciously fast (partial sector)
+                is_partial = False
+                if ref_sectors and s_num in ref_sectors:
+                    ref_t = ref_sectors[s_num]
+                    if ref_t > 0 and s_t < ref_t * 0.7:
+                        is_partial = True
+                label = f"S{s_num} {format_sector_time(s_t)}"
+                if is_partial:
+                    label += " (partial)"
+                parts.append(label)
+            return parts
+
         sector_entries = []
         # Track car indices already shown to avoid duplicates
         shown_car_indices = set()
 
         # Player sector times
-        player_sectors = player.get("fastest_sector_times", {})
         if player_sectors:
-            sector_parts = []
-            for s_num in sorted(player_sectors.keys()):
-                s_t = player_sectors[s_num]
-                if s_t > 0:
-                    sector_parts.append(f"S{s_num} {format_sector_time(s_t)}")
+            sector_parts = _format_sector_times(player_sectors)
             if sector_parts:
                 sector_entries.append(f"  You: {' | '.join(sector_parts)}")
             shown_car_indices.add(player.get("car_idx"))
@@ -1227,11 +1338,7 @@ class ContextBuilder:
             sector_times = car_info.get("fastest_sector_times", {})
             if not sector_times:
                 continue
-            sector_parts = []
-            for s_num in sorted(sector_times.keys()):
-                s_t = sector_times[s_num]
-                if s_t > 0:
-                    sector_parts.append(f"S{s_num} {format_sector_time(s_t)}")
+            sector_parts = _format_sector_times(sector_times, player_sectors)
             if not sector_parts:
                 continue
             pos = car_info.get("position", "?")
@@ -1267,11 +1374,7 @@ class ContextBuilder:
                     and car["real_name"] != name
                 ):
                     display_name = f"{name} / {car['real_name']}"
-                sector_parts = []
-                for s_num in sorted(car_sectors.keys()):
-                    s_t = car_sectors[s_num]
-                    if s_t > 0:
-                        sector_parts.append(f"S{s_num} {format_sector_time(s_t)}")
+                sector_parts = _format_sector_times(car_sectors, player_sectors)
                 if sector_parts:
                     sector_entries.append(
                         f"  P{pos} ({display_name}): {' | '.join(sector_parts)}"
@@ -1280,5 +1383,29 @@ class ContextBuilder:
         if sector_entries:
             lines.append("\nSector Times:")
             lines.extend(sector_entries)
+
+        # Emit alerts summary — insert after position/action lines so the LLM
+        # sees all critical items in one place regardless of question topic.
+        # Find the insertion point: after "Action:" line if present, else
+        # after "Position:" line.
+        if alert_items:
+            alert_line = f"  !! ALERTS: {' | '.join(alert_items)}"
+            # Find the right place to insert: after the last of position/action lines
+            insert_idx = None
+            for i, line in enumerate(lines):
+                if line.startswith("  Action:") or line.startswith("  Position:"):
+                    insert_idx = i + 1
+            if insert_idx is not None:
+                lines.insert(insert_idx, alert_line)
+            else:
+                # Fallback: insert after "Your car:" line
+                for i, line in enumerate(lines):
+                    if line.strip() == "Your car:":
+                        insert_idx = i + 1
+                        break
+                if insert_idx is not None:
+                    lines.insert(insert_idx, alert_line)
+                else:
+                    lines.append(alert_line)
 
         return "\n".join(lines)

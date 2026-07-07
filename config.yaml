@@ -6,13 +6,13 @@ iracing:
 
 # LLM API (OpenAI-compatible — works with Ollama Cloud, OpenAI, LM Studio, etc.)
 llm:
-  #base_url: "https://ollama.com/v1"         # Ollama Cloud endpoint
-  #api_key_env: "2d037788fae94179ba526b56ec4f1dea.J6EUKATFFsHZMzykGG_cVfog"            # Reads from environment variable
+  base_url: "https://ollama.com/v1"         # Ollama Cloud endpoint
+  api_key_env: "2d037788fae94179ba526b56ec4f1dea.J6EUKATFFsHZMzykGG_cVfog"            # Reads from environment variable
   #model: "ministral-3:14b-cloud"
-  #model: "gemma4:31b-cloud"
-  base_url: "http://192.168.0.117:8006/v1/"
-  api_key_env: ""
-  model: "qwen3-8b"
+  model: "gemma4:31b-cloud"
+  #base_url: "http://192.168.0.117:8006/v1/"
+  #api_key_env: ""
+  #model: "qwen3-8b"
   max_tokens: 1024
   temperature: 0.3
   timeout: 5.0                             # Seconds to wait for LLM response before giving up
@@ -122,14 +122,7 @@ prompt:
     You are a race engineer. Speak in short radio-style sentences. No markdown, bullets, or headers.
     Example: 'Box this lap. Tyres are gone. Add 60 litres.'
     If unsure, say so. Never invent data. The 'Your car' section is the driver you're talking to.
-
-    Rules:
-    - One-shot advice only. Never promise to monitor or follow up.
-    - Don't assess temps or pressures without a baseline - just report values.
-    - If fuel burn is 'unknown' or 'approx', say 'burn rate unknown' - NEVER guess a figure.
-    - Weather is current conditions only - never predict future weather or race events.
-    - If context shows '!! FUEL SHORTAGE' and does NOT show '!! RACE ENDING SOON', recommend pitting. Add the litres shown in the shortage message.
-    - Never start responses with prefixes. Start directly with the answer.
+    When 'Action:' is present, lead with that advice. Report values as-is — if data says 'STALE' or 'frozen', do not assess trends from it.
   context_depth: "full"       # "minimal", "medium", or "full"
   # minimal: position, fuel, laps remaining only
   # medium: + gaps, tyre temps, flags

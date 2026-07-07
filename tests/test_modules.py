@@ -419,7 +419,8 @@ class TestContextBuilder:
             4
         )  # both
 
-    def test_full_context_includes_engine_health(self):
+    def test_full_context_engine_health_normal_suppressed(self):
+        """Normal engine values (no anomaly, no warning) should be suppressed."""
         state = make_state()
         config = {
             "prompt": {
@@ -432,9 +433,78 @@ class TestContextBuilder:
         builder = ContextBuilder(config)
         messages = builder.build_prompt(state.get_snapshot())
         content = messages[1]["content"]
-        # Engine health should appear in full context
+        # Normal engine data should NOT appear — no anomaly or warning
+        assert "Engine:" not in content
+
+    def test_full_context_engine_health_warning_shown(self):
+        """Engine data should appear when there's an engine warning."""
+        state = make_state()
+        # Set an engine warning (fuel pressure = bit 0x02)
+        state.player.engine_warnings = 0x02
+        config = {
+            "prompt": {
+                "context_depth": "full",
+                "system": "test",
+                "include_lap_history": 5,
+                "include_nearby_cars": 3,
+            }
+        }
+        builder = ContextBuilder(config)
+        messages = builder.build_prompt(state.get_snapshot())
+        content = messages[1]["content"]
+        # Engine data should appear when there's a warning
         assert "Engine:" in content
-        assert "Oil" in content
+        assert "ENGINE WARNING" in content
+
+    def test_engine_warning_in_action_line_with_fuel_action(self):
+        """Engine warning should be appended to Action line when there's also a fuel action."""
+        state = make_state()
+        # Set engine warning (fuel pressure = bit 0x02)
+        state.player.engine_warnings = 0x02
+        # Set critical fuel to trigger PIT action
+        state.player.fuel_level = 0.9
+        state.player.fuel_pct = 0.04
+        state.player.fuel_laps_remaining = 0.3
+        state.player.avg_fuel_per_lap = 1.32
+        state.player.fuel_est_quality = "good"
+        config = {
+            "prompt": {
+                "context_depth": "full",
+                "system": "test",
+                "include_lap_history": 5,
+                "include_nearby_cars": 3,
+            }
+        }
+        builder = ContextBuilder(config)
+        messages = builder.build_prompt(state.get_snapshot())
+        content = messages[1]["content"]
+        # Action line should contain short engine issue suffix
+        assert "Action:" in content
+        assert "engine issue" in content
+
+    def test_engine_warning_in_action_line_standalone(self):
+        """Engine warning alone should create a standalone Action line when no fuel action."""
+        state = make_state()
+        # Set engine warning (oil pressure = bit 0x04)
+        state.player.engine_warnings = 0x04
+        # Adequate fuel — no PIT action
+        state.player.fuel_pct = 0.50
+        state.player.fuel_level = 11.0
+        config = {
+            "prompt": {
+                "context_depth": "full",
+                "system": "test",
+                "include_lap_history": 5,
+                "include_nearby_cars": 3,
+            }
+        }
+        builder = ContextBuilder(config)
+        messages = builder.build_prompt(state.get_snapshot())
+        content = messages[1]["content"]
+        # Action line should exist with short engine warning
+        assert "Action:" in content
+        assert "ENGINE WARNING" in content
+        assert "check engine" in content
 
     def test_full_context_includes_session_config(self):
         state = make_state()
