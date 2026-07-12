@@ -155,11 +155,8 @@ class ContextBuilder:
 
     def _default_system_prompt(self) -> str:
         return (
-            "You are a race engineer. Speak in short radio-style sentences. No markdown, bullets, or headers.\n"
-            "Example: 'Box this lap. Tyres are gone. Add 60 litres.'\n"
-            "If unsure, say so. Never invent data. The 'Your car' section is the driver you're talking to.\n"
-            "When 'Action:' is present, lead with that advice. "
-            "Report values as-is — if data says 'STALE' or 'frozen', do not assess trends from it."
+            "Race engineer. ONE sentence max. Be brief.\n"
+            "Never invent data. Trust STALE/frozen labels."
         )
 
     def build_prompt(self, state: dict, question: str = "") -> list[dict]:
@@ -351,7 +348,7 @@ class ContextBuilder:
         engine_warnings = player.get("engine_warnings", 0)
         if engine_warnings:
             warning_str = format_engine_warnings(engine_warnings)
-            lines.append(f"  !! ENGINE WARNING: {warning_str}")
+            lines.append(f"  !! Engine warning: {warning_str}")
 
         # Tyre temps
         tyres = player.get("tyres", {})
@@ -505,7 +502,7 @@ class ContextBuilder:
         if is_fixed or incident_limit or fuel_max:
             cfg_parts = []
             if is_fixed:
-                cfg_parts.append("FIXED SETUP")
+                cfg_parts.append("Fixed setup")
             if incident_limit:
                 label = (
                     "no limit"
@@ -543,7 +540,7 @@ class ContextBuilder:
             if wet_label is not None:
                 weather_parts.append(f"track {wet_label}")
             if declared_wet:
-                weather_parts.append("DECLARED WET")
+                weather_parts.append("Declared wet")
             if precipitation > 0:
                 weather_parts.append(f"rain {precipitation:.0%}")
             if wind_vel > 0.5:
@@ -616,9 +613,9 @@ class ContextBuilder:
         # Engine warning — add to alerts and show engine line only when anomalous
         if engine_warnings:
             warning_str = format_engine_warnings(engine_warnings)
-            alert_items.append(f"ENGINE: {warning_str}")
+            alert_items.append(f"Engine: {warning_str}")
             # Keep the warning line visible in context too
-            lines.append(f"!! ENGINE WARNING: {warning_str}")
+            lines.append(f"!! Engine warning: {warning_str}")
 
         if has_engine_anomaly and engine_parts:
             lines.append(f"Engine: {' | '.join(engine_parts)}")
@@ -642,7 +639,7 @@ class ContextBuilder:
         # Guard: don't fire at lap 0 (formation/pre-race) — estimates are unreliable
         # and iRacing reports near-zero time remaining during the pace lap.
         # Note: threshold must match the display threshold (≤3 laps) so fuel
-        # urgency messages are consistent with "RACE ENDING SOON" banners.
+        # urgency messages are consistent with "race ending soon" banners.
         race_ending_soon = (
             is_time_race
             and race_laps_remain <= 3
@@ -654,20 +651,20 @@ class ContextBuilder:
         action_line = None
 
         if race_ending_soon:
-            lines.append("  !! RACE ENDING SOON — DO NOT PIT. Stay out and finish.")
-            # Race-ending always means STAY OUT
+            lines.append("  !! Race ending soon — do not pit. Stay out and finish.")
+            # Race-ending always means stay out
             if fuel_pct > 0 and fuel_pct < 0.15:
-                action_line = "STAY OUT — race ending, conserve fuel"
+                action_line = "Stay out — race ending, conserve fuel"
             else:
-                action_line = "STAY OUT — race ending, finish as is"
+                action_line = "Stay out — race ending, finish as is"
 
         on_track = player.get("is_on_track", True)
         in_garage = player.get("is_in_garage", False)
         status_parts = []
         if not on_track:
-            status_parts.append("OFF TRACK")
+            status_parts.append("Off track")
         if in_garage:
-            status_parts.append("IN GARAGE")
+            status_parts.append("In garage")
         if status_parts:
             lines.append(f"  Status: {' | '.join(status_parts)}")
 
@@ -692,10 +689,10 @@ class ContextBuilder:
                         )
                         add_amount = max(1, add_amount)
                         action_line = (
-                            f"PIT this lap — add {add_amount} litres, fuel shortage"
+                            f"Pit this lap — add {add_amount} litres, fuel shortage"
                         )
                     else:
-                        action_line = "PIT this lap — fuel shortage"
+                        action_line = "Pit this lap — fuel shortage"
                 elif fuel_deficit < 0:
                     # Marginal — pit soon
                     if effective_fuel_max > 0 and fuel_level > 0:
@@ -708,15 +705,15 @@ class ContextBuilder:
                             )
                             add_amount = max(1, add_amount)
                             action_line = (
-                                f"PIT soon — add {add_amount} litres, tight on fuel"
+                                f"Pit soon — add {add_amount} litres, tight on fuel"
                             )
                         else:
-                            action_line = "PIT soon — tight on fuel"
+                            action_line = "Pit soon — tight on fuel"
                     else:
-                        action_line = "PIT soon — tight on fuel"
+                        action_line = "Pit soon — tight on fuel"
             if action_line is None and 0 < fuel_pct < 0.1:
                 # Critical fuel but no burn rate data
-                action_line = "PIT soon — fuel critical"
+                action_line = "Pit soon — fuel critical"
 
         # Append engine warning to action line if present.
         # This forces the LLM to lead with engine warnings regardless of
@@ -724,23 +721,27 @@ class ContextBuilder:
         # lead with that advice."
         # Use a short label ("engine issue") rather than the full warning list
         # because long Action lines get truncated by small models.
-        # Full details are already in !! ENGINE WARNING: and !! ALERTS: lines.
+        # Full details are already in !! Engine warning: and !! Alerts: lines.
         if engine_warnings:
             if action_line:
                 action_line += ", engine issue"
             else:
                 # No fuel/pit action, but engine warning exists — create standalone
-                action_line = "ENGINE WARNING — check engine"
+                action_line = "Engine issue — check engine"
 
         # Emit Action line if we have one — positioned right after position
         # so the LLM sees it before all the detail that follows.
+        # No label prefix — the system prompt instructs the model to lead with
+        # this advice naturally, without echoing a keyword.
+        action_line_index = None
         if action_line:
-            lines.append(f"  Action: {action_line}")
+            action_line_index = len(lines)
+            lines.append(f"  {action_line}")
 
         # Collect alerts throughout — emitted after position/action as a summary.
         # Engine warning already added in engine section; incidents added later.
         if 0 < fuel_pct < 0.1:
-            alert_items.append(f"FUEL CRITICAL ({format_pct(fuel_pct)})")
+            alert_items.append(f"Fuel critical ({format_pct(fuel_pct)})")
 
         # Fuel: compact format combining level, burn rate, range, and warnings.
         # Descriptor bands: critical (<10%), low (10-20%), half (20-50%), adequate (50-80%), full (>80%)
@@ -753,7 +754,7 @@ class ContextBuilder:
         elif fuel_pct >= 0.1:
             fuel_desc = "low"
         else:
-            fuel_desc = "!! CRITICAL"
+            fuel_desc = "!! critical"
 
         # Build fuel amount: level/tank (max add, %, descriptor)
         if effective_fuel_max and fuel_level > 0:
@@ -771,7 +772,7 @@ class ContextBuilder:
 
         # Fuel urgency warning
         if 0 < fuel_pct < 0.2 and fuel_laps > 0:
-            fuel_amt += " !! FUEL WARNING"
+            fuel_amt += " !! fuel warning"
 
         # Burn rate and range on one line
         if avg_fuel_per_lap > 0 and fuel_est_quality == "good":
@@ -789,8 +790,8 @@ class ContextBuilder:
 
         # Fuel shortage/tight warning — includes fuel-to-add when applicable
         # When race is ending (≤3 laps), override urgency to discourage pitting.
-        # Threshold matches the "RACE ENDING SOON" display so fuel messages
-        # never contradict the "DO NOT PIT" banner.
+        # Threshold matches the "race ending soon" display so fuel messages
+        # never contradict the "do not pit" banner.
         # Guard: don't fire at lap 0 (formation/pre-race) — estimates unreliable
         race_ending_soon = (
             is_time_race
@@ -815,42 +816,42 @@ class ContextBuilder:
                         add_litres = max(1, add_litres)
                         if race_ending_soon:
                             lines.append(
-                                f"  !! FUEL SHORTAGE: approx {deficit_laps:.0f} laps short{approx}. "
+                                f"  !! Fuel shortage: approx {deficit_laps:.0f} laps short{approx}. "
                                 f"Need approx {fuel_needed:.0f} litres for {race_laps_remain} laps — "
-                                f"conserve fuel and try to finish, do NOT pit (30s+ pit stop loses positions)"
+                                f"conserve fuel and try to finish, do not pit (30s+ pit stop loses positions)"
                             )
                         else:
                             lines.append(
-                                f"  !! FUEL SHORTAGE: approx {deficit_laps:.0f} laps short{approx}. "
+                                f"  !! Fuel shortage: approx {deficit_laps:.0f} laps short{approx}. "
                                 f"Add {add_litres} litres to finish (need approx {fuel_needed:.0f} litres for {race_laps_remain} laps)"
                             )
                     else:
                         if race_ending_soon:
                             lines.append(
-                                f"  !! FUEL SHORTAGE: approx {deficit_laps:.0f} laps short{approx} — "
-                                f"conserve fuel and try to finish, do NOT pit"
+                                f"  !! Fuel shortage: approx {deficit_laps:.0f} laps short{approx} — "
+                                f"conserve fuel and try to finish, do not pit"
                             )
                         else:
                             lines.append(
-                                f"  !! FUEL SHORTAGE: approx {deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
+                                f"  !! Fuel shortage: approx {deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
                             )
                 else:
                     if race_ending_soon:
                         lines.append(
-                            f"  !! FUEL SHORTAGE: approx {deficit_laps:.0f} laps short{approx} — "
-                            f"conserve fuel and try to finish, do NOT pit"
+                            f"  !! Fuel shortage: approx {deficit_laps:.0f} laps short{approx} — "
+                            f"conserve fuel and try to finish, do not pit"
                         )
                     else:
                         lines.append(
-                            f"  !! FUEL SHORTAGE: approx {deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
+                            f"  !! Fuel shortage: approx {deficit_laps:.0f} laps short{approx} — cannot finish without pit stop"
                         )
             elif fuel_laps < race_laps_remain + 1:
                 margin = fuel_laps - race_laps_remain
                 approx = "" if fuel_est_quality == "good" else " (approx)"
                 if race_ending_soon:
-                    urgency = "conserve fuel and try to finish — do NOT pit, race is almost over."
+                    urgency = "conserve fuel and try to finish — do not pit, race is almost over."
                 elif margin < 0.3:
-                    urgency = "will NOT finish if burn rate varies. Pit recommended."
+                    urgency = "will not finish if burn rate varies. Pit recommended."
                 else:
                     urgency = "pit if safety car or incident possible."
                 # Include fuel-to-add if there's a litres deficit even within margin
@@ -866,7 +867,7 @@ class ContextBuilder:
                         add_litres = max(1, add_litres)
                         add_str = f" Add {add_litres} litres if pitting."
                 lines.append(
-                    f"  !! FUEL TIGHT: only {margin:.1f} laps margin{approx}. {urgency}{add_str}"
+                    f"  !! Fuel tight: only {margin:.1f} laps margin{approx}. {urgency}{add_str}"
                 )
         elif (
             avg_fuel_per_lap > 0
@@ -905,19 +906,19 @@ class ContextBuilder:
                 else:
                     lines.append(f"  Time remaining: approx {remain_min:.1f} min")
             if race_laps_remain > 0:
-                # Don't show RACE ENDING SOON at lap 0 (formation/pre-race)
+                # Don't show race ending soon at lap 0 (formation/pre-race)
                 # — time estimates are unreliable before the first completed lap
                 race_ending_display = isinstance(race_laps, int) and race_laps >= 1
                 if race_laps_remain <= 1 and race_ending_display:
                     lines.append(
-                        f"  Race laps remaining: approx {race_laps_remain} — RACE ENDING SOON"
+                        f"  Race laps remaining: approx {race_laps_remain} — race ending soon"
                     )
                     lines.append(
-                        "  !! Pit stop costs approx 30s+ and you will lose multiple positions. Do NOT pit — stay out and finish the race."
+                        "  !! Pit stop costs approx 30s+ and you will lose multiple positions. Do not pit — stay out and finish the race."
                     )
                 elif race_laps_remain <= 3 and race_ending_display:
                     lines.append(
-                        f"  Race laps remaining: approx {race_laps_remain} laps (estimated) — RACE ENDING SOON"
+                        f"  Race laps remaining: approx {race_laps_remain} laps (estimated) — race ending soon"
                     )
                     lines.append(
                         "  !! Pit stop costs approx 30s+ and will lose you positions. Only pit if fuel cannot last to the finish."
@@ -1116,7 +1117,7 @@ class ContextBuilder:
         p2p_active = player.get("p2p_active", False)
         if p2p_remaining > 0:
             lines.append(
-                f"  Push-to-pass: {p2p_remaining} remaining{' (ACTIVE)' if p2p_active else ''}"
+                f"  Push-to-pass: {p2p_remaining} remaining{' (active)' if p2p_active else ''}"
             )
 
         # Shift lights
@@ -1227,7 +1228,7 @@ class ContextBuilder:
         if player.get("pits_open"):
             pit_lines.append("Pits open")
         if player.get("on_pit_road"):
-            pit_lines.append("ON PIT ROAD")
+            pit_lines.append("On pit road")
         if player.get("pitstop_active"):
             pit_lines.append("Pit stop in progress")
         if player.get("fast_repair_available"):
@@ -1386,15 +1387,18 @@ class ContextBuilder:
 
         # Emit alerts summary — insert after position/action lines so the LLM
         # sees all critical items in one place regardless of question topic.
-        # Find the insertion point: after "Action:" line if present, else
+        # Find the insertion point: after the action line if present, else
         # after "Position:" line.
         if alert_items:
-            alert_line = f"  !! ALERTS: {' | '.join(alert_items)}"
-            # Find the right place to insert: after the last of position/action lines
+            alert_line = f"  !! Alerts: {' | '.join(alert_items)}"
+            # Find the right place to insert: after action line or Position line
             insert_idx = None
-            for i, line in enumerate(lines):
-                if line.startswith("  Action:") or line.startswith("  Position:"):
-                    insert_idx = i + 1
+            if action_line_index is not None:
+                insert_idx = action_line_index + 1
+            else:
+                for i, line in enumerate(lines):
+                    if line.startswith("  Position:"):
+                        insert_idx = i + 1
             if insert_idx is not None:
                 lines.insert(insert_idx, alert_line)
             else:

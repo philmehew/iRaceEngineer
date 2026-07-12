@@ -722,6 +722,18 @@ class SpotterAudioPlayer:
         spotter_config = config.get("spotter", {})
         self._output_device = spotter_config.get("output_device", None)
         self._volume = spotter_config.get("volume", 1.0)
+        # Per-key debounce: minimum seconds between plays of the same audio key.
+        # Prevents the same call (e.g. "5 laps of fuel") playing twice in
+        # rapid succession if the caller logic or telemetry noise triggers it.
+        self._debounce_seconds = spotter_config.get("debounce_seconds", 3.0)
+        self._last_play_time: dict[str, float] = {}  # key -> monotonic timestamp
+        # Global debounce: minimum gap between ANY two audio plays, regardless
+        # of key. Prevents overlapping calls (e.g. blue flag + car left)
+        # from sounding like two voices at once.
+        self._global_debounce_seconds = spotter_config.get(
+            "global_debounce_seconds", 0.5
+        )
+        self._last_play_time_global: float = 0.0
         self._samples: dict[
             str, tuple[np.ndarray, int]
         ] = {}  # key -> (float32_array, sample_rate)
@@ -798,10 +810,35 @@ class SpotterAudioPlayer:
         Each call spawns a daemon thread that creates its own OutputStream,
         writes the audio, and exits. This allows multiple calls to overlap
         and doesn't interfere with TTS playback.
+
+        A per-key debounce prevents the same audio playing twice in rapid
+        succession. A global debounce prevents any two calls from overlapping,
+        so the spotter never talks over itself.
         """
         if key not in self._samples:
             logger.warning(f"Spotter audio sample not found: {key}")
             return
+
+        now = time.monotonic()
+
+        # Global debounce: skip if ANY audio played very recently
+        if now - self._last_play_time_global < self._global_debounce_seconds:
+            logger.debug(
+                f"Spotter audio global debounce: {key} "
+                f"(last audio {now - self._last_play_time_global:.2f}s ago)"
+            )
+            return
+
+        # Per-key debounce: skip if same key played very recently
+        last = self._last_play_time.get(key, 0.0)
+        if now - last < self._debounce_seconds:
+            logger.debug(
+                f"Spotter audio debounced: {key} (last played {now - last:.2f}s ago)"
+            )
+            return
+
+        self._last_play_time[key] = now
+        self._last_play_time_global = now
 
         audio, sample_rate = self._samples[key]
 
@@ -1331,6 +1368,8 @@ class Spotter:
         self._prev_incidents = None
         self._prev_on_pit_road = None
         self._confirmed_on_pit_road = False
+        self._player._last_play_time.clear()
+        self._player._last_play_time_global = 0.0
         logger.debug("Spotter state reset")
 
     @property

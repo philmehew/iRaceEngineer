@@ -454,14 +454,14 @@ class TestContextBuilder:
         content = messages[1]["content"]
         # Engine data should appear when there's a warning
         assert "Engine:" in content
-        assert "ENGINE WARNING" in content
+        assert "Engine warning" in content
 
     def test_engine_warning_in_action_line_with_fuel_action(self):
         """Engine warning should be appended to Action line when there's also a fuel action."""
         state = make_state()
         # Set engine warning (fuel pressure = bit 0x02)
         state.player.engine_warnings = 0x02
-        # Set critical fuel to trigger PIT action
+        # Set critical fuel to trigger Pit action
         state.player.fuel_level = 0.9
         state.player.fuel_pct = 0.04
         state.player.fuel_laps_remaining = 0.3
@@ -479,7 +479,7 @@ class TestContextBuilder:
         messages = builder.build_prompt(state.get_snapshot())
         content = messages[1]["content"]
         # Action line should contain short engine issue suffix
-        assert "Action:" in content
+        # (no "Action:" prefix — just the advice text)
         assert "engine issue" in content
 
     def test_engine_warning_in_action_line_standalone(self):
@@ -487,7 +487,7 @@ class TestContextBuilder:
         state = make_state()
         # Set engine warning (oil pressure = bit 0x04)
         state.player.engine_warnings = 0x04
-        # Adequate fuel — no PIT action
+        # Adequate fuel — no Pit action
         state.player.fuel_pct = 0.50
         state.player.fuel_level = 11.0
         config = {
@@ -502,8 +502,8 @@ class TestContextBuilder:
         messages = builder.build_prompt(state.get_snapshot())
         content = messages[1]["content"]
         # Action line should exist with short engine warning
-        assert "Action:" in content
-        assert "ENGINE WARNING" in content
+        # (no "Action:" prefix — just the advice text)
+        assert "Engine issue" in content
         assert "check engine" in content
 
     def test_full_context_includes_session_config(self):
@@ -597,7 +597,7 @@ class TestContextBuilder:
 
         At lap 0, iRacing reports near-zero time remaining during the pace lap,
         which makes lap estimates unreliable. The guard prevents the LLM from
-        getting "DO NOT PIT, stay out and finish" at the start of a 30-min race.
+        getting "do not pit, stay out and finish" at the start of a 30-min race.
         """
         # Create a time-based race state at lap 0 with very few estimated laps
         config = {"prompt": {"context_depth": "full", "system": "test"}}
@@ -615,8 +615,8 @@ class TestContextBuilder:
         builder = ContextBuilder(config)
         content = builder.build_prompt(snap)[1]["content"]
         # RACE ENDING SOON must NOT appear at lap 0
-        assert "RACE ENDING SOON" not in content
-        assert "DO NOT PIT" not in content
+        assert "race ending soon" not in content
+        assert "do not pit" not in content
 
     def test_race_ending_soon_fires_late_race(self):
         """RACE ENDING SOON SHOULD fire at lap 10+ with ≤2 laps remaining."""
@@ -634,8 +634,8 @@ class TestContextBuilder:
         snap = state.get_snapshot()
         builder = ContextBuilder(config)
         content = builder.build_prompt(snap)[1]["content"]
-        # RACE ENDING SOON SHOULD appear at lap 10 with only 2 laps left
-        assert "RACE ENDING SOON" in content
+        # race ending soon SHOULD appear at lap 10 with only 2 laps left
+        assert "race ending soon" in content
         assert "Wet" not in content
 
 

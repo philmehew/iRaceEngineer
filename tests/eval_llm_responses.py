@@ -202,14 +202,14 @@ def check_response_quality(question: str, response: str, context: str) -> list[s
             issues.append(f"Monitor language: '{phrase}' violates one-shot rule")
             break
 
-    # 6. Highlight when ENGINE WARNING present but not addressed in response
+    # 6. Highlight when engine warning present but not addressed in response
     if "engine warning" in context_lower:
         # Check if the response mentions the warning
         if (
             "engine warning" not in response_lower
             and "fuel pressure" not in response_lower
         ):
-            issues.append("ENGINE WARNING in context but not highlighted in response")
+            issues.append("Engine warning in context but not highlighted in response")
 
     # 7. Check for wildly incorrect fuel calculations
     # If context shows fuel at < 5% and response says "laps of fuel" > 10,
