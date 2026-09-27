@@ -13,9 +13,11 @@ Usage:
 """
 
 import argparse
+import atexit
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -28,12 +30,14 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
 
 from iracing_client import IRacingClient
+from single_instance import SingleInstanceGuard
+from chat_macros import ChatMacroManager
 from race_state import RaceState, TyreState
 from context_builder import ContextBuilder
-from llm_client import LLMClient
+from llm_client import LLMClient, LLMError
 from capture import TelemetryCapture, TelemetryReplay, create_sample_data
-from stt_client import STTClient
 from tts_client import TTSClient
+from voice_clients import create_stt_client, create_tts_client
 from spotter import Spotter
 
 
@@ -115,8 +119,11 @@ class WheelButtonListener:
 
     def start(self):
         """Start listening for button events in a background thread."""
-        if self._running:
+        # Skip if already running, but allow restart after the thread died
+        if self._running and self._thread and self._thread.is_alive():
             return
+        if self._thread and self._thread.is_alive():
+            return  # Old thread still winding down — don't start a second
 
         try:
             import importlib.util
@@ -206,11 +213,32 @@ class WheelButtonListener:
                 # joystick state only updates when the event pump runs.
                 pygame.event.pump()
 
+                if self._joystick is None:
+                    # Joystick was disconnected — try to reopen it
+                    try:
+                        self._joystick = pygame.joystick.Joystick(self.device_index)
+                        self._joystick.init()
+                        js_name = self._joystick.get_name()
+                        logger.info(
+                            f"Wheel button listener: reconnected to "
+                            f"device {self.device_index} ({js_name})"
+                        )
+                    except Exception:
+                        # Still gone — retry later (don't spam the log)
+                        time.sleep(1.0)
+                        continue
+
                 try:
                     is_pressed = bool(self._joystick.get_button(self.button_index))
-                except Exception:
-                    # Joystick may have disconnected — try to reconnect next tick
-                    time.sleep(1 / 30)
+                except Exception as e:
+                    # Joystick disconnected mid-read — drop it and retry
+                    logger.warning(f"Wheel device lost ({e}) — attempting reconnect")
+                    try:
+                        self._joystick.quit()
+                    except Exception:
+                        pass
+                    self._joystick = None
+                    was_pressed = False  # don't hold a phantom press
                     continue
 
                 if is_pressed and not was_pressed:
@@ -220,7 +248,10 @@ class WheelButtonListener:
                         f"(device {self.device_index}: {js_name})"
                     )
                     if self.on_press:
-                        self.on_press()
+                        try:
+                            self.on_press()
+                        except Exception:
+                            logger.exception("Wheel button on_press callback failed")
                 elif not is_pressed and was_pressed:
                     was_pressed = False
                     logger.info(
@@ -228,7 +259,10 @@ class WheelButtonListener:
                         f"(device {self.device_index}: {js_name})"
                     )
                     if self.on_release:
-                        self.on_release()
+                        try:
+                            self.on_release()
+                        except Exception:
+                            logger.exception("Wheel button on_release callback failed")
 
                 # Periodic alive log (every 30s) to confirm thread is running
                 now = time.monotonic()
@@ -242,13 +276,18 @@ class WheelButtonListener:
                 time.sleep(1 / 30)  # ~30Hz polling
 
         except Exception as e:
-            logger.error(f"Wheel button listener error: {e}")
+            logger.exception(f"Wheel button listener error: {e}")
         finally:
             if self._joystick is not None:
-                self._joystick.quit()
+                try:
+                    self._joystick.quit()
+                except Exception:
+                    pass
             pygame.joystick.quit()
             pygame.quit()
             self._pygame_initialized = False
+            # Allow a later start() call to spin up a fresh listener thread
+            self._running = False
 
 
 def _session_timestamp() -> str:
@@ -280,6 +319,16 @@ def _clean_response(text: str) -> str:
     """Post-process LLM response text for common model quirks."""
     # Replace tildes with "about" (small models often output ~2 instead of "about 2")
     text = text.replace("~", "about ")
+    # Expand unit abbreviations TTS engines read poorly ("\m slash s")
+    text = re.sub(r"\bm/s\b", "meters per second", text)
+    # kph (or km/h) — TTS voices read these as letter soup
+    text = re.sub(r"\bkm/h\b", "kilometers per hour", text)
+    text = re.sub(r"\bkph\b", "kilometers per hour", text)
+    # PSI: TTS voices say "sigh" or "psye"; force letter-by-letter "P S I"
+    text = re.sub(r"\bPSI\b", "P S I", text)
+    # Standalone L after a number = litres ("12.5 L" -> "12.5 litres")
+    text = re.sub(r"(\d)\s*L\b", r"\1 litres", text)
+    text = re.sub(r"\b1 litres\b", "1 litre", text)
     return text
 
 
@@ -290,7 +339,9 @@ llm_query_logger.propagate = False  # Don't double-print to console
 # Thread safety for live mode: protects state reads/writes between the main
 # poll loop and the wheel-button-hook thread, and prevents double-press.
 _state_lock = threading.Lock()
-_llm_in_progress = threading.Event()
+# Non-blocking lock guarding LLM calls: acquire(blocking=False) is atomic,
+# unlike an Event's check-then-set, so two threads can never both start a call.
+_llm_call_lock = threading.Lock()
 
 
 def _print_timing_summary(steps: list[tuple[str, float]], label: str = "Pipeline"):
@@ -378,6 +429,8 @@ def handle_button_press(
     question: str = "",
     tts: TTSClient | None = None,
     timing_steps: list[tuple[str, float]] | None = None,
+    chat_macros=None,
+    iracing: IRacingClient | None = None,
 ):
     """Handle a button press — build context, call LLM, process response.
 
@@ -388,12 +441,15 @@ def handle_button_press(
         timing_steps: Optional list of (step_name, duration) tuples from
             earlier pipeline steps (e.g. recording, transcription). Additional
             timing will be appended and a summary printed at the end.
+        chat_macros: Optional ChatMacroManager — when present, [CMD:name] tags
+            in the LLM response are stripped and the matching chat macro fired.
+        iracing: Client used to send chat macros (None = log-only, for tests).
     """
-    # Guard against double-press — skip if an LLM call is already running
-    if _llm_in_progress.is_set():
+    # Guard against double-press — skip if an LLM call is already running.
+    # acquire(blocking=False) is atomic, so two racing threads can't both pass.
+    if not _llm_call_lock.acquire(blocking=False):
         logger.info("LLM call already in progress — skipping")
         return
-    _llm_in_progress.set()
 
     steps = list(timing_steps) if timing_steps else []
 
@@ -419,7 +475,16 @@ def handle_button_press(
 
         # Call LLM
         t0 = time.monotonic()
-        response_text = llm.ask(messages)
+        try:
+            response_text = llm.ask(messages)
+        except LLMError as e:
+            # LLM failure — show a short user-facing message, don't speak
+            # raw error text as if it were engineer advice
+            steps.append(("LLM call", time.monotonic() - t0))
+            print(f"\n⚠️  {e}")
+            logger.warning(f"LLM call failed: {e}")
+            _print_timing_summary(steps, label="Pipeline (error)")
+            return
         steps.append(("LLM call", time.monotonic() - t0))
 
         # Log the prompt and response to the LLM query log file
@@ -442,6 +507,20 @@ def handle_button_press(
         # Post-process: clean common model quirks
         response_text = _clean_response(response_text)
 
+        # Extract [CMD:name] action tags before display/TTS so they're never
+        # spoken, then fire the corresponding chat macros
+        fired_actions: list[str] = []
+        if chat_macros is not None and chat_macros.enabled:
+            response_text, action_names = chat_macros.parse_response(response_text)
+            for action_name in action_names:
+                if chat_macros.fire(action_name, iracing_client=iracing):
+                    fired_actions.append(action_name)
+
+        # Record the exchange so follow-up questions have context
+        context_builder.qa_history.append(
+            question or "(strategy update)", response_text
+        )
+
         # Display response
         print("\n" + "=" * 60)
         print(f"🏁 RACE ENGINEER (depth={depth})")
@@ -457,10 +536,10 @@ def handle_button_press(
         _print_timing_summary(steps)
 
     finally:
-        _llm_in_progress.clear()
+        _llm_call_lock.release()
 
 
-def run_live_mode(config: dict, tick_rate_hz: int = 30):
+def run_live_mode(config: dict, tick_rate_hz: int = 30, question: str = ""):
     """Main loop — connect to iRacing and poll telemetry."""
     iracing = IRacingClient()
     state = RaceState(config)
@@ -472,11 +551,11 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
     tts = None
     if voice_config.get("tts", {}).get("enabled", False):
         try:
-            tts = TTSClient(config)
+            tts = create_tts_client(config)
             if tts.is_available:
                 logger.info("TTS enabled — LLM responses will be spoken aloud")
             else:
-                logger.warning("TTS configured but piper-tts not installed — disabled")
+                logger.warning("TTS configured but backend unavailable — disabled")
                 tts = None
         except Exception as e:
             logger.warning(f"TTS setup failed: {e}")
@@ -485,13 +564,11 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
     stt = None
     if voice_config.get("stt", {}).get("enabled", False):
         try:
-            stt = STTClient(config)
+            stt = create_stt_client(config)
             if stt.is_available:
                 logger.info("STT enabled — voice input available via push-to-talk")
             else:
-                logger.warning(
-                    "STT configured but faster-whisper not installed — disabled"
-                )
+                logger.warning("STT configured but backend unavailable — disabled")
                 stt = None
         except Exception as e:
             logger.warning(f"STT setup failed: {e}")
@@ -515,7 +592,7 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
 
     # Pre-load voice models to avoid cold-start latency on first PTT press
     if stt is not None:
-        if stt.device == "cuda" and not cuda_dll_found:
+        if getattr(stt, "device", None) == "cuda" and not cuda_dll_found:
             logger.warning(
                 "CUDA toolkit DLLs not found — STT will fall back to CPU. "
                 "Install CUDA or add it to PATH for GPU acceleration."
@@ -552,8 +629,35 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
         f"👥 Team detected: {len(team_indices)} cars — {', '.join(driver_names.get(i, f'Car #{i}') for i in team_indices)}\n"
     )
 
-    # Register triggers (wheel button for voice PTT)
+    # Chat macro actions (e.g. clear black flag) — validate against app.ini
+    # so misconfigured macro slots are caught before they matter mid-race
+    chat_macros = ChatMacroManager(config)
+    if chat_macros.enabled:
+        chat_macros.validate_against_app_ini(config)
+        context_builder.set_chat_macros(chat_macros)
+        print(f"⚙️  Chat macro actions: {', '.join(chat_macros.actions)}\n")
+
+    # Register triggers (wheel button for voice PTT / LLM query)
     voice_listener = None
+
+    # If a question was given on the command line, ask it once state is live
+    if question:
+
+        def _ask_cli_question():
+            # Wait a moment for telemetry to populate state
+            time.sleep(1.0)
+            handle_button_press(
+                state,
+                context_builder,
+                llm,
+                question=question,
+                tts=tts,
+                chat_macros=chat_macros,
+                iracing=iracing,
+            )
+
+        threading.Thread(target=_ask_cli_question, daemon=True).start()
+        print(f'   Will ask: "{question}"\n')
 
     # Voice PTT trigger — wheel button hold-to-talk
     if stt is not None:
@@ -564,6 +668,9 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
             _ptt_recording = threading.Event()
             _ptt_recording_time = [0.0]  # monotonic time when recording started
             _ptt_stop = threading.Event()
+            _ptt_generation = [0]  # increments per recording; lets a stale
+            # thread detect it was force-cleared and avoid clobbering a
+            # newer recording's flags in its finally block
 
             def _on_voice_button_down():
                 """Start recording when wheel button is pressed."""
@@ -576,13 +683,17 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                             f"PTT stuck for {elapsed:.0f}s — force-clearing "
                             f"(previous recording thread likely hung)"
                         )
-                        _ptt_recording.clear()
+                        # Retire the old thread: bump the generation so its
+                        # finally block won't touch the new recording's state
+                        _ptt_generation[0] += 1
                         _ptt_stop.set()
+                        _ptt_recording.clear()
                     else:
                         logger.debug(
                             f"PTT still recording ({elapsed:.1f}s) — ignoring press"
                         )
                         return
+                generation = _ptt_generation[0]
                 _ptt_recording.set()
                 _ptt_recording_time[0] = time.monotonic()
                 _ptt_stop.clear()
@@ -615,6 +726,8 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                                 question=text,
                                 tts=tts,
                                 timing_steps=timing_steps,
+                                chat_macros=chat_macros,
+                                iracing=iracing,
                             )
                         else:
                             logger.warning("No speech detected — skipping LLM query")
@@ -624,7 +737,11 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                     except Exception:
                         logger.exception("Voice recording/transcription failed")
                     finally:
-                        _ptt_recording.clear()
+                        # Only clear flags if this thread still owns the
+                        # current recording — a force-cleared thread must not
+                        # clobber a newer recording's state
+                        if _ptt_generation[0] == generation:
+                            _ptt_recording.clear()
 
                 threading.Thread(target=_record_and_query, daemon=True).start()
 
@@ -652,29 +769,107 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                 "   ⚠️  Voice PTT not configured. Edit config.yaml voice.trigger section."
             )
 
+    # Non-voice fallback: wheel button press = direct LLM query.
+    # Only wired when the voice PTT listener isn't already using the button
+    # (STT unavailable, or voice disabled via --no-voice).
+    if voice_listener is None:
+        query_device = voice_trigger_config.get("device_index")
+        query_button = voice_trigger_config.get("button_index")
+        if query_device is not None and query_button is not None:
+
+            def _on_query_button_down():
+                handle_button_press(
+                    state,
+                    context_builder,
+                    llm,
+                    question="",
+                    tts=tts,
+                    chat_macros=chat_macros,
+                    iracing=iracing,
+                )
+
+            voice_listener = WheelButtonListener(
+                device_index=query_device,
+                button_index=query_button,
+                on_press=_on_query_button_down,
+            )
+            voice_listener.start()
+            print(
+                f"   Wheel button {query_button} (device {query_device}) "
+                f"press = ask LLM."
+            )
+        else:
+            logger.warning(
+                "No wheel button trigger configured — LLM queries only via "
+                "--question. Set voice.trigger.device_index and "
+                "voice.trigger.button_index."
+            )
+            print(
+                "   ⚠️  No query trigger configured. Use --question, or set "
+                "voice.trigger.device_index and voice.trigger.button_index."
+            )
+
     print("   Press Ctrl+C to exit.\n")
     tick_interval = 1.0 / tick_rate_hz
+
+    # Cached per-session data: units are static for the whole session, and
+    # driver names only change when session info updates. Refresh both when
+    # the session info tick changes (reconnects also refresh — see below).
+    cached_units: dict = {}
+    cached_driver_names: dict = {}
+    cached_session_info_tick = None
+    _prev_session_num: int | None = None
+
     try:
         while True:
             if iracing.is_connected:
-                # Read telemetry
-                telemetry = iracing.get_telemetry()
+                # Read telemetry — only the ~100 vars RaceState consumes,
+                # not all 327 (each pyirsdk read re-sorts its buffer list)
+                telemetry = iracing.get_live_telemetry()
                 session_info = iracing.get_session_info()
 
-                # Read telemetry units for unit conversion (kPa, degF, etc.)
-                # Only needed once per session, but safe to call each tick
-                try:
-                    units = iracing.get_telemetry_units()
-                except Exception:
-                    units = {}
+                # Refresh cached units/driver names when session info changes
+                session_info_tick = getattr(iracing, "_session_info_tick", None)
+                if session_info_tick != cached_session_info_tick:
+                    cached_session_info_tick = session_info_tick
+                    try:
+                        cached_units = iracing.get_telemetry_units()
+                    except Exception:
+                        cached_units = {}
+                    cached_driver_names = {
+                        d.car_idx: d.driver_name for d in iracing.drivers
+                    }
 
-                # Update race state (under lock to prevent stale reads from button handler)
-                driver_names = {d.car_idx: d.driver_name for d in iracing.drivers}
+                # Update race state (under lock to prevent stale reads from button handler).
+                # Returns False when the session just ended — state is frozen
+                # at last known values, so skip the spotter too (otherwise it
+                # would replay "car still there" forever on frozen data).
                 with _state_lock:
-                    state.update(telemetry, session_info, driver_names, units=units)
+                    state_fresh = state.update(
+                        telemetry, session_info, cached_driver_names, units=cached_units
+                    )
+
+                # Reset spotter when a new session loads (iRacing stays
+                # connected across a weekend's sessions — without this,
+                # flag/fuel/lap state leaks from practice into the race)
+                session_num = state.session.session_num
+                if (
+                    spotter is not None
+                    and _prev_session_num is not None
+                    and session_num != _prev_session_num
+                ):
+                    logger.info(
+                        f"Session change detected ({_prev_session_num} → "
+                        f"{session_num}) — resetting spotter"
+                    )
+                    spotter.reset()
+                if _prev_session_num is not None and session_num != _prev_session_num:
+                    # Advice from practice doesn't apply to the race
+                    context_builder.qa_history.clear()
+                _prev_session_num = session_num
 
                 # Spotter tick — car proximity audio calls + fuel/flag/pit alerts
-                if spotter is not None:
+                if spotter is not None and state_fresh:
                     car_lr = state.player.car_left_right
                     on_track = state.player.is_on_track
                     track_surface = state.player.player_track_surface
@@ -726,9 +921,22 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
                     time.sleep(2)
                     continue
                 print("✅ Reconnected to iRacing")
-                # Reset spotter state on reconnect to avoid stale transitions
+                # Re-run session setup: car indices can change between
+                # sessions, so team detection and driver names must be
+                # re-derived, not just spotter transitions reset
+                team_indices = iracing.detect_team_indices(config)
+                driver_aliases = getattr(iracing, "driver_aliases", {})
+                with _state_lock:
+                    state.set_team_indices(team_indices, driver_aliases)
+                    state.set_driver_names(
+                        {d.car_idx: d.driver_name for d in iracing.drivers}
+                    )
+                    state.reset()  # drop stale lap history/fuel baselines
+                # Invalidate cached per-session data
+                cached_session_info_tick = None
                 if spotter is not None:
                     spotter.reset()
+                print(f"👥 Team re-detected: {len(team_indices)} cars")
 
             time.sleep(tick_interval)
 
@@ -739,8 +947,10 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30):
         iracing.shutdown()
 
 
-def run_capture_mode(config: dict, capture_dir: str, interval_ms: int = 1000):
+def run_capture_mode(config: dict, capture_dir: str, interval_ms: int | None = None):
     """Capture mode — record telemetry snapshots to JSON files."""
+    if interval_ms is None:
+        interval_ms = config.get("capture", {}).get("interval_ms", 1000)
     iracing = IRacingClient()
     state = RaceState(config)
     capture = TelemetryCapture(capture_dir, interval_ms)
@@ -812,12 +1022,18 @@ def run_replay_mode(
     llm = LLMClient(config)
     state = RaceState(config)
 
+    # Chat macro actions — log-only in replay (no live sim to send through)
+    chat_macros = ChatMacroManager(config)
+    if chat_macros.enabled:
+        chat_macros.validate_against_app_ini(config)
+        context_builder.set_chat_macros(chat_macros)
+
     # Set up TTS for replay mode
     voice_config = config.get("voice", {})
     tts = None
     if voice_config.get("tts", {}).get("enabled", False):
         try:
-            tts = TTSClient(config)
+            tts = create_tts_client(config)
             if not tts.is_available:
                 tts = None
         except Exception:
@@ -866,7 +1082,11 @@ def run_replay_mode(
     # If question provided on command line, ask it and exit
     if question:
         messages = context_builder.build_prompt(state.get_snapshot(), question=question)
-        response = llm.ask(messages)
+        try:
+            response = llm.ask(messages)
+        except LLMError as e:
+            print(f"\n⚠️  {e}")
+            return
 
         # Log the prompt and response to the LLM query log file
         depth = context_builder.context_depth
@@ -885,6 +1105,12 @@ def run_replay_mode(
         print("🏁 RACE ENGINEER")
         print("=" * 60)
         response = _clean_response(response)
+        # Extract and fire [CMD:] tags (log-only — no sim in replay mode)
+        if chat_macros.enabled:
+            response, action_names = chat_macros.parse_response(response)
+            for action_name in action_names:
+                chat_macros.fire(action_name)  # iracing_client=None → log-only
+        context_builder.qa_history.append(question, response)
         print(response)
         print("=" * 60)
         if tts is not None:
@@ -910,9 +1136,16 @@ def run_replay_mode(
     stt = None
     if voice_config.get("stt", {}).get("enabled", False):
         try:
-            stt = STTClient(config)
+            stt = create_stt_client(config)
             if not stt.is_available:
                 stt = None
+            else:
+                # Pre-load the STT model — without this, the first
+                # 'voice' command triggers a lazy model load that can take
+                # 10-30s, exceeding the join timeout below and silently
+                # discarding the transcription
+                print("  ⏳ Loading STT model for voice input...")
+                stt.preload()
         except Exception:
             stt = None
 
@@ -944,8 +1177,9 @@ def run_replay_mode(
             units = snapshot.get("units", {})
             if driver_names:
                 driver_names = {int(k): v for k, v in driver_names.items()}
-            state.update(telemetry, session_info, driver_names, units=units)
-            p = state.player
+            with _state_lock:
+                state.update(telemetry, session_info, driver_names, units=units)
+                p = state.player
             # Update shared prompt state
             prompt_state["lap"] = p.lap
             prompt_state["pos"] = p.position
@@ -1020,7 +1254,13 @@ def run_replay_mode(
             rec_thread.start()
             input()  # Wait for Enter to stop
             stop_event.set()
-            rec_thread.join(timeout=5)
+            # Recording stops immediately, but transcription runs inside the
+            # same thread and can take a few seconds — join generously so
+            # a valid transcription isn't discarded as "no speech"
+            rec_thread.join(timeout=120)
+            if rec_thread.is_alive():
+                print("  ⚠️  Transcription still running — try again shortly.\n")
+                continue
 
             if result[0].strip():
                 print(f'  📝 Heard: "{result[0]}"')
@@ -1041,7 +1281,8 @@ def run_replay_mode(
             units = snapshot.get("units", {})
             if driver_names:
                 driver_names = {int(k): v for k, v in driver_names.items()}
-            state.update(telemetry, session_info, driver_names, units=units)
+            with _state_lock:
+                state.update(telemetry, session_info, driver_names, units=units)
             p = state.player
             print(
                 f"  📊 Lap {p.lap}, P{p.position}, "
@@ -1100,11 +1341,16 @@ def run_replay_mode(
             continue
 
         # It's a question — send to LLM
-        messages = context_builder.build_prompt(
-            state.get_snapshot(), question=user_input
-        )
+        with _state_lock:
+            messages = context_builder.build_prompt(
+                state.get_snapshot(), question=user_input
+            )
         print("  ⏳ Asking race engineer...\n")
-        response = llm.ask(messages)
+        try:
+            response = llm.ask(messages)
+        except LLMError as e:
+            print(f"  ⚠️  {e}\n")
+            continue
 
         # Log the prompt and response to the LLM query log file
         depth = context_builder.context_depth
@@ -1121,6 +1367,12 @@ def run_replay_mode(
 
         if response:
             response = _clean_response(response)
+            # Extract and fire [CMD:] tags (log-only — no sim in replay mode)
+            if chat_macros.enabled:
+                response, action_names = chat_macros.parse_response(response)
+                for action_name in action_names:
+                    chat_macros.fire(action_name)  # iracing_client=None → log-only
+            context_builder.qa_history.append(user_input, response)
             print("  " + "=" * 56)
             print("  🏁 RACE ENGINEER")
             print("  " + "=" * 56)
@@ -1168,8 +1420,8 @@ def main():
     parser.add_argument(
         "--capture-interval",
         type=int,
-        default=1000,
-        help="Capture interval in milliseconds (default: 1000)",
+        default=None,
+        help="Capture interval in milliseconds (default: capture.interval_ms from config)",
     )
     parser.add_argument(
         "--replay", help="Replay mode — feed captured data from this directory"
@@ -1216,10 +1468,28 @@ def main():
         help="Disable voice input/output for this run",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Start even if another iRaceEngineer instance is running",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable debug logging"
     )
 
     args = parser.parse_args()
+
+    # Refuse to run alongside another instance — two instances would fight over
+    # the wheel, audio devices, and LLM queries. Lock is OS-held, so a crashed
+    # instance never blocks a restart.
+    guard = SingleInstanceGuard()
+    if not args.force and not guard.acquire():
+        print("=" * 60)
+        print("❌  iRaceEngineer is already running (another instance holds the lock).")
+        print("    If you're sure it isn't, or you want a second instance anyway,")
+        print("    rerun with --force.")
+        print("=" * 60)
+        sys.exit(1)
+    atexit.register(guard.release)
 
     # Generate session timestamp for log file names
     session_ts = _session_timestamp()
@@ -1248,15 +1518,6 @@ def main():
             args.voice and not args.no_voice
         )
 
-    # Set API key from config if not in environment
-    llm_config = config.get("llm", {})
-    api_key_env = llm_config.get("api_key_env", "OLLAMA_API_KEY")
-    if not os.environ.get(api_key_env):
-        # Try common env var names
-        for env_var in ["OLLAMA_API_KEY", "OPENAI_API_KEY", "API_KEY"]:
-            if os.environ.get(env_var):
-                break
-
     print("=" * 60)
     print("🏎️  iRaceEngineer")
     print("=" * 60)
@@ -1265,7 +1526,7 @@ def main():
         run_generate_samples(config)
     elif args.save_samples:
         sample_dir = config.get("capture", {}).get("output_dir", "./tests/sample_data")
-        run_capture_mode(config, sample_dir, args.capture_interval)
+        run_capture_mode(config, sample_dir)
     elif args.capture:
         capture_dir = args.capture_dir or config.get("capture", {}).get(
             "output_dir", "./tests/sample_data"
@@ -1280,7 +1541,11 @@ def main():
             replay_speed=args.replay_speed,
         )
     else:
-        run_live_mode(config, config.get("iracing", {}).get("tick_rate_hz", 30))
+        run_live_mode(
+            config,
+            config.get("iracing", {}).get("tick_rate_hz", 30),
+            question=args.question,
+        )
 
 
 if __name__ == "__main__":

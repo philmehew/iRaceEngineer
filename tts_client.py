@@ -66,15 +66,24 @@ class TTSClient:
 
     def __init__(self, config: dict):
         tts_config = config.get("voice", {}).get("tts", {})
-        self.model_name = tts_config.get("model", "en_GB-alan-medium")
-        self.voice_dir = tts_config.get("voice_dir", "voices")
-        self.use_cuda = tts_config.get("use_cuda", True)
+        # Backend-local settings live under 'local:' — fall back to the
+        # top-level keys for backward-compat with older flat configs.
+        local_config = tts_config.get("local", tts_config)
+        self.model_name = local_config.get("model", "en_GB-alan-medium")
+        self.voice_dir = local_config.get("voice_dir", "voices")
+        self.use_cuda = local_config.get("use_cuda", True)
+        # Shared keys — used by both local and remote backends (playback
+        # always happens on this machine regardless of backend).
         self.volume = tts_config.get("volume", 1.0)
         self.sentence_silence = tts_config.get("sentence_silence", 0.2)
         self._output_device = tts_config.get("output_device", None)
         self._voice = None
         self._voice_loaded = False
         self._load_lock = threading.Lock()
+        # Serialize playback: sd.play() uses one global stream, so a second
+        # call kills whatever is currently playing. This lock makes
+        # concurrent speak_async calls queue instead of truncating each other.
+        self._play_lock = threading.Lock()
 
         logger.info(
             f"TTS client configured: model={self.model_name}, "
@@ -152,7 +161,8 @@ class TTSClient:
     def speak(self, text: str):
         """Synthesize text and play through the configured audio device.
 
-        Streams audio sentence-by-sentence for lower latency.
+        Thread-safe: playback is serialized — if another response is still
+        playing, this one waits (or is skipped if stale — see speak_async).
         """
         if not text.strip():
             return
@@ -174,56 +184,71 @@ class TTSClient:
         device = self._resolve_output_device()
         logger.info(f"Speaking: {text[:80]}{'...' if len(text) > 80 else ''}")
 
-        try:
-            t_start = time.monotonic()
+        # Serialize synthesis+playback: sd.play() terminates any currently
+        # running playback, so concurrent calls would cut each other off.
+        with self._play_lock:
+            try:
+                t_start = time.monotonic()
 
-            # Collect audio chunks from streaming synthesis
-            audio_chunks = []
-            sample_rate = None
+                # Synthesize and play sentence-by-sentence so the first
+                # sentence starts playing while later ones are still being
+                # synthesized — perceived latency stays near-constant
+                # instead of scaling with response length.
+                sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+                total_played = 0.0
+                first_sentence = True
+                t_first_audio = None
 
-            for chunk in self._voice.synthesize(text.strip()):
-                if sample_rate is None:
-                    sample_rate = chunk.sample_rate
-                audio_chunks.append(
-                    np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16)
+                for sentence in sentences:
+                    if not sentence.strip():
+                        continue
+
+                    audio_chunks = []
+                    sample_rate = None
+                    for chunk in self._voice.synthesize(sentence.strip()):
+                        if sample_rate is None:
+                            sample_rate = chunk.sample_rate
+                        audio_chunks.append(
+                            np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16)
+                        )
+
+                    if not audio_chunks or sample_rate is None:
+                        continue
+
+                    audio = np.concatenate(audio_chunks).astype(np.float32) / 32768.0
+                    if self.volume != 1.0:
+                        audio = np.clip(audio * self.volume, -1.0, 1.0)
+
+                    if first_sentence:
+                        t_first_audio = time.monotonic()
+                        logger.info(
+                            f"TTS first sentence ready: {t_first_audio - t_start:.3f}s"
+                        )
+                        first_sentence = False
+
+                    t_play_start = time.monotonic()
+                    sd.play(audio, samplerate=sample_rate, device=device)
+                    sd.wait()
+                    total_played += time.monotonic() - t_play_start
+
+                if first_sentence:
+                    logger.warning("Piper produced no audio")
+
+                t_done = time.monotonic()
+                logger.info(
+                    f"TTS total speak: {t_done - t_start:.3f}s "
+                    f"(playback {total_played:.3f}s)"
                 )
 
-            if not audio_chunks or sample_rate is None:
-                logger.warning("Piper produced no audio")
-                return
-
-            t_synthesized = time.monotonic()
-            logger.info(
-                f"TTS synthesis: {t_synthesized - t_start:.3f}s "
-                f"({len(audio_chunks)} chunks)"
-            )
-
-            audio = np.concatenate(audio_chunks).astype(np.float32) / 32768.0
-
-            # Apply volume
-            if self.volume != 1.0:
-                audio = audio * self.volume
-
-            # Play through selected device
-            sd.play(audio, samplerate=sample_rate, device=device)
-            sd.wait()
-
-            t_done = time.monotonic()
-            logger.info(
-                f"TTS playback: {t_done - t_synthesized:.3f}s, "
-                f"total speak: {t_done - t_start:.3f}s"
-            )
-
-        except Exception as e:
-            logger.error(f"TTS playback failed: {e}")
+            except Exception as e:
+                logger.error(f"TTS playback failed: {e}")
 
     def speak_async(self, text: str):
         """Synthesize and play audio in a background thread.
 
         Non-blocking — returns immediately while audio plays.
-        Text is preprocessed for TTS before synthesis.
+        Playback is serialized with any other in-flight speak/speak_async call.
         """
-        text = preprocess_for_tts(text)
         thread = threading.Thread(target=self.speak, args=(text,), daemon=True)
         thread.start()
 
@@ -251,7 +276,7 @@ class TTSClient:
         audio = np.concatenate(audio_chunks).astype(np.float32) / 32768.0
 
         if self.volume != 1.0:
-            audio = audio * self.volume
+            audio = np.clip(audio * self.volume, -1.0, 1.0)
 
         return audio, sample_rate
 

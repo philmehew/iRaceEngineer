@@ -151,6 +151,24 @@ def watch_buttons(device_index: int | None = None, watch_axes: bool = False):
     try:
         while True:
             for event in pygame.event.get():
+                # Only handle joystick events — JOYDEVICEADDED/REMOVED and
+                # other events carry different attributes (device_index, not
+                # instance_id) and would crash the watcher on hot-plug
+                if event.type not in (
+                    pygame.JOYBUTTONDOWN,
+                    pygame.JOYBUTTONUP,
+                    pygame.JOYHATMOTION,
+                    pygame.JOYAXISMOTION,
+                ):
+                    if event.type == pygame.JOYDEVICEADDED:
+                        print(
+                            f"\n  🔌 Device added (index {getattr(event, 'device_index', '?')}) "
+                            f"— restart test_wheel.py to see it.\n"
+                        )
+                    elif event.type == pygame.JOYDEVICEREMOVED:
+                        print("\n  ⚠️  Device removed — restart test_wheel.py.\n")
+                    continue
+
                 # Resolve the event's instance_id to our device index
                 eid = event.instance_id
                 dev_idx = instance_map.get(eid)
@@ -171,8 +189,6 @@ def watch_buttons(device_index: int | None = None, watch_axes: bool = False):
                         print("\n  📋 Suggested config.yaml:")
                         print("     voice:")
                         print("       trigger:")
-                        print("         push_to_talk: true")
-                        print('         method: "wheel_button"')
                         print(f"         device_index: {dev_idx}")
                         print(f"         button_index: {btn}")
                         print("         max_record_seconds: 15\n")

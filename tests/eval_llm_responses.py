@@ -13,6 +13,7 @@ Outputs a markdown file with prompt + response for review.
 import argparse
 import json
 import os
+import re
 import sys
 
 # Fix Windows console encoding for emoji/special characters
@@ -124,14 +125,32 @@ def load_all_snapshots(session_dir: str):
     return snapshots
 
 
+def is_infrastructure_failure(response: str) -> bool:
+    """Detect responses that are harness/endpoint failures, not model output.
+
+    Empty responses and [ERROR: ...] wrappers mean the model never answered —
+    the LLMClient raised LLMError or returned nothing. These must not be
+    scored as model quality issues.
+    """
+    if not response.strip():
+        return True
+    if response.strip() == "(empty)":
+        return True
+    return response.strip().startswith("[ERROR:")
+
+
 def check_response_quality(question: str, response: str, context: str) -> list[str]:
     """Check an LLM response for common quality issues.
 
     Returns a list of issue descriptions. Empty list means no issues found.
     """
-    issues = []
+    issues: list[str] = []
     response_lower = response.lower()
     context_lower = context.lower()
+
+    # 0. Infrastructure failures — count separately, don't score the model
+    if is_infrastructure_failure(response):
+        return issues  # Reported separately in the summary
 
     # 1. No refusal — the LLM must always provide useful info
     refusal_phrases = ["i'm busy", "try again", "ask again later", "cannot respond"]
@@ -214,15 +233,65 @@ def check_response_quality(question: str, response: str, context: str) -> list[s
     # 7. Check for wildly incorrect fuel calculations
     # If context shows fuel at < 5% and response says "laps of fuel" > 10,
     # that's a hallucinated calculation
-    if "⚠ critical" in context_lower:
+    if "!! critical" in context_lower:
         # Extract any number like "X laps fuel" in response
-        import re
-
         laps_match = re.search(r"(\d+)\+?\s*laps\s+(?:of\s+)?fuel", response_lower)
         if laps_match and int(laps_match.group(1)) > 10:
             issues.append(
                 f"Wild fuel calc: claims {laps_match.group(1)} laps of fuel despite CRITICAL warning"
             )
+
+    # 8. Fuel margin-vs-range confusion: context reports "range X laps" and
+    # "only Y laps margin" — the margin is spare fuel, NOT total fuel left.
+    # A response claiming only Y laps of fuel left has misread the context.
+    range_match = re.search(r"range approx (\d+(?:\.\d+)?) laps", context_lower)
+    margin_match = re.search(r"only (\d+(?:\.\d+)?) laps margin", context_lower)
+    if range_match and margin_match:
+        margin = float(margin_match.group(1))
+        fuel_range = float(range_match.group(1))
+        # Look for the response quoting the margin as total fuel remaining
+        only_fuel = re.search(
+            r"only (?:about |~)?(\d+(?:\.\d+)?)\s*laps?(?:\s+of)?(?:\s+fuel)?\s+(?:left|remaining)",
+            response_lower,
+        )
+        if only_fuel and float(only_fuel.group(1)) <= margin + 0.15:
+            if fuel_range > margin + 0.5:
+                issues.append(
+                    f"Margin-vs-range confusion: claims only {only_fuel.group(1)} laps of fuel left "
+                    f"but range is {fuel_range} laps ({margin} is the margin)"
+                )
+
+    # 9. Gap-vs-pace confusion: "X seconds behind/ahead" describes position;
+    # pace is seconds per lap. If the response claims the car behind is "Xs
+    # slower" using the gap value, it's conflated the two.
+    behind_match = re.search(r"P\d+ \(.*?\): -([\d.]+)s behind", context)
+    if behind_match:
+        gap = float(behind_match.group(1))
+        slower_match = re.search(r"([\d.]+)\s*s(?:econds)?\s+slower", response_lower)
+        if slower_match and abs(float(slower_match.group(1)) - gap) < 0.05:
+            issues.append(
+                f"Gap-vs-pace confusion: calls the {gap}s GAP a pace difference"
+            )
+
+    # 10. Ahead/behind inversion: in racing you ATTACK the car ahead and
+    # DEFEND against the car behind. If the response does the opposite for a
+    # car listed in context, the directions are flipped.
+    ahead_cars = set(re.findall(r"P(\d+) \(.*?\): \+[\d.]+s ahead", context))
+    behind_cars = set(re.findall(r"P(\d+) \(.*?\): -[\d.]+s behind", context))
+    defend_matches = re.findall(r"defend (?:against )?[Pp](\d+)", response_lower)
+    attack_matches = re.findall(r"attack [Pp](\d+)", response_lower)
+    for p in defend_matches:
+        if p in ahead_cars:
+            issues.append(
+                f"Direction inversion: defends against P{p}, which is AHEAD in context"
+            )
+            break
+    for p in attack_matches:
+        if p in behind_cars:
+            issues.append(
+                f"Direction inversion: attacks P{p}, which is BEHIND in context"
+            )
+            break
 
     return issues
 
@@ -364,30 +433,41 @@ def run_eval(session_dir: str, count: int, output_file: str, config: dict):
             f.write(f"**A:** {r['response']}\n\n")
 
             # Quality checks per response
-            issues = check_response_quality(r["question"], r["response"], r["context"])
-            if issues:
-                f.write(f"**Issues:** {'; '.join(issues)}\n\n")
+            if is_infrastructure_failure(r["response"]):
+                f.write("**Quality:** ⚠ INFRASTRUCTURE FAILURE (not model output)\n\n")
             else:
-                f.write("**Quality:** ✅ OK\n\n")
+                issues = check_response_quality(
+                    r["question"], r["response"], r["context"]
+                )
+                if issues:
+                    f.write(f"**Issues:** {'; '.join(issues)}\n\n")
+                else:
+                    f.write("**Quality:** ✅ OK\n\n")
             f.write("---\n\n")
 
         # Summary section
         f.write("## Quality Summary\n\n")
         total = len(results)
+        infra_failures = sum(
+            1 for r in results if is_infrastructure_failure(r["response"])
+        )
+        scored = [r for r in results if not is_infrastructure_failure(r["response"])]
         results_with_issues = sum(
             1
-            for r in results
+            for r in scored
             if check_response_quality(r["question"], r["response"], r["context"])
         )
         all_issues = []
-        for r in results:
+        for r in scored:
             all_issues.extend(
                 check_response_quality(r["question"], r["response"], r["context"])
             )
 
         f.write(f"- Total responses: {total}\n")
+        f.write(f"- Infrastructure failures (not model output): {infra_failures}\n")
+        f.write(f"- Model responses scored: {len(scored)}\n")
         f.write(f"- Responses with issues: {results_with_issues}\n")
-        f.write(f"- Clean responses: {total - results_with_issues}\n\n")
+        f.write(f"- Clean responses: {len(scored) - results_with_issues}\n\n")
 
         # Count by issue type
         issue_counts: dict[str, int] = {}

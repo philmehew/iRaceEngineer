@@ -20,7 +20,11 @@ Wheel button (hold) → stt_client.py (mic → Whisper) → transcribed text →
 - **spotter.py** — deterministic real-time audio calls for car proximity (car left/right, three wide, clear) and car-behind-closing alerts using pre-recorded WAV files; no LLM involved
 - **stt_client.py** — speech-to-text via faster-whisper + sounddevice mic capture, push-to-talk
 - **tts_client.py** — text-to-speech via Piper TTS + sounddevice playback, configurable output device
+- **remote_stt_client.py** — `RemoteSTTClient(STTClient)`: mic stays local, transcription offloaded to speaches (faster-whisper server) on the Strix Halo over HTTP
+- **remote_tts_client.py** — `RemoteTTSClient(TTSClient)`: synthesis offloaded to Kokoro-FastAPI on the Strix Halo (returns MP3), playback stays local
+- **voice_clients.py** — `create_stt_client`/`create_tts_client` factories pick local vs remote backend from `voice.<stt|tts>.backend`
 - **capture.py** — record/replay telemetry JSON for testing without iRacing
+- **chat_macros.py** — `ChatMacroManager`: maps LLM-declared actions (`[CMD:name]` tags in LLM replies) to iRacing chat macros (AutoChatStr1-15), fired via the SDK broadcast; validates macro slots against app.ini at startup. Used for driver commands like `!clearall` (clear black flag) that have no SDK broadcast of their own
 - **main.py** — entry point with CLI: live, --capture, --replay, --generate-samples, --voice; includes WheelButtonListener for steering wheel query and PTT triggers
 
 ## Key Design Decisions
@@ -32,7 +36,9 @@ Wheel button (hold) → stt_client.py (mic → Whisper) → transcribed text →
 - **Voice is optional** — voice deps in `[voice]` extra (`uv sync --extra voice`), graceful degradation if not installed
 - **Wheel button triggers** — pygame in `[wheel]` extra (`uv sync --extra wheel`), used for both LLM query (press) and push-to-talk voice (hold) via steering wheel buttons
 - **Voice tested independently** — `test_stt.py` and `test_tts.py` are standalone scripts for testing each component
+- **Remote voice backend** — `voice.stt.backend`/`voice.tts.backend` (`"local"` default | `"remote"`) selects faster-whisper/Piper (local) vs Strix Halo HTTP (remote). Backend-specific settings live in symmetric `local:`/`remote:` blocks; shared mic/speaker keys (`input_device`, `output_device`, `volume`, etc.) stay at the service level because audio capture/playback always happens on this machine. Remote STT = speaches at `192.168.0.117:9000`, remote TTS = Kokoro-FastAPI at `192.168.0.117:8880` (voice `bm_fable`).
 - **Spotter is local and deterministic** — reads CarLeftRight telemetry at 30Hz, plays pre-recorded WAV files on transitions (car appears/clears alongside). Also detects car-behind-closing using lap-time delta comparison (not noisy CarDistBehind derivative). No LLM involved. Edge-detection with cooldown timers prevents repeated calls. Uses sounddevice.OutputStream (not sd.play) to avoid conflicting with TTS.
+- **LLM actions fire chat macros** — the SDK can't send arbitrary chat text, so commands like `!clearall` (clear black flag) live in iRacing chat macro slots (set in the sim UI; trailing `$` = auto-transmit). `chat_macros:` config maps action names → macro slots, the system prompt tells the LLM which `[CMD:name]` tags exist, and `main.py` strips the tags (never spoken/displayed) and fires the macro via `chat_command_macro`. Slot contents validated against app.ini at startup (warn-only). Replay mode fires log-only.
 - **Still-there reminder** — when a car has been alongside continuously for more than `still_there_delay_ms` (default 5000ms), plays `carstillthere.wav` as a reminder. Repeats every `still_there_cooldown_ms` (default 10000ms) while the car remains alongside. Resets when the car clears.
 
 ## Tech Stack

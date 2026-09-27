@@ -133,7 +133,11 @@ class IRacingClient:
 
         Returns a flat dict of variable name -> value for all available
         telemetry fields. This captures everything so downstream consumers
-        can pick what they need.
+        can pick what they need. Used by capture mode (records everything).
+
+        For the live tick loop, prefer get_live_telemetry() — it reads only
+        the ~100 variables RaceState consumes, which avoids per-variable
+        overhead in pyirsdk (each __getitem__ re-sorts the buffer list).
         """
         if not self.is_connected:
             return {}
@@ -142,6 +146,151 @@ class IRacingClient:
         for name in self._ir.var_headers_names:
             try:
                 result[name] = self._ir[name]
+            except Exception:
+                # Some variables may not be available in all sessions
+                pass
+        return result
+
+    # Telemetry variables consumed by RaceState.update per tick. Reading
+    # only these (instead of all 327 vars) cuts the per-tick read cost by
+    # ~4x — each self._ir[name] lookup re-sorts pyirsdk's buffer list, so
+    # reading 327 vars means 327 redundant sorts per tick.
+    _LIVE_TELEMETRY_VARS = frozenset(
+        {
+            # Session-level
+            "Lap",
+            "SessionTime",
+            "SessionFlags",
+            "PlayerCarIdx",
+            "CarIdxSessionFlags",
+            "SessionLapsRemain",
+            "SessionTimeRemain",
+            "SessionNum",
+            "SessionState",
+            "RaceLaps",
+            # Weather/track
+            "TrackTemp",
+            "TrackWetness",
+            "WeatherDeclaredWet",
+            "AirTemp",
+            "AirPressure",
+            "Precipitation",
+            "WindDir",
+            "WindVel",
+            "Skies",
+            # Per-car arrays
+            "CarIdxLapDistPct",
+            "CarIdxTrackSurface",
+            "CarIdxOnPitRoad",
+            "CarIdxPosition",
+            "CarIdxLap",
+            "CarIdxBestLapTime",
+            "CarIdxLastLapTime",
+            "CarIdxTireCompound",
+            "CarIdxRPM",
+            "CarIdxGear",
+            # Player position/driving
+            "PlayerCarPosition",
+            "PlayerCarClassPosition",
+            "LapCompleted",
+            "LapDistPct",
+            "Speed",
+            "RPM",
+            "Gear",
+            "Throttle",
+            "Brake",
+            # Engine
+            "OilTemp",
+            "WaterTemp",
+            "OilPress",
+            "OilLevel",
+            "WaterLevel",
+            "FuelPress",
+            "EngineWarnings",
+            "ManifoldPress",
+            "Voltage",
+            # Player status
+            "IsOnTrack",
+            "IsInGarage",
+            "PlayerTrackSurface",
+            "LatAccel",
+            "LongAccel",
+            "VertAccel",
+            "PlayerCarWeightPenalty",
+            "PlayerFastRepairsUsed",
+            "PitRepairLeft",
+            "PitOptRepairLeft",
+            "CarLeftRight",
+            "CarDistAhead",
+            "CarDistBehind",
+            "PlayerCarTowTime",
+            "ShiftIndicatorPct",
+            "PlayerCarSLShiftRPM",
+            "dcBrakeBias",
+            # Fuel
+            "FuelLevel",
+            "FuelLevelPct",
+            "FuelUsePerHour",
+            # Tyres/brakes
+            "LFodometer",
+            "RFodometer",
+            "LRodometer",
+            "RRodometer",
+            "LFbrakeLinePress",
+            "RFbrakeLinePress",
+            "LRbrakeLinePress",
+            "RRbrakeLinePress",
+            "BrakeABSactive",
+            # Per-corner tyre temps/pressures/wear ({LF,RF,LR,RR} × these)
+            *[
+                f"{c}{s}"
+                for c in ("LF", "RF", "LR", "RR")
+                for s in (
+                    "tempCL",
+                    "tempCM",
+                    "tempCR",
+                    "coldPressure",
+                    "wearL",
+                    "wearM",
+                    "wearR",
+                )
+            ],
+            # Lap timing
+            "LapCurrentLapTime",
+            "LapBestLapTime",
+            "LapLastLapTime",
+            "LapDeltaToBestLap",
+            # Incidents
+            "PlayerCarMyIncidentCount",
+            "PlayerCarTeamIncidentCount",
+            # Pit
+            "OnPitRoad",
+            "PitstopActive",
+            "PitsOpen",
+            "PlayerCarInPitStall",
+            "FastRepairAvailable",
+            "TireSetsAvailable",
+            "TireSetsUsed",
+            "PlayerTireCompound",
+        }
+    )
+
+    def get_live_telemetry(self) -> dict[str, Any]:
+        """Read only the telemetry variables RaceState consumes per tick.
+
+        Much faster than get_telemetry() in the live tick loop — pyirsdk
+        re-sorts its buffer list on every variable read, so reading 327
+        vars per tick at 30-60Hz wastes most of the tick budget. Downstream
+        code uses .get() with defaults, so missing variables are harmless.
+        """
+        if not self.is_connected:
+            return {}
+
+        result: dict[str, Any] = {}
+        get = self._ir.__getitem__
+        for name in self._LIVE_TELEMETRY_VARS:
+            try:
+                result[name] = get(name)
             except Exception:
                 # Some variables may not be available in all sessions
                 pass
@@ -792,6 +941,29 @@ class IRacingClient:
             logger.info(f"Sent chat command: {command_name}")
         except Exception as e:
             logger.error(f"Failed to send chat command {command_name}: {e}")
+
+    def send_chat_macro(self, macro_num: int):
+        """Fire a chat macro (autochat message) via the SDK broadcast.
+
+        Macros are AutoChatStr1-15 in iRacing's app.ini; a trailing "$" in
+        the macro text makes iRacing auto-transmit without an Enter keypress.
+        Used for actions the LLM triggers (e.g. !clearall to clear flags).
+
+        The broadcast macro index is 0-based despite the SDK docs saying
+        "1-15": passing 1 fires AutoChatStr2 (verified live — asking for
+        slot 1 sent the slot 2 text). Subtract 1 so macro_num keeps natural
+        AutoChatStr numbering.
+
+        Args:
+            macro_num: AutoChatStr slot number 1-15.
+        """
+        try:
+            self._ir.chat_command_macro(macro_num - 1)
+            logger.info(
+                f"Sent chat macro {macro_num} (broadcast index {macro_num - 1})"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send chat macro {macro_num}: {e}")
 
     def broadcast_pit_command(self, command_name: str, param: int = 0):
         """Send a broadcast pit command via pyirsdk's internal method.

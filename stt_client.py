@@ -33,12 +33,17 @@ class STTClient:
 
     def __init__(self, config: dict):
         stt_config = config.get("voice", {}).get("stt", {})
-        self.model_name = stt_config.get("model", "small")
-        self.device = stt_config.get("device", "cuda")
-        self.compute_type = stt_config.get("compute_type", "float16")
+        # Backend-local settings live under 'local:' — fall back to the
+        # top-level keys for backward-compat with older flat configs.
+        local_config = stt_config.get("local", stt_config)
+        self.model_name = local_config.get("model", "small")
+        self.device = local_config.get("device", "cuda")
+        self.compute_type = local_config.get("compute_type", "float16")
+        self.vad_filter = local_config.get("vad_filter", True)
+        # Shared keys — used by both local and remote backends (mic capture
+        # always happens on this machine regardless of backend).
         self._input_device = stt_config.get("input_device", None)
         self.input_gain = stt_config.get("input_gain", 1.0)
-        self.vad_filter = stt_config.get("vad_filter", True)
         self.language = stt_config.get("language", "en")
         self._model = None
         self._model_loaded = False
@@ -46,6 +51,11 @@ class STTClient:
         self._cpu_model_loaded = False
         self._cpu_load_lock = threading.Lock()
         self._load_lock = threading.Lock()
+        # Prevents concurrent model.transcribe() calls on the same model:
+        # a timed-out CUDA worker can't be killed and keeps running in the
+        # background; letting a new PTT press start another inference on the
+        # same model while the zombie is still burning would stack GPU load
+        self._transcribe_lock = threading.Lock()
 
         logger.info(
             f"STT client configured: model={self.model_name}, "
@@ -99,6 +109,12 @@ class STTClient:
                         )
                         device = "cpu"
                         compute_type = "int8"
+                        # Remember the fallback so transcribe() doesn't apply
+                        # the CUDA-only watchdog to CPU inference (which can
+                        # legitimately take >10s) and doesn't try to load a
+                        # second CPU model on timeout
+                        self.device = "cpu"
+                        self.compute_type = "int8"
                         self._model = WhisperModel(
                             self.model_name,
                             device="cpu",
@@ -402,6 +418,25 @@ class STTClient:
             TimeoutError: If transcription exceeds timeout_s.
             Exception: If transcription fails for any other reason.
         """
+        # Serialise model access — a timed-out worker thread can't be
+        # killed and may still be running inference on this model. Wait
+        # for it (bounded) rather than stacking a second inference on
+        # the same GPU.
+        with self._transcribe_lock:
+            return self._do_transcribe_locked(
+                model, audio, t_start, t_model_loaded, timeout_s, label
+            )
+
+    def _do_transcribe_locked(
+        self,
+        model,
+        audio: np.ndarray,
+        t_start: float,
+        t_model_loaded: float,
+        timeout_s: float | None,
+        label: str,
+    ) -> str:
+        """Run transcription holding _transcribe_lock. See _do_transcribe."""
         audio_duration = len(audio) / WHISPER_SAMPLE_RATE
 
         if timeout_s is not None:

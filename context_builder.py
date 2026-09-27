@@ -4,6 +4,7 @@ for the LLM. Configurable depth: minimal, medium, full.
 """
 
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,46 @@ TRACK_WETNESS_LABELS = {
 }
 
 
+class QAHistory:
+    """Rolling window of past question/answer exchanges.
+
+    Kept verbatim (answers are short — the system prompt enforces one
+    sentence) so the LLM can resolve follow-up questions ("what if it
+    rains?"). Thread-safe: button-press threads and the main loop can
+    append/read concurrently.
+    """
+
+    def __init__(self, max_exchanges: int = 3):
+        self.max_exchanges = max_exchanges
+        self._lock = threading.Lock()
+        self._exchanges: list[tuple[str, str]] = []
+
+    def append(self, question: str, answer: str):
+        """Record a completed exchange. Oldest is dropped beyond max."""
+        if self.max_exchanges <= 0:
+            return
+        with self._lock:
+            self._exchanges.append((question, answer))
+            if len(self._exchanges) > self.max_exchanges:
+                self._exchanges = self._exchanges[-self.max_exchanges :]
+
+    def as_messages(self) -> list[dict]:
+        """Render history as OpenAI chat messages (oldest first)."""
+        with self._lock:
+            exchanges = list(self._exchanges)
+        messages = []
+        for q, a in exchanges:
+            if q:
+                messages.append({"role": "user", "content": q})
+            messages.append({"role": "assistant", "content": a})
+        return messages
+
+    def clear(self):
+        """Drop all history (e.g. new session detected)."""
+        with self._lock:
+            self._exchanges.clear()
+
+
 class ContextBuilder:
     """Builds LLM-ready prompts from race state snapshots.
 
@@ -152,11 +193,30 @@ class ContextBuilder:
         self.system_prompt = prompt_config.get("system", self._default_system_prompt())
         self.include_lap_history = prompt_config.get("include_lap_history", 5)
         self.include_nearby_cars = prompt_config.get("include_nearby_cars", 3)
+        # 0 disables conversation memory entirely (previous stateless behaviour)
+        self.qa_history_max = prompt_config.get("qa_history_max", 3)
+        self.qa_history = QAHistory(self.qa_history_max)
+        # Optional chat macro actions block (set via set_chat_macros) —
+        # appended to the system prompt so the LLM knows which [CMD:] tags
+        # it may use. Empty by default: no actions configured = no block.
+        self._chat_macros_prompt = ""
+
+    def set_chat_macros(self, manager) -> None:
+        """Attach a ChatMacroManager to enable [CMD:] action tags.
+
+        The manager's actions block is appended to the system prompt so the
+        LLM knows which commands it can execute for the driver.
+        """
+        self._chat_macros_prompt = manager.available_actions_prompt()
 
     def _default_system_prompt(self) -> str:
         return (
-            "Race engineer. ONE sentence max. Be brief.\n"
-            "Never invent data. Trust STALE/frozen labels."
+            "Race engineer. Race questions: ONE sentence max. Be brief.\n"
+            "Off-topic small talk (weather banter, other drivers, general chat):\n"
+            "answer naturally, still keep it to 2-3 sentences max.\n"
+            "Never invent data. Trust STALE/frozen labels.\n"
+            "Prior Q&A is conversation memory only — figures in it are outdated;\n"
+            "always use the current snapshot for any number."
         )
 
     def build_prompt(self, state: dict, question: str = "") -> list[dict]:
@@ -169,9 +229,16 @@ class ContextBuilder:
         Returns:
             List of message dicts for the OpenAI API.
         """
+        system_content = self.system_prompt
+        if self._chat_macros_prompt:
+            system_content += "\n\n" + self._chat_macros_prompt
         messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": system_content},
         ]
+
+        # Conversation memory: past exchanges go before the fresh snapshot so
+        # the current data is the last (and most salient) thing the model reads
+        messages.extend(self.qa_history.as_messages())
 
         if self.context_depth == "minimal":
             user_content = self._build_minimal(state)
@@ -989,11 +1056,17 @@ class ContextBuilder:
                         w = ts.get("wear_center", 0)
                         if w > 0:
                             wear_values.append(w)
-                    wear_str = (
-                        f" Life: approx {wear_values[0] * 100:.0f}%."
-                        if wear_values
-                        else ""
-                    )
+                    if wear_values:
+                        avg_wear = sum(wear_values) / len(wear_values)
+                        # Report the worst corner too — a near-worn-out rear
+                        # is invisible in an average (e.g. LF 95%, RR 45%)
+                        worst_wear = min(wear_values)
+                        wear_str = (
+                            f" Life: approx {avg_wear * 100:.0f}%"
+                            f" (worst {worst_wear * 100:.0f}%)."
+                        )
+                    else:
+                        wear_str = ""
 
                     lines.append(
                         "  Tyres: STALE (on track, values frozen) — cannot assess condition."
