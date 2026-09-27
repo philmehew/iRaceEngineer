@@ -1509,7 +1509,7 @@ class TestSpotterFlagAlerts:
             is_on_track=True,
             track_surface=3,
             session_flags=self.FLAG_GREEN,
-            session_state=3,
+            session_state=4,
             lap_completed=1,
         )
         spotter.update(
@@ -1517,7 +1517,7 @@ class TestSpotterFlagAlerts:
             is_on_track=True,
             track_surface=3,
             session_flags=self.FLAG_GREEN | self.FLAG_BLUE,
-            session_state=3,
+            session_state=4,
             lap_completed=1,
         )
         assert "flag_blue" in played_keys
@@ -1538,7 +1538,7 @@ class TestSpotterFlagAlerts:
             is_on_track=True,
             track_surface=3,
             session_flags=self.FLAG_GREEN,
-            session_state=3,
+            session_state=4,
             lap_completed=0,
         )
         # Blue flag appears — should be suppressed
@@ -1547,7 +1547,7 @@ class TestSpotterFlagAlerts:
             is_on_track=True,
             track_surface=3,
             session_flags=self.FLAG_GREEN | self.FLAG_BLUE,
-            session_state=3,
+            session_state=4,
             lap_completed=0,
         )
         assert "flag_blue" not in played_keys
@@ -1558,7 +1558,7 @@ class TestSpotterFlagAlerts:
             is_on_track=True,
             track_surface=3,
             session_flags=self.FLAG_GREEN,
-            session_state=3,
+            session_state=4,
             lap_completed=1,
         )
         spotter.update(
@@ -1566,7 +1566,7 @@ class TestSpotterFlagAlerts:
             is_on_track=True,
             track_surface=3,
             session_flags=self.FLAG_GREEN | self.FLAG_BLUE,
-            session_state=3,
+            session_state=4,
             lap_completed=1,
         )
         assert "flag_blue" in played_keys
@@ -1674,6 +1674,129 @@ class TestSpotterFlagAlerts:
             session_flags=self.FLAG_GREEN | self.FLAG_YELLOW,
         )
         assert "flag_yellow" in played_keys
+
+
+class TestSpotterSessionState:
+    """Test lights-out detection and _race_started derivation from SessionState.
+
+    iRacing SessionState (pyirsdk SessionState enum):
+        0=Invalid, 1=GetInCar, 2=Warmup, 3=ParadeLaps, 4=Racing,
+        5=Checkered, 6=CoolDown.
+    """
+
+    FLAG_GREEN = 0x0004
+
+    def setup_method(self):
+        self.config = {
+            "spotter": {
+                "enabled": True,
+                "cooldowns": {
+                    "proximity_ms": 3000,
+                    "clearance_ms": 5000,
+                    "clear_delay_ms": 100,
+                    "appear_delay_ms": 0,
+                },
+                "audio_paths": {},
+                "output_device": None,
+                "volume": 1.0,
+            }
+        }
+
+    def _make_spotter(self):
+        spotter = Spotter(self.config)
+        played_keys = []
+        spotter._player.play = lambda key: played_keys.append(key)
+        return spotter, played_keys
+
+    def test_lights_out_on_parade_to_racing(self):
+        """Lights out should fire on the 3→4 transition (parade laps → racing),
+        i.e. at the actual green, not at formation-lap start."""
+        spotter, played_keys = self._make_spotter()
+
+        # Prime in GetInCar (1)
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=0,
+            session_state=1,
+        )
+        assert "lights_out" not in played_keys
+
+        # Formation lap begins (1→3, GetInCar→ParadeLaps) — NOT lights out
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=0,
+            session_state=3,
+        )
+        assert "lights_out" not in played_keys
+        assert spotter._race_started is False
+
+        # Green! (3→4, ParadeLaps→Racing) — lights out now
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            session_state=4,
+        )
+        assert "lights_out" in played_keys
+        assert spotter._race_started is True
+
+    def test_race_not_started_during_parade_laps(self):
+        """_race_started must be False during parade laps (state 3) so pit/blue
+        alerts don't fire on the grid or formation lap."""
+        spotter, played_keys = self._make_spotter()
+
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=0,
+            session_state=3,
+        )
+        assert spotter._race_started is False
+
+    def test_race_started_clears_on_new_session(self):
+        """Dropping back to states 1-3 after racing means a new session —
+        _race_started should clear."""
+        spotter, played_keys = self._make_spotter()
+
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            session_state=4,
+        )
+        assert spotter._race_started is True
+
+        # Session ends / next session loads (4→1)
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=0,
+            session_state=1,
+        )
+        assert spotter._race_started is False
+
+    def test_joined_mid_race_primes_race_started(self):
+        """Joining while already in state >= 4 primes race_started without
+        playing lights_out."""
+        spotter, played_keys = self._make_spotter()
+
+        spotter.update(
+            0,
+            is_on_track=True,
+            track_surface=3,
+            session_flags=self.FLAG_GREEN,
+            session_state=4,
+        )
+        assert spotter._race_started is True
+        assert "lights_out" not in played_keys
 
 
 class TestSpotterSlipperyAlert:

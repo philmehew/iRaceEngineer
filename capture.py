@@ -10,6 +10,7 @@ the pipeline instead of live iRacing data.
 
 import json
 import logging
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -106,15 +107,26 @@ class TelemetryReplay:
         """
         self.capture_dir = Path(capture_dir)
         self.loop = loop
-        self._snapshots: list[dict] = []
         self._index = 0
         self._loaded = False
+        # Guards the check-index-then-increment in next_snapshot — the
+        # replay feeder thread and interactive 'next' command can race
+        self._lock = threading.Lock()
+        # Sorted snapshot files, populated by load() — parsed lazily, one
+        # per next_snapshot() call, so an endurance capture (tens of
+        # thousands of files) doesn't blow up RAM
+        self._filepaths: list[Path] = []
 
     def load(self) -> int:
-        """Load all snapshot files from the capture directory.
+        """Index snapshot files from the capture directory.
+
+        Files are listed and sorted here but parsed lazily, one per call to
+        next_snapshot() — an endurance capture can hold tens of thousands
+        of snapshots (hours of telemetry), and eager loading put multiple
+        GB of parsed JSON in RAM.
 
         Returns:
-            Number of snapshots loaded.
+            Number of snapshot files found.
         """
         if not self.capture_dir.exists():
             raise FileNotFoundError(f"Capture directory not found: {self.capture_dir}")
@@ -124,51 +136,59 @@ class TelemetryReplay:
         if not files:
             raise ValueError(f"No snapshot files found in {self.capture_dir}")
 
-        self._snapshots = []
-        for filepath in files:
-            try:
-                with open(filepath) as f:
-                    snapshot = json.load(f)
-                self._snapshots.append(snapshot)
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning(f"Skipping invalid snapshot file {filepath}: {e}")
-
+        self._filepaths = files
         self._loaded = True
         self._index = 0
-        logger.info(f"Loaded {len(self._snapshots)} snapshots from {self.capture_dir}")
-        return len(self._snapshots)
+        logger.info(f"Indexed {len(files)} snapshots from {self.capture_dir}")
+        return len(files)
+
+    def _read_snapshot(self, filepath: Path) -> dict | None:
+        """Parse one snapshot file, warning and skipping on invalid JSON."""
+        try:
+            with open(filepath) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Skipping invalid snapshot file {filepath}: {e}")
+            return None
 
     def next_snapshot(self) -> dict | None:
         """Get the next snapshot in sequence.
 
+        Files are parsed from disk one at a time — only the file list is
+        held in memory, so replay of an endurance capture stays flat in RAM.
+
         Returns:
             Snapshot dict, or None if all snapshots have been replayed
             (and loop is False).
+
+        Thread-safe: the replay feeder thread and the interactive 'next'
+        command both call this concurrently.
         """
         if not self._loaded:
             self.load()
 
-        if self._index >= len(self._snapshots):
-            if self.loop:
-                self._index = 0
-                logger.info("Replay loop: restarting from beginning")
-            else:
-                return None
+        with self._lock:
+            if self._index >= len(self._filepaths):
+                if self.loop:
+                    self._index = 0
+                    logger.info("Replay loop: restarting from beginning")
+                else:
+                    return None
 
-        snapshot = self._snapshots[self._index]
-        self._index += 1
-        return snapshot
+            snapshot = self._read_snapshot(self._filepaths[self._index])
+            self._index += 1
+            return snapshot
 
     def has_more(self) -> bool:
         """Check if there are more snapshots to replay."""
         if not self._loaded:
             return True
-        return self._index < len(self._snapshots) or self.loop
+        return self._index < len(self._filepaths) or self.loop
 
     @property
     def progress(self) -> tuple[int, int]:
         """Return (current_index, total_snapshots)."""
-        return (self._index, len(self._snapshots))
+        return (self._index, len(self._filepaths))
 
     @property
     def is_loaded(self) -> bool:

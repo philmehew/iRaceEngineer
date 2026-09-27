@@ -382,6 +382,83 @@ class TestContextBuilder:
         last_msg = messages[-1]["content"]
         assert "Should I pit?" in last_msg
 
+    def test_qa_history_injected_into_prompt(self):
+        state = make_state()
+        config = {"prompt": {"context_depth": "minimal", "system": "test"}}
+        builder = ContextBuilder(config)
+        builder.qa_history.append("Should I pit?", "Box in 2 laps.")
+        messages = builder.build_prompt(
+            state.get_snapshot(), question="What if it rains?"
+        )
+        # system, history user, history assistant, snapshot+question
+        assert len(messages) == 4
+        assert messages[1] == {"role": "user", "content": "Should I pit?"}
+        assert messages[2] == {"role": "assistant", "content": "Box in 2 laps."}
+        assert "What if it rains?" in messages[3]["content"]
+
+    def test_qa_history_respects_max_exchanges(self):
+        config = {
+            "prompt": {
+                "context_depth": "minimal",
+                "system": "test",
+                "qa_history_max": 2,
+            }
+        }
+        builder = ContextBuilder(config)
+        for i in range(5):
+            builder.qa_history.append(f"Q{i}", f"A{i}")
+        messages = builder.qa_history.as_messages()
+        # 2 exchanges = 4 messages, and only the newest survive
+        assert len(messages) == 4
+        assert messages[0]["content"] == "Q3"
+        assert messages[-1]["content"] == "A4"
+
+    def test_qa_history_disabled(self):
+        config = {
+            "prompt": {
+                "context_depth": "minimal",
+                "system": "test",
+                "qa_history_max": 0,
+            }
+        }
+        builder = ContextBuilder(config)
+        builder.qa_history.append("Q", "A")
+        assert builder.qa_history.as_messages() == []
+        messages = builder.build_prompt(state=make_state().get_snapshot())
+        assert len(messages) == 2  # stateless — system + user only
+
+    def test_qa_history_thread_safety(self):
+        # Concurrent appends must never lose the lock or corrupt the list
+        import threading
+
+        config = {
+            "prompt": {
+                "context_depth": "minimal",
+                "system": "test",
+                "qa_history_max": 100,
+            }
+        }
+        builder = ContextBuilder(config)
+        errors = []
+
+        def worker(n):
+            try:
+                for i in range(200):
+                    builder.qa_history.append(f"Q{n}-{i}", f"A{n}-{i}")
+                    builder.qa_history.as_messages()
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors
+        # Cap is 100 exchanges = 200 messages; reaching it intact means no
+        # appends were lost or corrupted under concurrency
+        assert len(builder.qa_history.as_messages()) == 200
+
     def test_format_lap_time(self):
         assert format_lap_time(92.5) == "1:32.500"
         assert format_lap_time(-1) == "N/A"
@@ -969,3 +1046,535 @@ class TestSectorTimeTracker:
         assert isinstance(snap["player"]["fastest_sector_times"], dict)
         for car in snap["nearby_cars"]:
             assert "fastest_sector_times" in car
+
+
+# --- LLMClient retry tests ---
+
+
+class TestLLMClientRetry:
+    """Tests for LLMClient transient-error retry logic."""
+
+    def _make_client(self, retries=2, backoff=0.0, thinking=None):
+        from llm_client import LLMClient
+
+        config = {
+            "llm": {
+                "base_url": "http://localhost:1",  # nothing listening
+                "api_key": "test",
+                "model": "test",
+                "retries": retries,
+                "retry_backoff": backoff,
+                "timeout": 0.1,
+                "thinking": thinking,
+            }
+        }
+        return LLMClient(config)
+
+    @staticmethod
+    def _make_response(text):
+        class Msg:
+            content = text
+
+        class Choice:
+            message = Msg()
+
+        class Resp:
+            choices = [Choice()]
+            usage = None
+
+        return Resp()
+
+    @staticmethod
+    def _make_api_error(exc_cls, message):
+        """Build an openai SDK error — needs a response with .request set."""
+
+        class Request:
+            method = "POST"
+            url = "http://localhost:1/v1/chat/completions"
+
+        class Response:
+            request = Request()
+            status_code = 429
+            headers = {}
+
+        return exc_cls(message, response=Response(), body=None)
+
+    def test_success_first_try(self):
+        client = self._make_client()
+        calls = []
+        client.client.chat.completions.create = lambda *a, **kw: (
+            calls.append(1) or self._make_response("pit now")
+        )
+        assert client.ask([{"role": "user", "content": "q"}]) == "pit now"
+        assert len(calls) == 1
+
+    def test_retry_then_success(self):
+        """A transient error followed by success returns the good response."""
+        import openai
+
+        client = self._make_client(retries=2, backoff=0.0)
+        attempts = []
+
+        def flaky(*args, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise self._make_api_error(openai.RateLimitError, "rate limit exceeded")
+            return self._make_response("stay out")
+
+        client.client.chat.completions.create = flaky
+        assert client.ask([{"role": "user", "content": "q"}]) == "stay out"
+        assert len(attempts) == 2
+
+    def test_transient_exhausted_raises_llmerror(self):
+        """Persistent transient errors exhaust retries and raise LLMError."""
+        import openai
+
+        client = self._make_client(retries=1, backoff=0.0)
+        attempts = []
+
+        def always_rate_limited(*args, **kwargs):
+            attempts.append(1)
+            raise self._make_api_error(openai.RateLimitError, "rate limit exceeded")
+
+        client.client.chat.completions.create = always_rate_limited
+        from llm_client import LLMError
+
+        try:
+            client.ask([{"role": "user", "content": "q"}])
+            assert False, "expected LLMError"
+        except LLMError:
+            pass
+        assert len(attempts) == 2  # initial + 1 retry
+
+    def test_auth_error_no_retry(self):
+        """Auth failures fail fast — no pointless retries."""
+        import openai
+
+        client = self._make_client(retries=2, backoff=0.0)
+        attempts = []
+
+        def bad_auth(*args, **kwargs):
+            attempts.append(1)
+            raise self._make_api_error(openai.AuthenticationError, "invalid api key")
+
+        client.client.chat.completions.create = bad_auth
+        from llm_client import LLMError
+
+        try:
+            client.ask([{"role": "user", "content": "q"}])
+            assert False, "expected LLMError"
+        except LLMError:
+            pass
+        assert len(attempts) == 1  # no retry on permanent errors
+
+    def test_timeout_message(self):
+        """Timeout errors surface the friendly 'I'm busy' message."""
+        client = self._make_client(retries=0)
+
+        def slow(*args, **kwargs):
+            raise Exception("Request timed out after 100ms")
+
+        client.client.chat.completions.create = slow
+        from llm_client import LLMError
+
+        try:
+            client.ask([{"role": "user", "content": "q"}])
+            assert False, "expected LLMError"
+        except LLMError as e:
+            assert "busy" in str(e).lower()
+
+    def test_thinking_sent_when_set(self):
+        """thinking config passes both known spellings via extra_body."""
+        client = self._make_client(thinking="high")
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return self._make_response("ok")
+
+        client.client.chat.completions.create = capture
+        client.ask([{"role": "user", "content": "q"}])
+        extra = captured.get("extra_body", {})
+        assert extra.get("think") == "high"
+        assert extra.get("reasoning_effort") == "high"
+
+    def test_thinking_false_maps_to_low_effort(self):
+        """thinking: false sends think=false; OpenAI's reasoning_effort (strings
+        only) gets "low" as the closest equivalent."""
+        client = self._make_client(thinking=False)
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return self._make_response("ok")
+
+        client.client.chat.completions.create = capture
+        client.ask([{"role": "user", "content": "q"}])
+        extra = captured.get("extra_body", {})
+        assert extra.get("think") is False
+        assert extra.get("reasoning_effort") == "low"
+
+    def test_thinking_string_aliases(self):
+        """String spellings normalise: "False"/"off"/"none" → False."""
+        for raw in ("False", "OFF", "none"):
+            client = self._make_client(thinking=raw)
+            assert client.thinking is False, f"{raw!r} should map to False"
+        client = self._make_client(thinking="HIGH")
+        assert client.thinking == "high"
+        client = self._make_client(thinking=True)
+        assert client.thinking is True
+
+    def test_thinking_omitted_when_unset(self):
+        """No thinking keys sent when thinking is unset/empty."""
+        for raw in (None, ""):
+            client = self._make_client(thinking=raw)
+            captured = {}
+
+            def capture(**kwargs):
+                captured.update(kwargs)
+                return self._make_response("ok")
+
+            client.client.chat.completions.create = capture
+            client.ask([{"role": "user", "content": "q"}])
+            assert "extra_body" not in captured
+
+
+# --- Eval quality-check tests ---
+
+
+class TestEvalQualityChecks:
+    """Tests for tests/eval_llm_responses.py check_response_quality."""
+
+    @staticmethod
+    def _check(question, response, context):
+        from tests.eval_llm_responses import check_response_quality
+
+        return check_response_quality(question, response, context)
+
+    def test_empty_response_is_infrastructure_failure(self):
+        from tests.eval_llm_responses import is_infrastructure_failure
+
+        assert is_infrastructure_failure("")
+        assert is_infrastructure_failure("(empty)")
+        assert is_infrastructure_failure("[ERROR: I'm busy, try again in a minute.]")
+        assert not is_infrastructure_failure("Pit now for fuel.")
+
+    def test_infrastructure_failure_not_scored(self):
+        """ERROR-wrapped and empty responses are excluded from model scoring."""
+        issues = self._check(
+            "When should I pit?", "[ERROR: I'm busy, try again in a minute.]", ""
+        )
+        assert issues == []
+
+    def test_margin_vs_range_confusion_detected(self):
+        """The 'only X laps margin' trap: margin is not total fuel remaining."""
+        context = (
+            "Fuel: 4.1 litres/22 litre tank. Burn approx 1.31 litres/lap, "
+            "range approx 3.2 laps.\n"
+            "!! Fuel tight: only 0.2 laps margin. conserve fuel."
+        )
+        issues = self._check(
+            "Any warnings I should know about?",
+            "Fuel is critical – you have only ~0.2 laps of fuel left, so you must conserve.",
+            context,
+        )
+        assert any("Margin-vs-range confusion" in i for i in issues)
+
+    def test_margin_vs_range_correct_answer_passes(self):
+        context = (
+            "Fuel: 4.1 litres/22 litre tank. Burn approx 1.31 litres/lap, "
+            "range approx 3.2 laps.\n"
+            "!! Fuel tight: only 0.2 laps margin. conserve fuel."
+        )
+        issues = self._check(
+            "Any warnings I should know about?",
+            "Fuel is critical—only ~0.2 laps margin, so conserve and stay out.",
+            context,
+        )
+        assert not any("Margin-vs-range" in i for i in issues)
+
+    def test_gap_vs_pace_confusion_detected(self):
+        """Calling the gap to the car behind a 'pace difference' is wrong."""
+        context = (
+            "Nearby (+ ahead, − behind):\n"
+            "  P10 (Nick Leep): -5.124s behind, last lap 2:27.669\n"
+        )
+        issues = self._check(
+            "Am I safe from the car behind?",
+            "You're safe – the car behind is 5.1s slower and can't close the gap.",
+            context,
+        )
+        assert any("Gap-vs-pace confusion" in i for i in issues)
+
+    def test_gap_vs_pace_correct_answer_passes(self):
+        context = (
+            "Nearby (+ ahead, − behind):\n"
+            "  P10 (Nick Leep): -5.124s behind, last lap 2:27.669\n"
+        )
+        issues = self._check(
+            "Am I safe from the car behind?",
+            "You're safe – P10 is 5.1s behind and lapping much slower.",
+            context,
+        )
+        assert not any("Gap-vs-pace" in i for i in issues)
+
+    def test_direction_inversion_detected(self):
+        """Describing a car ahead as behind (or vice versa) is flagged."""
+        context = (
+            "Nearby (+ ahead, − behind):\n"
+            "  P3 (Nik McCarter): +2.174s ahead, last lap 2:22.708\n"
+            "  P5 (Kim Berry): -1.023s behind, last lap 2:25.083\n"
+        )
+        issues = self._check(
+            "Should I use push-to-pass?",
+            "Yes — use push-to-pass now to defend P3 and attack P5.",
+            context,
+        )
+        # P3 is ahead (+2.174s) — you can't "defend" against it
+        assert any("Direction inversion" in i for i in issues)
+
+    def test_direction_inversion_correct_passes(self):
+        context = (
+            "Nearby (+ ahead, − behind):\n"
+            "  P3 (Nik McCarter): +2.174s ahead, last lap 2:22.708\n"
+            "  P5 (Kim Berry): -1.023s behind, last lap 2:25.083\n"
+        )
+        issues = self._check(
+            "Should I use push-to-pass?",
+            "No — save fuel; you're 2.174s behind P3 and P5 is 1.023s behind you.",
+            context,
+        )
+        assert not any("Direction inversion" in i for i in issues)
+
+    def test_refusal_phrase_flagged(self):
+        issues = self._check("How are we looking?", "I'm busy, try again later.", "")
+        assert any("Refusal" in i for i in issues)
+
+    def test_clean_response_no_issues(self):
+        context = (
+            "Fuel: 5.2 litres/22 litre tank. Burn approx 1.31 litres/lap, "
+            "range approx 4.0 laps."
+        )
+        issues = self._check(
+            "How many laps of fuel left?", "Approximately 4 laps of fuel left.", context
+        )
+        assert issues == []
+
+
+class TestChatMacroManager:
+    """Tests for ChatMacroManager — config parsing, app.ini validation,
+    [CMD:] tag extraction, and macro firing."""
+
+    CONFIG = {
+        "chat_macros": {
+            "actions": {
+                "clear_black_flag": {
+                    "macro": 15,
+                    "command": "!clearall",
+                    "description": "Clears your black flags",
+                },
+                "pitting_in": {
+                    "macro": 1,
+                    "command": "Pitting In",
+                    "description": "Tells the field you're pitting",
+                },
+            }
+        }
+    }
+
+    def _manager(self, config=None):
+        from chat_macros import ChatMacroManager
+
+        return ChatMacroManager(config if config is not None else self.CONFIG)
+
+    def test_parses_configured_actions(self):
+        m = self._manager()
+        assert m.enabled
+        assert "clear_black_flag" in m.actions
+        assert m.actions["clear_black_flag"]["macro"] == 15
+        assert m.actions["pitting_in"]["macro"] == 1
+
+    def test_empty_config_disables(self):
+        m = self._manager({})
+        assert not m.enabled
+        assert m.actions == {}
+
+    def test_invalid_macro_number_dropped(self):
+        config = {
+            "chat_macros": {
+                "actions": {
+                    "bad_zero": {"macro": 0, "command": "x"},
+                    "bad_high": {"macro": 16, "command": "x"},
+                    "bad_str": {"macro": "five", "command": "x"},
+                    "good": {"macro": 3, "command": "x"},
+                }
+            }
+        }
+        m = self._manager(config)
+        assert list(m.actions) == ["good"]
+
+    def test_parse_response_extracts_and_strips_tags(self):
+        m = self._manager()
+        clean, actions = m.parse_response(
+            "Clearing your flags now. [CMD:clear_black_flag]"
+        )
+        assert actions == ["clear_black_flag"]
+        assert clean == "Clearing your flags now."
+        assert "[CMD" not in clean
+
+    def test_parse_response_multiple_tags(self):
+        m = self._manager()
+        clean, actions = m.parse_response(
+            "[CMD:clear_black_flag] [CMD:pitting_in] Boxing this lap."
+        )
+        assert actions == ["clear_black_flag", "pitting_in"]
+        assert clean == "Boxing this lap."
+
+    def test_parse_response_unknown_action_dropped(self):
+        m = self._manager()
+        clean, actions = m.parse_response("Doing it. [CMD:make_tea]")
+        assert actions == []
+        assert clean == "Doing it."
+
+    def test_parse_response_no_tags_unchanged(self):
+        m = self._manager()
+        clean, actions = m.parse_response("Stay out for two more laps.")
+        assert actions == []
+        assert clean == "Stay out for two more laps."
+
+    def test_parse_response_empty_text(self):
+        m = self._manager()
+        clean, actions = m.parse_response("")
+        assert clean == ""
+        assert actions == []
+
+    def test_fire_log_only_without_client(self):
+        # iracing_client=None (replay/tests) — logs intent, returns True
+        m = self._manager()
+        assert m.fire("clear_black_flag") is True
+        assert m.fire("nonexistent") is False
+
+    def test_fire_sends_macro_via_client(self):
+        m = self._manager()
+
+        class FakeClient:
+            def __init__(self):
+                self.sent = []
+
+            def send_chat_macro(self, macro_num):
+                self.sent.append(macro_num)
+
+        client = FakeClient()
+        assert m.fire("clear_black_flag", iracing_client=client) is True
+        assert client.sent == [15]
+
+    def test_available_actions_prompt_lists_all(self):
+        m = self._manager()
+        prompt = m.available_actions_prompt()
+        assert "clear_black_flag" in prompt
+        assert "pitting_in" in prompt
+        assert "[CMD:clear_black_flag]" in prompt  # example tag included
+        assert "Never invent command names" in prompt
+
+    def test_available_actions_prompt_empty_when_disabled(self):
+        m = self._manager({})
+        assert m.available_actions_prompt() == ""
+
+    def test_validate_against_app_ini_matching(self, tmp_path):
+        app_ini = tmp_path / "app.ini"
+        app_ini.write_text(
+            "[Autochat Messages]\nAutoChatStr1=Pitting In$\nAutoChatStr15=!clearall$\n",
+            encoding="utf-8",
+        )
+        config = {
+            "chat_macros": {
+                "app_ini_path": str(app_ini),
+                "actions": self.CONFIG["chat_macros"]["actions"],
+            }
+        }
+        m = self._manager(config)
+        assert m.validate_against_app_ini(config) == []
+
+    def test_validate_against_app_ini_mismatch(self, tmp_path):
+        app_ini = tmp_path / "app.ini"
+        app_ini.write_text(
+            "[Autochat Messages]\nAutoChatStr15=Wrong command$\n",
+            encoding="utf-8",
+        )
+        config = {
+            "chat_macros": {
+                "app_ini_path": str(app_ini),
+                "actions": self.CONFIG["chat_macros"]["actions"],
+            }
+        }
+        m = self._manager(config)
+        warnings = m.validate_against_app_ini(config)
+        assert any("Wrong command" in w for w in warnings)
+
+    def test_validate_missing_app_ini(self, tmp_path):
+        config = {
+            "chat_macros": {
+                "app_ini_path": str(tmp_path / "nonexistent.ini"),
+                "actions": self.CONFIG["chat_macros"]["actions"],
+            }
+        }
+        m = self._manager(config)
+        warnings = m.validate_against_app_ini(config)
+        assert any("not found" in w for w in warnings)
+
+    def test_validate_handles_inline_comments(self, tmp_path):
+        # app.ini has "; comment" suffixes — parser must strip them
+        app_ini = tmp_path / "app.ini"
+        app_ini.write_text(
+            "[Autochat Messages]\n"
+            "AutoChatStr1=Pitting In$          ; autochat message\n"
+            "AutoChatStr15=!clearall$          ; autochat message\n",
+            encoding="utf-8",
+        )
+        config = {
+            "chat_macros": {
+                "app_ini_path": str(app_ini),
+                "actions": self.CONFIG["chat_macros"]["actions"],
+            }
+        }
+        m = self._manager(config)
+        assert m.validate_against_app_ini(config) == []
+
+
+class TestChatMacroPromptInjection:
+    """Tests for chat macros block injection into the system prompt."""
+
+    def _builder_with_macros(self):
+        from chat_macros import ChatMacroManager
+
+        config = {
+            "prompt": {"system": "Race engineer. Be brief."},
+            "chat_macros": {
+                "actions": {
+                    "clear_black_flag": {
+                        "macro": 15,
+                        "command": "!clearall",
+                        "description": "Clears your black flags",
+                    }
+                }
+            },
+        }
+        builder = ContextBuilder(config)
+        manager = ChatMacroManager(config)
+        builder.set_chat_macros(manager)
+        return builder
+
+    def _state(self):
+        return make_state().get_snapshot()
+
+    def test_system_prompt_contains_actions_block(self):
+        builder = self._builder_with_macros()
+        messages = builder.build_prompt(self._state(), question="clear my flags")
+        system = messages[0]["content"]
+        assert "clear_black_flag" in system
+        assert "[CMD:clear_black_flag]" in system
+
+    def test_system_prompt_without_macros_unchanged(self):
+        builder = ContextBuilder({"prompt": {"system": "Race engineer. Be brief."}})
+        messages = builder.build_prompt(self._state(), question="hello")
+        assert messages[0]["content"] == "Race engineer. Be brief."

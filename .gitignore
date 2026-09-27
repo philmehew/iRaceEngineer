@@ -28,3 +28,6 @@ logs/
 
 # Piper voice models (large .onnx files)
 voices/
+
+# Config (contains API key — use config.yaml.example as template)
+config.yaml

@@ -623,11 +623,14 @@ class CarBehindClosingDetector:
         self._ema_fast = self._ema_fast + alpha_fast * (gap_metres - self._ema_fast)
         self._ema_slow = self._ema_slow + alpha_slow * (gap_metres - self._ema_slow)
 
-        logger.debug(
-            f"Car behind: gap={gap_seconds:.1f}s ({gap_metres:.1f}m), "
-            f"ema_fast={self._ema_fast:.1f}m, ema_slow={self._ema_slow:.1f}m, "
-            f"trend={(self._ema_slow - self._ema_fast) / self._ema_slow_tau:.3f}m/s"
-        )
+        # Lazy formatting — this runs every tick a car is behind, so avoid
+        # building the string when debug logging is off
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"Car behind: gap={gap_seconds:.1f}s ({gap_metres:.1f}m), "
+                f"ema_fast={self._ema_fast:.1f}m, ema_slow={self._ema_slow:.1f}m, "
+                f"trend={(self._ema_slow - self._ema_fast) / self._ema_slow_tau:.3f}m/s"
+            )
 
     def should_alert(self, current_time: float | None = None) -> bool:
         """Whether a 'car behind closing' alert should fire this tick.
@@ -979,7 +982,7 @@ class Spotter:
 
         # Flag state: track previous flags for transition detection
         self._prev_flags: int | None = None  # None = first tick not yet processed
-        self._race_started: bool = False  # True when SessionState >= 3
+        self._race_started: bool = False  # True when SessionState >= 4
         self._first_lap_completed: bool = (
             False  # True after first lap completed (suppresses blue flag at race start)
         )
@@ -1042,7 +1045,7 @@ class Spotter:
             session_flags: iRacing SessionFlags bitmask for flag transition detection.
             session_state: iRacing SessionState value.
                 1=GetInCar, 2=ParadeLaps, 3=Racing, 4=Checkered, 5=CoolDown.
-                Used to derive _race_started (state >= 3 means race is on).
+                Used to derive _race_started (state >= 4 means race is on).
             incidents: Player's incident points (1x, 2x, 4x). Alert fires on increases.
             on_pit_road: iRacing OnPitRoad boolean. Alert fires on transitions
                 (entering or exiting pit road).
@@ -1082,16 +1085,17 @@ class Spotter:
             self._first_lap_completed = True
 
         # --- Session state: lights-out detection + race started ---
-        # iRacing SessionState: 1=GetInCar, 2=ParadeLaps, 3=Racing,
-        # 4=Checkered, 5=CoolDown.
-        # - 2→3 transition = lights out (race goes from parade to racing)
-        # - State >= 3 = race is on (sets _race_started for pit/blue alerts)
-        # - State drops to 1-2 = new session (clears _race_started)
+        # iRacing SessionState (pyirsdk SessionState enum):
+        # 0=Invalid, 1=GetInCar, 2=Warmup, 3=ParadeLaps, 4=Racing,
+        # 5=Checkered, 6=CoolDown.
+        # - 3→4 transition = lights out (parade laps → racing)
+        # - State >= 4 = race is on (sets _race_started for pit/blue alerts)
+        # - State drops to 1-3 = new session (clears _race_started)
         # Fallback: if session_state is 0 (not provided), check green flag.
         if self._prev_session_state is None:
             # First tick — prime state
             self._prev_session_state = session_state
-            if session_state >= 3:
+            if session_state >= 4:
                 self._race_started = True
                 logger.info(
                     f"Session state primed: {session_state} (race already started)"
@@ -1102,20 +1106,20 @@ class Spotter:
             else:
                 logger.info(f"Session state primed: {session_state}")
         elif session_state != self._prev_session_state:
-            if self._prev_session_state in (1, 2) and session_state >= 3:
-                # Lights out! GetInCar/ParadeLaps → Racing (or Checkered/CoolDown
-                # in some race formats that skip state 3)
+            if self._prev_session_state in (1, 2, 3) and session_state >= 4:
+                # Lights out! GetInCar/Warmup/ParadeLaps → Racing (or
+                # Checkered/CoolDown in some race formats that skip state 4)
                 self._race_started = True
                 self._player.play("lights_out")
                 logger.info(
                     f"Lights out! (SessionState {self._prev_session_state} → {session_state})"
                 )
-            elif session_state >= 1 and session_state <= 2 and self._race_started:
+            elif session_state >= 1 and session_state <= 3 and self._race_started:
                 # Dropped back to pre-race — new session
                 self._race_started = False
                 logger.info(f"Session state reset: {session_state} (new session)")
-            elif session_state >= 3 and not self._race_started:
-                # Joined mid-race at state >= 3 (not via 2→3 transition)
+            elif session_state >= 4 and not self._race_started:
+                # Joined mid-race at state >= 4 (not via 3→4 transition)
                 self._race_started = True
                 logger.info(f"Race already started (SessionState={session_state})")
             self._prev_session_state = session_state
@@ -1311,11 +1315,21 @@ class Spotter:
             )
             # Check if the car behind is on pit road
             car_behind_on_pit = getattr(self, "_car_behind_on_pit_road", False)
+            # Pace reference for the slower-chaser veto: use the player's
+            # LAST lap (current pace) when available — a chaser doing 92.5s
+            # laps IS genuinely closing on a player currently pacing 95s on
+            # old tyres, even if the player's best is 91.0s. Comparing
+            # against best-ever pace vetoed almost all real alerts.
+            player_pace = (
+                player_last_lap_time
+                if player_last_lap_time > 0
+                else player_best_lap_time
+            )
             self._car_behind_tracker.update(
                 gap_seconds=abs_gap,
                 gap_metres=car_behind_gap_metres,
                 car_on_pit_road=car_behind_on_pit,
-                player_best_lap_time=player_best_lap_time,
+                player_best_lap_time=player_pace,
                 car_behind_lap_time=car_behind_lap_time,
                 is_yellow=is_yellow,
                 current_time=now,
@@ -1360,7 +1374,7 @@ class Spotter:
         self._prev_flags = None
         # _race_started will be re-derived from SessionState on the next
         # tick, so it's correct regardless of whether we reconnect mid-race
-        # (state >= 3 → True immediately) or between sessions (state 1-2 → False).
+        # (state >= 4 → True immediately) or between sessions (state 1-3 → False).
         self._race_started = False
         self._first_lap_completed = False
         self._prev_session_state = None

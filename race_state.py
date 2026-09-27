@@ -10,6 +10,7 @@ Architecture:
 """
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 
@@ -292,6 +293,11 @@ class SectorTimeTracker:
             try:
                 pct = float(pct)
             except (TypeError, ValueError):
+                continue
+            if math.isnan(pct):
+                # NaN passes float() but fails every comparison below —
+                # without this guard it poisons the car's prev_lap_dist_pct
+                # for the rest of the session (no boundary is ever detected)
                 continue
 
             surface = track_surfaces[i] if i < len(track_surfaces) else 0
@@ -666,6 +672,10 @@ class RaceState:
         # Telemetry units (populated from iRacing VarHeader.unit each tick)
         self._telemetry_units: dict[str, str] = {}
 
+        # Last session-info payload processed by _update_session — lets us
+        # skip re-parsing static WeekendInfo/DriverInfo data on every tick
+        self._last_session_info: dict | None = None
+
         # Driver name lookup (set by main from iracing_client)
         self._driver_names: dict[int, str] = {}
 
@@ -701,6 +711,27 @@ class RaceState:
             else:
                 self._teammate_real_names[idx] = ""
 
+    def reset(self):
+        """Reset session-scoped state for a new iRacing session.
+
+        Called on reconnect (or when a new session loads) so stale lap
+        history, fuel baselines, and calibration data from the previous
+        session don't contaminate the new one. Team indices / driver names
+        are NOT cleared — re-set them via set_team_indices()/set_driver_names().
+        """
+        self.player = DriverState(car_idx=0, driver_name="Player")
+        self.nearby_cars = []
+        self.standings = []
+        self.sector_tracker = SectorTimeTracker()
+        self._last_lap_completed = -1
+        self._last_lap = -1
+        self._fuel_at_lap_start = 0.0
+        self._was_on_pit_road = False
+        self._prev_tyre_values = None
+        self._last_update_time = 0.0
+        self._last_session_info = None
+        logger.info("Race state reset for new session")
+
     def update(
         self,
         telemetry: dict,
@@ -718,6 +749,11 @@ class RaceState:
             driver_names: Optional mapping of car_idx -> driver name.
             units: Optional dict of telemetry variable name -> iRacing unit
                 string (e.g. 'kPa', 'degC', 'm'). Used for unit conversion.
+
+        Returns:
+            False if the session just ended/reset (state is frozen at the
+            last known values — callers should skip per-tick consumers like
+            the spotter), True otherwise.
         """
         if driver_names:
             self._driver_names = driver_names
@@ -736,7 +772,7 @@ class RaceState:
         if new_lap == 0 and self._last_lap > 0:
             # Session ended / reset — keep last known state, don't process
             # the zeroed-out telemetry that iRacing sends after the chequered.
-            return
+            return False
 
         # Update session state
         self._update_session(telemetry, session_info)
@@ -761,14 +797,21 @@ class RaceState:
 
         # Check for lap completion (to record lap history)
         self._check_lap_completion(telemetry)
+        return True
 
     def _update_session(self, telemetry: dict, session_info: dict):
         """Update session-level state from telemetry and parsed session info."""
         self.session.flags = int(telemetry.get("SessionFlags", 0))
-        # Merge per-driver flags (black, disqualify, repair) from CarIdxSessionFlags
-        player_idx = telemetry.get("PlayerCarIdx", 0)
+        # Merge per-driver flags (black, disqualify, repair) from CarIdxSessionFlags.
+        # Default -1 (no player) — a default of 0 would merge car 0's flags
+        # into the player's during session transitions.
+        player_idx = telemetry.get("PlayerCarIdx", -1)
         car_idx_flags = telemetry.get("CarIdxSessionFlags", [])
-        if isinstance(car_idx_flags, list) and 0 <= player_idx < len(car_idx_flags):
+        if (
+            isinstance(car_idx_flags, list)
+            and isinstance(player_idx, int)
+            and 0 <= player_idx < len(car_idx_flags)
+        ):
             self.session.flags |= int(car_idx_flags[player_idx])
         self.session.laps_remain = int(telemetry.get("SessionLapsRemain", 0))
         self.session.time_remain = float(telemetry.get("SessionTimeRemain", 0.0))
@@ -789,8 +832,11 @@ class RaceState:
         self.session.wind_vel = float(telemetry.get("WindVel", 0.0))
         self.session.skies = int(telemetry.get("Skies", 0))
 
-        # From session info (less frequent updates)
-        if session_info:
+        # From session info (static per session — re-parse only when the
+        # session info payload actually changes, not every tick; iracing_client
+        # hands us the same cached dict object between session-info updates)
+        if session_info and session_info is not self._last_session_info:
+            self._last_session_info = session_info
             weekend = session_info.get("WeekendInfo", {})
             self.session.track_name = weekend.get("TrackName", self.session.track_name)
             self.session.track_config = weekend.get(
@@ -1173,16 +1219,28 @@ class RaceState:
 
             # Compute gap in seconds (based on lap distance difference)
             # Lap distance difference gives a fraction of a lap; convert to
-            # seconds using the player's best lap time as the reference.
+            # seconds using the best available lap-time estimate. Prefer the
+            # session's estimated lap time (track-accurate), then the
+            # player's last lap (current pace), then best lap. The old
+            # hardcoded 90s fallback badly understated gaps at long tracks
+            # like Spa (~146s laps).
             other_lap_dist = entry["lap_dist_pct"]
             other_lap = entry["lap"]
             gap_laps = (other_lap + other_lap_dist) - (
                 self.player.lap + player_lap_dist_pct
             )
-            ref_lap_time = (
-                self.player.best_lap_time if self.player.best_lap_time > 0 else 90.0
-            )
-            gap = gap_laps * ref_lap_time
+            ref_lap_time = 0.0
+            if 0 < self.session.est_lap_time < 600:
+                ref_lap_time = self.session.est_lap_time
+            elif self.player.last_lap_time > 0:
+                ref_lap_time = self.player.last_lap_time
+            elif self.player.best_lap_time > 0:
+                ref_lap_time = self.player.best_lap_time
+            if ref_lap_time <= 0:
+                # No reference available — skip gap computation
+                gap = 0.0
+            else:
+                gap = gap_laps * ref_lap_time
 
             if abs(entry["position"] - self.player.position) <= max_nearby:
                 car = DriverState(

@@ -7,15 +7,17 @@ iracing:
 # LLM API (OpenAI-compatible — works with Ollama Cloud, OpenAI, LM Studio, etc.)
 llm:
   base_url: "https://ollama.com/v1"         # Ollama Cloud endpoint
-  api_key_env: "2d037788fae94179ba526b56ec4f1dea.J6EUKATFFsHZMzykGG_cVfog"            # Reads from environment variable
-  #model: "ministral-3:14b-cloud"
-  model: "gemma4:31b-cloud"
-  #base_url: "http://192.168.0.117:8006/v1/"
-  #api_key_env: ""
-  #model: "qwen3-8b"
+  api_key_env: "OLLAMA_API_KEY"   # Env var name, or paste the key directly
+  model: "glm-5.3"
   max_tokens: 1024
   temperature: 0.3
   timeout: 5.0                             # Seconds to wait for LLM response before giving up
+  retries: 2                                # Retry attempts for transient errors (rate limits, overload)
+  retry_backoff: 1.0                        # Base delay between retries (seconds, scales per attempt)
+  thinking: false                           # false | true | "low" | "medium" | "high" — thinking-model
+                                            # reasoning control (Ollama "think" / OpenAI "reasoning_effort").
+                                            # false = fastest replies; "high" = deep analysis.
+                                            # Unset/empty = model default (don't send anything).
 
 # Team identification — how to recognise your teammates
 # AUTO-DETECT (default): iRacing assigns each driver a TeamName in session info.
@@ -47,30 +49,50 @@ team:
 
 
 # Voice input/output (requires: uv sync)
+# Each service has a "backend" switch plus symmetric "local:" / "remote:"
+# blocks. Shared keys (mic/speaker settings) live at the service level — audio
+# capture and playback always happen on THIS machine, whichever backend runs.
 voice:
   stt:
     enabled: true
-    model: "small"                    # Whisper model: tiny, small, medium, large-v3, turbo, distil-large-v3
-    device: "cuda"                    # cuda or cpu — use "cpu" if iRacing stutters when Whisper runs (GPU contention)
-    compute_type: "float16"          # float16 (GPU), int8 (CPU/GPU), int8_float16
-    input_device: 1                # null = system default, or device name/index
+    backend: "local"                  # "local" (faster-whisper here) | "remote" (speaches on Strix Halo)
+    # --- shared (both backends: mic capture stays local) ---
+    input_device: 1                   # null = system default, or device name/index
     input_gain: 1.0                   # Mic input gain multiplier (1.0 = no boost, 2.0 = 2x louder)
-    vad_filter: true                  # Use Silero VAD to trim silence from recordings
-    language: "en"                     # Language hint for Whisper
+    language: "en"                    # Language hint for Whisper
+    # --- local backend ---
+    local:
+      model: "small"                  # Whisper model: tiny, small, medium, large-v3, turbo, distil-large-v3
+      device: "cuda"                  # cuda or cpu — use "cpu" if iRacing stutters when Whisper runs (GPU contention)
+      compute_type: "float16"         # float16 (GPU), int8 (CPU/GPU), int8_float16
+      vad_filter: true                # Use Silero VAD to trim silence from recordings
+    # --- remote backend ---
+    remote:
+      base_url: "http://192.168.0.117:9000"      # speaches endpoint
+      model: "Systran/faster-whisper-small"       # model served by speaches
+      timeout: 30.0                   # Seconds; server runs realtime-ish on 32 threads
 
   tts:
     enabled: true
-    model: "en_GB-northern_english_male-medium"         # Piper voice model name
-    voice_dir: "voices"               # Where voice .onnx files are stored
-    use_cuda: true                    # GPU acceleration for Piper (requires onnxruntime-gpu)
+    backend: "local"                  # "local" (Piper here) | "remote" (Kokoro on Strix Halo)
+    # --- shared (both backends: playback stays local) ---
     output_device: null               # null = system default, or device name/index
-    volume: 1.0                        # Volume multiplier
-    sentence_silence: 0.2             # Seconds of silence between sentences
+    volume: 1.0                       # Volume multiplier (1.0 = normal; >1.0 clips safely)
+    # --- local backend ---
+    local:
+      model: "en_GB-northern_english_male-medium"   # Piper voice model name
+      voice_dir: "voices"             # Where voice .onnx files are stored
+      use_cuda: true                  # GPU acceleration for Piper (requires onnxruntime-gpu)
+    # --- remote backend ---
+    remote:
+      base_url: "http://192.168.0.117:8880"        # Kokoro-FastAPI endpoint
+      voice: "bm_fable"               # bm_daniel | bm_fable | bm_george | bm_lewis
+      timeout: 30.0                   # Seconds
 
   trigger:
     device_index: 0              # Joystick device index (use test_wheel.py to find)
     button_index: 9              # Button index on device (use test_wheel.py to find)
-    push_to_talk: true                # true = hold button to record, release to stop (like radio PTT)
+    # PTT is always hold-to-talk: hold button = record, release = transcribe
     max_record_seconds: 15           # Safety: auto-stop recording after this
 
 # Spotter — real-time audio calls for car proximity and track events
@@ -121,14 +143,19 @@ spotter:
 # Prompt configuration
 prompt:
   system: |
-    Race engineer. ONE sentence max. Be brief.
+    Race engineer. Race questions: ONE sentence max. Be brief.
+    Off-topic small talk (weather banter, other drivers, general chat):
+    answer naturally, still keep it to 2-3 sentences max.
     Never invent data. Trust STALE/frozen labels.
+    Prior Q&A is conversation memory only — figures in it are outdated;
+    always use the current snapshot for any number.
   context_depth: "full"       # "minimal", "medium", or "full"
   # minimal: position, fuel, laps remaining only
   # medium: + gaps, tyre temps, flags
   # full:   + lap time trends, nearby cars, pit window estimate, weather, damage
   include_lap_history: 5     # How many recent laps to include (full depth only)
   include_nearby_cars: 3     # How many nearby cars to report (full depth only)
+  qa_history_max: 3          # Past Q&A exchanges kept for follow-up questions (0 = off, stateless)
 
 # State tracking
 state:
@@ -148,6 +175,21 @@ state:
   #   oil_press:
   #     normal_low: 3.0
   #     normal_high: 5.0
+
+# Chat macro actions — commands the LLM can execute for the driver.
+# iRacing's SDK can fire chat macros (AutoChatStr1-15 in app.ini) but not
+# arbitrary chat text, so each action maps to a macro slot whose content
+# carries the actual chat command. Set the slot in the sim (Options -> Chat);
+# a trailing "$" in the macro text makes iRacing auto-transmit it.
+# When you ask the race engineer to do something ("clear my black flag"),
+# the LLM includes [CMD:<action>] in its reply and the macro fires.
+chat_macros:
+  # app_ini_path: "C:/Users/phil/Documents/iRacing/app.ini"  # null = auto-detect
+  actions:
+    clear_black_flag:
+      macro: 1                  # AutoChatStr slot to fire (1-15)
+      command: "!clearall$"      # expected slot content — validated against app.ini at startup
+      description: "Clears your black flags (works where you have admin rights)"
 
 # Capture/replay test mode
 capture:

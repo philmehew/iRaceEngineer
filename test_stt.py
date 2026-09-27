@@ -11,6 +11,7 @@ Usage:
     python test_stt.py --model small            # Use "small" Whisper model
     python test_stt.py --push-to-talk            # Press Enter to start/stop recording
     python test_stt.py --duration 10            # Record for 10 seconds
+    python test_stt.py --remote                 # Use the Strix Halo remote STT backend
 """
 
 import argparse
@@ -21,6 +22,39 @@ import threading
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+
+
+def _build_config(
+    remote: bool,
+    model: str = "small",
+    device: int | None = None,
+    language: str = "en",
+    vad: bool = True,
+    gain: float = 1.0,
+    remote_url: str = "http://192.168.0.117:9000",
+) -> dict:
+    """Build a voice.stt config for either the local or remote backend."""
+    stt: dict[str, object] = {
+        "input_device": device,
+        "input_gain": gain,
+        "language": language,
+    }
+    if remote:
+        stt["backend"] = "remote"
+        stt["remote"] = {
+            "base_url": remote_url,
+            "model": "Systran/faster-whisper-small",
+            "timeout": 30.0,
+        }
+    else:
+        stt["backend"] = "local"
+        stt["local"] = {
+            "model": model,
+            "device": "cpu",
+            "compute_type": "int8",
+            "vad_filter": vad,
+        }
+    return {"voice": {"stt": stt}}
 
 
 def list_devices():
@@ -64,29 +98,28 @@ def test_fixed_duration(
     language: str = "en",
     vad: bool = True,
     gain: float = 1.0,
+    remote: bool = False,
+    remote_url: str = "http://192.168.0.117:9000",
 ):
     """Record for a fixed duration and transcribe."""
-    config = {
-        "voice": {
-            "stt": {
-                "model": model,
-                "device": "cpu",
-                "compute_type": "int8",
-                "input_device": device,
-                "input_gain": gain,
-                "vad_filter": vad,
-                "language": language,
-            }
-        }
-    }
+    config = _build_config(
+        remote=remote,
+        model=model,
+        device=device,
+        language=language,
+        vad=vad,
+        gain=gain,
+        remote_url=remote_url,
+    )
 
-    from stt_client import STTClient
+    from voice_clients import create_stt_client
 
-    stt = STTClient(config)
+    stt = create_stt_client(config)
 
     if not stt.is_available:
         print(
-            "ERROR: faster-whisper not available. Install with: uv pip install -e '.[voice]'"
+            "ERROR: STT backend unavailable. For local: uv pip install -e '.[voice]'. "
+            "For remote: check base_url in --remote-url."
         )
         return
 
@@ -107,29 +140,28 @@ def test_push_to_talk(
     vad: bool = True,
     max_duration: float = 15.0,
     gain: float = 1.0,
+    remote: bool = False,
+    remote_url: str = "http://192.168.0.117:9000",
 ):
     """Push-to-talk: press Enter to start recording, press Enter again to stop."""
-    config = {
-        "voice": {
-            "stt": {
-                "model": model,
-                "device": "cpu",
-                "compute_type": "int8",
-                "input_device": device,
-                "input_gain": gain,
-                "vad_filter": vad,
-                "language": language,
-            }
-        }
-    }
+    config = _build_config(
+        remote=remote,
+        model=model,
+        device=device,
+        language=language,
+        vad=vad,
+        gain=gain,
+        remote_url=remote_url,
+    )
 
-    from stt_client import STTClient
+    from voice_clients import create_stt_client
 
-    stt = STTClient(config)
+    stt = create_stt_client(config)
 
     if not stt.is_available:
         print(
-            "ERROR: faster-whisper not available. Install with: uv pip install -e '.[voice]'"
+            "ERROR: STT backend unavailable. For local: uv pip install -e '.[voice]'. "
+            "For remote: check base_url in --remote-url."
         )
         return
 
@@ -209,6 +241,16 @@ def main():
         default=15.0,
         help="Maximum recording duration for push-to-talk (default: 15s)",
     )
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Use the remote STT backend (speaches on Strix Halo) instead of local faster-whisper",
+    )
+    parser.add_argument(
+        "--remote-url",
+        default="http://192.168.0.117:9000",
+        help="Remote STT base URL (default: http://192.168.0.117:9000)",
+    )
 
     args = parser.parse_args()
 
@@ -224,6 +266,8 @@ def main():
             vad=not args.no_vad,
             max_duration=args.max_duration,
             gain=args.gain,
+            remote=args.remote,
+            remote_url=args.remote_url,
         )
     else:
         test_fixed_duration(
@@ -233,6 +277,8 @@ def main():
             language=args.language,
             vad=not args.no_vad,
             gain=args.gain,
+            remote=args.remote,
+            remote_url=args.remote_url,
         )
 
 

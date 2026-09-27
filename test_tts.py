@@ -13,6 +13,7 @@ Usage:
     python test_tts.py --download en_GB-alan-medium        # Download a voice model
     python test_tts.py --file response.txt                 # Speak contents of file
     python test_tts.py --wav out.wav "Box this lap"        # Write to WAV (no playback)
+    python test_tts.py --remote "Box this lap"             # Use Strix Halo remote TTS (Kokoro)
 """
 
 import argparse
@@ -129,37 +130,46 @@ def speak_text(
     use_cuda: bool = True,
     volume: float = 1.0,
     wav_path: str | None = None,
+    remote: bool = False,
+    remote_voice: str = "bm_fable",
+    remote_url: str = "http://192.168.0.117:8880",
 ):
-    """Synthesize and speak text using Piper TTS.
+    """Synthesize and speak text using Piper TTS (local) or Kokoro (remote).
 
     If wav_path is set, writes audio to a WAV file instead of playing it.
     """
-    config = {
-        "voice": {
-            "tts": {
-                "model": model,
-                "voice_dir": voice_dir,
-                "use_cuda": use_cuda,
-                "output_device": device,
-                "volume": volume,
-            }
+    tts: dict[str, object] = {"output_device": device, "volume": volume}
+    if remote:
+        tts["backend"] = "remote"
+        tts["remote"] = {
+            "base_url": remote_url,
+            "voice": remote_voice,
+            "timeout": 30.0,
         }
-    }
+    else:
+        tts["backend"] = "local"
+        tts["local"] = {
+            "model": model,
+            "voice_dir": voice_dir,
+            "use_cuda": use_cuda,
+        }
+    config = {"voice": {"tts": tts}}
 
-    from tts_client import TTSClient
+    from voice_clients import create_tts_client
 
-    tts = TTSClient(config)
+    tts_client = create_tts_client(config)
 
-    if not tts.is_available:
+    if not tts_client.is_available:
         print(
-            "ERROR: Piper TTS not available. Install with: uv pip install -e '.[voice]'"
+            "ERROR: TTS backend unavailable. For local: uv pip install -e '.[voice]'. "
+            "For remote: check base_url in --remote-url."
         )
         return
 
     if wav_path:
-        audio, sample_rate = tts.synthesize(text)
+        audio, sample_rate = tts_client.synthesize(text)
         if audio.size == 0:
-            print("ERROR: Piper produced no audio")
+            print("ERROR: TTS produced no audio")
             return
         import wave
 
@@ -175,11 +185,14 @@ def speak_text(
         )
     else:
         print(f'🗣️  Speaking: "{text}"')
-        print(f"   Model: {model}")
-        if device is not None:
-            print(f"   Device: {device}")
+        if remote:
+            print(f"   Backend: remote ({remote_url}, voice={remote_voice})")
+        else:
+            print(f"   Model: {model}")
+            if device is not None:
+                print(f"   Device: {device}")
 
-        tts.speak(text)
+        tts_client.speak(text)
         print("✅ Done")
 
 
@@ -245,6 +258,21 @@ def main():
         default=1.0,
         help="Volume multiplier (default: 1.0)",
     )
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Use the remote TTS backend (Kokoro on Strix Halo) instead of local Piper",
+    )
+    parser.add_argument(
+        "--remote-voice",
+        default="bm_fable",
+        help="Remote TTS voice (default: bm_fable)",
+    )
+    parser.add_argument(
+        "--remote-url",
+        default="http://192.168.0.117:8880",
+        help="Remote TTS base URL (default: http://192.168.0.117:8880)",
+    )
 
     args = parser.parse_args()
 
@@ -293,6 +321,9 @@ def main():
         use_cuda=not args.no_cuda,
         volume=args.volume,
         wav_path=args.wav,
+        remote=args.remote,
+        remote_voice=args.remote_voice,
+        remote_url=args.remote_url,
     )
 
 
