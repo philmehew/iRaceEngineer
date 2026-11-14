@@ -24,9 +24,9 @@ if sys.platform == "win32":
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from race_state import RaceState
-from context_builder import ContextBuilder
-from llm_client import LLMClient
+from modules.race_state import RaceState
+from modules.context_builder import ContextBuilder
+from modules.llm_client import LLMClient
 
 # --- Questions to cycle through, designed to test different data areas ---
 

@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from remote_stt_client import encode_wav
+from modules.remote_stt_client import encode_wav
 
 
 class TestEncodeWav:
@@ -44,18 +44,18 @@ class TestEncodeWav:
 
 class TestVoiceClients:
     def test_default_backend_is_local(self):
-        from voice_clients import create_stt_client, create_tts_client
-        from stt_client import STTClient
-        from tts_client import TTSClient
+        from modules.voice_clients import create_stt_client, create_tts_client
+        from modules.stt_client import STTClient
+        from modules.tts_client import TTSClient
 
         config = {"voice": {"stt": {}, "tts": {}}}
         assert isinstance(create_stt_client(config), STTClient)
         assert isinstance(create_tts_client(config), TTSClient)
 
     def test_remote_backend_selected(self):
-        from voice_clients import create_stt_client, create_tts_client
-        from remote_stt_client import RemoteSTTClient
-        from remote_tts_client import RemoteTTSClient
+        from modules.voice_clients import create_stt_client, create_tts_client
+        from modules.remote_stt_client import RemoteSTTClient
+        from modules.remote_tts_client import RemoteTTSClient
 
         config = {
             "voice": {
@@ -74,7 +74,7 @@ class TestVoiceClients:
 
     def test_local_client_reads_nested_config(self):
         """Local clients read backend keys from 'local:' when present."""
-        from voice_clients import create_stt_client, create_tts_client
+        from modules.voice_clients import create_stt_client, create_tts_client
 
         config = {
             "voice": {
@@ -97,7 +97,7 @@ class TestVoiceClients:
 
     def test_local_client_falls_back_to_flat_config(self):
         """Backward compat: flat (non-nested) config still works."""
-        from voice_clients import create_stt_client, create_tts_client
+        from modules.voice_clients import create_stt_client, create_tts_client
 
         config = {
             "voice": {

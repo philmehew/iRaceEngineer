@@ -31,3 +31,6 @@ voices/
 
 # Config (contains API key — use config.yaml.example as template)
 config.yaml
+
+# Plan review extension workspace (local scratch, not source)
+.pi/

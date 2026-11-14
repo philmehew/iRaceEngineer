@@ -5,18 +5,22 @@ Tests speech-to-text independently from the main iRaceEngineer pipeline.
 Use this to verify mic capture, Whisper model setup, and transcription quality.
 
 Usage:
-    python test_stt.py                         # Record 5s, transcribe, print
-    python test_stt.py --list-devices           # List available input devices
-    python test_stt.py --device 3               # Use input device index 3
-    python test_stt.py --model small            # Use "small" Whisper model
-    python test_stt.py --push-to-talk            # Press Enter to start/stop recording
-    python test_stt.py --duration 10            # Record for 10 seconds
-    python test_stt.py --remote                 # Use the Strix Halo remote STT backend
+    python scripts/test_stt.py                         # Record 5s, transcribe, print
+    python scripts/test_stt.py --list-devices           # List available input devices
+    python scripts/test_stt.py --device 3               # Use input device index 3
+    python scripts/test_stt.py --model small            # Use "small" Whisper model
+    python scripts/test_stt.py --push-to-talk            # Press Enter to start/stop recording
+    python scripts/test_stt.py --duration 10            # Record for 10 seconds
+    python scripts/test_stt.py --remote                 # Use the Strix Halo remote STT backend
 """
 
 import argparse
 import sys
 import threading
+from pathlib import Path
+
+# Allow running from tests/ — add project root to path so `modules` imports work
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # Fix Windows console encoding for emoji/special characters
 if sys.platform == "win32":
@@ -112,7 +116,7 @@ def test_fixed_duration(
         remote_url=remote_url,
     )
 
-    from voice_clients import create_stt_client
+    from modules.voice_clients import create_stt_client
 
     stt = create_stt_client(config)
 
@@ -154,7 +158,7 @@ def test_push_to_talk(
         remote_url=remote_url,
     )
 
-    from voice_clients import create_stt_client
+    from modules.voice_clients import create_stt_client
 
     stt = create_stt_client(config)
 

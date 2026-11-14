@@ -10,7 +10,12 @@ track_surface guard, and the fuel alert feature.
 from unittest.mock import MagicMock
 
 
-from spotter import CarBehindClosingDetector, ProximityDetector, Spotter, SpotterCall
+from modules.spotter import (
+    CarBehindClosingDetector,
+    ProximityDetector,
+    Spotter,
+    SpotterCall,
+)
 
 # iRacing CarLeftRight enum values (from irsdk.CarLeftRight — ordinal, NOT bitmask)
 CLR_OFF = 0
@@ -2204,7 +2209,7 @@ class TestSpotterAudioPlayer:
         player = MagicMock()
         # Just verify the SpotterAudioPlayer can be created without crashing
         # even when audio files don't exist
-        from spotter import SpotterAudioPlayer
+        from modules.spotter import SpotterAudioPlayer
 
         player = SpotterAudioPlayer(config)
         # No samples should be loaded (file doesn't exist)
@@ -2212,7 +2217,7 @@ class TestSpotterAudioPlayer:
 
     def test_available_samples_list(self):
         """available_samples should list loaded sample keys (not missing ones)."""
-        from spotter import SpotterAudioPlayer
+        from modules.spotter import SpotterAudioPlayer
 
         config = {
             "spotter": {
@@ -2230,7 +2235,7 @@ class TestSpotterAudioPlayer:
 
     def test_play_missing_key_does_not_crash(self):
         """Playing a missing key should log warning but not crash."""
-        from spotter import SpotterAudioPlayer
+        from modules.spotter import SpotterAudioPlayer
 
         config = {
             "spotter": {
@@ -2245,7 +2250,7 @@ class TestSpotterAudioPlayer:
 
     def test_load_real_wav_files(self):
         """Test loading actual WAV files from the audio directory."""
-        from spotter import SpotterAudioPlayer
+        from modules.spotter import SpotterAudioPlayer
 
         config = {
             "spotter": {
@@ -2263,7 +2268,7 @@ class TestSpotterAudioPlayer:
 
     def test_default_audio_paths_include_all_alerts(self):
         """Default audio paths should include all alert types."""
-        from spotter import SpotterAudioPlayer
+        from modules.spotter import SpotterAudioPlayer
 
         expected_keys = [
             "car_left",
@@ -2299,7 +2304,7 @@ class TestSpotterAudioPlayer:
 
     def test_default_audio_paths_include_car_behind_closing(self):
         """Default audio paths should include car_behind_closing alert."""
-        from spotter import SpotterAudioPlayer
+        from modules.spotter import SpotterAudioPlayer
 
         assert "car_behind_closing" in SpotterAudioPlayer.DEFAULT_AUDIO_PATHS
 

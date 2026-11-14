@@ -16,7 +16,7 @@ import logging
 
 import numpy as np
 
-from tts_client import TTSClient, preprocess_for_tts
+from modules.tts_client import TTSClient, preprocess_for_tts
 
 logger = logging.getLogger(__name__)
 

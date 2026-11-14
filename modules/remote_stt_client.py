@@ -18,7 +18,7 @@ import wave
 
 import numpy as np
 
-from stt_client import STTClient, WHISPER_SAMPLE_RATE
+from modules.stt_client import STTClient, WHISPER_SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
 

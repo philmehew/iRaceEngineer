@@ -1,6 +1,6 @@
 """Unit tests for iRaceEngineer modules."""
 
-from race_state import (
+from modules.race_state import (
     RaceState,
     DriverState,
     TyreState,
@@ -9,7 +9,7 @@ from race_state import (
     FLAG_GREEN,
     FLAG_YELLOW,
 )
-from context_builder import (
+from modules.context_builder import (
     ContextBuilder,
     TRACK_WETNESS_LABELS,
     format_lap_time,
@@ -19,7 +19,7 @@ from context_builder import (
     format_engine_warnings,
     format_car_proximity,
 )
-from capture import TelemetryReplay
+from modules.capture import TelemetryReplay
 
 
 # --- Fixtures ---
@@ -1055,7 +1055,7 @@ class TestLLMClientRetry:
     """Tests for LLMClient transient-error retry logic."""
 
     def _make_client(self, retries=2, backoff=0.0, thinking=None):
-        from llm_client import LLMClient
+        from modules.llm_client import LLMClient
 
         config = {
             "llm": {
@@ -1137,7 +1137,7 @@ class TestLLMClientRetry:
             raise self._make_api_error(openai.RateLimitError, "rate limit exceeded")
 
         client.client.chat.completions.create = always_rate_limited
-        from llm_client import LLMError
+        from modules.llm_client import LLMError
 
         try:
             client.ask([{"role": "user", "content": "q"}])
@@ -1158,7 +1158,7 @@ class TestLLMClientRetry:
             raise self._make_api_error(openai.AuthenticationError, "invalid api key")
 
         client.client.chat.completions.create = bad_auth
-        from llm_client import LLMError
+        from modules.llm_client import LLMError
 
         try:
             client.ask([{"role": "user", "content": "q"}])
@@ -1175,7 +1175,7 @@ class TestLLMClientRetry:
             raise Exception("Request timed out after 100ms")
 
         client.client.chat.completions.create = slow
-        from llm_client import LLMError
+        from modules.llm_client import LLMError
 
         try:
             client.ask([{"role": "user", "content": "q"}])
@@ -1383,7 +1383,7 @@ class TestChatMacroManager:
     }
 
     def _manager(self, config=None):
-        from chat_macros import ChatMacroManager
+        from modules.chat_macros import ChatMacroManager
 
         return ChatMacroManager(config if config is not None else self.CONFIG)
 
@@ -1545,7 +1545,7 @@ class TestChatMacroPromptInjection:
     """Tests for chat macros block injection into the system prompt."""
 
     def _builder_with_macros(self):
-        from chat_macros import ChatMacroManager
+        from modules.chat_macros import ChatMacroManager
 
         config = {
             "prompt": {"system": "Race engineer. Be brief."},

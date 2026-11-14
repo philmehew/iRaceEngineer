@@ -5,26 +5,31 @@ Real-time iRacing data collection with on-demand LLM race engineering. Reads tel
 ## Architecture
 
 ```
-iRacing (shared memory) → iracing_client.py → race_state.py → context_builder.py → llm_client.py → response
-                                                        ↓
-                                                  spotter.py
-                                                 (local audio)
+iRacing (shared memory) → modules/iracing_client.py → modules/race_state.py → modules/context_builder.py → modules/llm_client.py → response
+                                                                        ↓
+                                                                 modules/spotter.py
+                                                                (local audio)
 
-Wheel button (hold) → stt_client.py (mic → Whisper) → transcribed text → context_builder → LLM
+Wheel button (hold) → modules/stt_client.py (mic → Whisper) → transcribed text → modules/context_builder → LLM
 ```
 
-- **iracing_client.py** — pyirsdk wrapper, reads 327 telemetry variables + session info, exposes pit commands
-- **race_state.py** — DriverState (universal per-car class), SessionState, RaceState with per-lap history
-- **context_builder.py** — condenses state into ~0.2-2KB prompt at 3 depth levels (minimal/medium/full)
-- **llm_client.py** — OpenAI-compatible API caller, works with Ollama Cloud, OpenAI, LM Studio, etc.
-- **spotter.py** — deterministic real-time audio calls for car proximity (car left/right, three wide, clear) and car-behind-closing alerts using pre-recorded WAV files; no LLM involved
-- **stt_client.py** — speech-to-text via faster-whisper + sounddevice mic capture, push-to-talk
-- **tts_client.py** — text-to-speech via Piper TTS + sounddevice playback, configurable output device
-- **remote_stt_client.py** — `RemoteSTTClient(STTClient)`: mic stays local, transcription offloaded to speaches (faster-whisper server) on the Strix Halo over HTTP
-- **remote_tts_client.py** — `RemoteTTSClient(TTSClient)`: synthesis offloaded to Kokoro-FastAPI on the Strix Halo (returns MP3), playback stays local
-- **voice_clients.py** — `create_stt_client`/`create_tts_client` factories pick local vs remote backend from `voice.<stt|tts>.backend`
-- **capture.py** — record/replay telemetry JSON for testing without iRacing
-- **chat_macros.py** — `ChatMacroManager`: maps LLM-declared actions (`[CMD:name]` tags in LLM replies) to iRacing chat macros (AutoChatStr1-15), fired via the SDK broadcast; validates macro slots against app.ini at startup. Used for driver commands like `!clearall` (clear black flag) that have no SDK broadcast of their own
+All library code lives in the `modules/` package; only entry points and data
+dirs stay at the project root. Import with absolute paths:
+`from modules.race_state import RaceState`.
+
+- **modules/iracing_client.py** — pyirsdk wrapper, reads 327 telemetry variables + session info, exposes pit commands
+- **modules/race_state.py** — DriverState (universal per-car class), SessionState, RaceState with per-lap history
+- **modules/context_builder.py** — condenses state into ~0.2-2KB prompt at 3 depth levels (minimal/medium/full)
+- **modules/llm_client.py** — OpenAI-compatible API caller, works with Ollama Cloud, OpenAI, LM Studio, etc.
+- **modules/spotter.py** — deterministic real-time audio calls for car proximity (car left/right, three wide, clear) and car-behind-closing alerts using pre-recorded WAV files; no LLM involved
+- **modules/stt_client.py** — speech-to-text via faster-whisper + sounddevice mic capture, push-to-talk
+- **modules/tts_client.py** — text-to-speech via Piper TTS + sounddevice playback, configurable output device
+- **modules/remote_stt_client.py** — `RemoteSTTClient(STTClient)`: mic stays local, transcription offloaded to speaches (faster-whisper server) on the Strix Halo over HTTP
+- **modules/remote_tts_client.py** — `RemoteTTSClient(TTSClient)`: synthesis offloaded to Kokoro-FastAPI on the Strix Halo (returns MP3), playback stays local
+- **modules/voice_clients.py** — `create_stt_client`/`create_tts_client` factories pick local vs remote backend from `voice.<stt|tts>.backend`
+- **modules/capture.py** — record/replay telemetry JSON for testing without iRacing
+- **modules/chat_macros.py** — `ChatMacroManager`: maps LLM-declared actions (`[CMD:name]` tags in LLM replies) to iRacing chat macros (AutoChatStr1-15), fired via the SDK broadcast; validates macro slots against app.ini at startup. Used for driver commands like `!clearall` (clear black flag) that have no SDK broadcast of their own
+- **modules/single_instance.py** — `SingleInstanceGuard`: OS-held lock so a second iRaceEngineer instance can't fight over the wheel, audio devices, and LLM queries
 - **main.py** — entry point with CLI: live, --capture, --replay, --generate-samples, --voice; includes WheelButtonListener for steering wheel query and PTT triggers
 
 ## Key Design Decisions
@@ -35,7 +40,7 @@ Wheel button (hold) → stt_client.py (mic → Whisper) → transcribed text →
 - **Testable without iRacing** — `--generate-samples` creates fake data, `--replay <dir>` feeds it through the pipeline
 - **Voice is optional** — voice deps in `[voice]` extra (`uv sync --extra voice`), graceful degradation if not installed
 - **Wheel button triggers** — pygame in `[wheel]` extra (`uv sync --extra wheel`), used for both LLM query (press) and push-to-talk voice (hold) via steering wheel buttons
-- **Voice tested independently** — `test_stt.py` and `test_tts.py` are standalone scripts for testing each component
+- **Voice tested independently** — `scripts/test_stt.py` and `scripts/test_tts.py` are standalone scripts for testing each component
 - **Remote voice backend** — `voice.stt.backend`/`voice.tts.backend` (`"local"` default | `"remote"`) selects faster-whisper/Piper (local) vs Strix Halo HTTP (remote). Backend-specific settings live in symmetric `local:`/`remote:` blocks; shared mic/speaker keys (`input_device`, `output_device`, `volume`, etc.) stay at the service level because audio capture/playback always happens on this machine. Remote STT = speaches at `192.168.0.117:9000`, remote TTS = Kokoro-FastAPI at `192.168.0.117:8880` (voice `bm_fable`).
 - **Spotter is local and deterministic** — reads CarLeftRight telemetry at 30Hz, plays pre-recorded WAV files on transitions (car appears/clears alongside). Also detects car-behind-closing using lap-time delta comparison (not noisy CarDistBehind derivative). No LLM involved. Edge-detection with cooldown timers prevents repeated calls. Uses sounddevice.OutputStream (not sd.play) to avoid conflicting with TTS.
 - **LLM actions fire chat macros** — the SDK can't send arbitrary chat text, so commands like `!clearall` (clear black flag) live in iRacing chat macro slots (set in the sim UI; trailing `$` = auto-transmit). `chat_macros:` config maps action names → macro slots, the system prompt tells the LLM which `[CMD:name]` tags exist, and `main.py` strips the tags (never spoken/displayed) and fires the macro via `chat_command_macro`. Slot contents validated against app.ini at startup (warn-only). Replay mode fires log-only.
@@ -64,10 +69,10 @@ python main.py --depth minimal          # Override context depth
 python main.py --question "Should I pit?"  # Ask a specific question
 python main.py --voice                  # Force-enable voice input/output
 python main.py --no-voice               # Force-disable voice input/output
-python test_tts.py "Box this lap"       # Test TTS standalone
-python test_stt.py --push-to-talk       # Test STT standalone
-python test_wheel.py                    # Discover wheel button device/index for push-to-talk
-python test_wheel.py --list             # List connected controllers
+python scripts/test_tts.py "Box this lap"       # Test TTS standalone
+python scripts/test_stt.py --push-to-talk        # Test STT standalone
+python scripts/test_wheel.py                     # Discover wheel button device/index for push-to-talk
+python scripts/test_wheel.py --list              # List connected controllers
 ```
 
 ## Current LLM Config
@@ -88,8 +93,11 @@ Located in `tests/sample_data/` — 10 snapshots simulating a Spa 24h race stint
 
 ## File Locations
 
+- Library code: `modules/` package (all imported modules)
 - Config: `config.yaml`
-- Wheel button test: `test_wheel.py`
+- Entry points: `main.py`, `run.bat`
+- Standalone test scripts: `scripts/test_wheel.py`, `scripts/test_stt.py`, `scripts/test_tts.py` (interactive hardware checks — run directly, not collected by pytest)
+- Wheel button test: `scripts/test_wheel.py`
 - Spotter audio: `audio/` (carleft.wav, carright.wav, carthreewide.wav, carclear.wav, carstillthere.wav, carbehindclosing.wav, plus flag/penalty/fuel/pit WAVs; fuel alerts at 5, 3, 2, 1 laps)
 - Sample data: `tests/sample_data/session_*`
 - Tests: `tests/test_modules.py`, `tests/test_spotter.py` (ProximityDetector, CarBehindTracker, Spotter coordinator, SpotterAudioPlayer)
