@@ -10,10 +10,10 @@ the device index. This script maps events to the correct device using the
 instance_id, so the config values it suggests are always correct.
 
 Usage:
-    python test_wheel.py --list              # List connected devices
-    python test_wheel.py                      # Watch for button presses
-    python test_wheel.py --device 0           # Watch only device 0
-    python test_wheel.py --watch-axes         # Also show analog axis movements
+    python scripts/test_wheel.py --list              # List connected devices
+    python scripts/test_wheel.py                      # Watch for button presses
+    python scripts/test_wheel.py --device 0           # Watch only device 0
+    python scripts/test_wheel.py --watch-axes         # Also show analog axis movements
 """
 
 import argparse

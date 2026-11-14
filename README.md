@@ -19,19 +19,23 @@ Real-time iRacing data collection with on-demand LLM race engineering. Collects 
 iRacing (shared memory)
         │
         ▼
- iracing_client.py   ← continuous 30Hz poll via pyirsdk
+ modules/iracing_client.py   ← continuous 30Hz poll via pyirsdk
         │
         ▼
- race_state.py        ← in-memory model: positions, fuel, tyres, laps, trends
+ modules/race_state.py        ← in-memory model: positions, fuel, tyres, laps, trends
         │
         ├──────────────────────────┐
         │                          │
         ▼ (on button press)       ▼ (every tick)
- context_builder.py   ← condenses     spotter.py ← deterministic audio calls
+ modules/context_builder.py  ← condenses     modules/spotter.py ← deterministic audio calls
         │              state →         │            (car left/right, three wide, clear,
         ▼              configurable    ▼             car behind closing, flags, fuel,
- llm_client.py        depth prompt   Pre-recorded WAV files (audio/)  penalties, pit entry/exit)
+ modules/llm_client.py     depth prompt   Pre-recorded WAV files (audio/)  penalties, pit entry/exit)
 ```
+
+All library code lives in the `modules/` package; only entry points and data
+dirs stay at the project root. Import with absolute paths:
+`from modules.race_state import RaceState`.
 
 ## Quick Start
 
@@ -212,7 +216,7 @@ uv pip install onnxruntime-gpu
 python -m piper.download_voices en_GB-alan-medium --data-dir voices
 
 # Or download via the test script
-python test_tts.py --download en_GB-alan-medium
+python scripts/test_tts.py --download en_GB-alan-medium
 ```
 
 Voice models are stored in `voices/` (gitignored). Available voices: [piper-samples](https://rhasspy.github.io/piper-samples/)
@@ -221,79 +225,79 @@ Voice models are stored in `voices/` (gitignored). Available voices: [piper-samp
 
 ```bash
 # Speak text through your default audio device
-python test_tts.py "Box this lap, tyres are gone. Add sixty litres."
+python scripts/test_tts.py "Box this lap, tyres are gone. Add sixty litres."
 
 # List available audio output devices
-python test_tts.py --list-devices
+python scripts/test_tts.py --list-devices
 
 # List available voice aliases and downloaded models
-python test_tts.py --list-voices
+python scripts/test_tts.py --list-voices
 
 # Play through a specific device (use index from --list-devices)
-python test_tts.py --device 5 "Hello"
+python scripts/test_tts.py --device 5 "Hello"
 
 # Use a voice alias (short name)
-python test_tts.py --voice alan "Box this lap"
-python test_tts.py --voice cori "Box this lap"
-python test_tts.py --voice cori-high "Box this lap"
-python test_tts.py --voice northern "Box this lap"
+python scripts/test_tts.py --voice alan "Box this lap"
+python scripts/test_tts.py --voice cori "Box this lap"
+python scripts/test_tts.py --voice cori-high "Box this lap"
+python scripts/test_tts.py --voice northern "Box this lap"
 
 # Use a full model name
-python test_tts.py --model en_US-lessac-medium "Hello"
+python scripts/test_tts.py --model en_US-lessac-medium "Hello"
 
 # Write to WAV file instead of playing (useful over SSH)
-python test_tts.py --wav out.wav "Box this lap, tyres are gone"
-python test_tts.py --voice northern --wav out.wav "Box this lap"
+python scripts/test_tts.py --wav out.wav "Box this lap, tyres are gone"
+python scripts/test_tts.py --voice northern --wav out.wav "Box this lap"
 
 # Read text from a file
-python test_tts.py --file response.txt
+python scripts/test_tts.py --file response.txt
 
 # Adjust volume
-python test_tts.py --volume 0.5 "Quiet please"
+python scripts/test_tts.py --volume 0.5 "Quiet please"
 ```
 
 ### Test STT Standalone
 
 ```bash
 # Record for 5 seconds, transcribe, print
-python test_stt.py
+python scripts/test_stt.py
 
 # List available audio input devices
-python test_stt.py --list-devices
+python scripts/test_stt.py --list-devices
 
 # Use a specific microphone (use index from --list-devices)
-python test_stt.py --device 1
+python scripts/test_stt.py --device 1
 
 # Push-to-talk: press Enter to start, Enter again to stop
-python test_stt.py --push-to-talk
+python scripts/test_stt.py --push-to-talk
 
 # Change Whisper model size
-python test_stt.py --model tiny     # fastest, least accurate
-python test_stt.py --model medium  # better accuracy, slower
+python scripts/test_stt.py --model tiny     # fastest, least accurate
+python scripts/test_stt.py --model medium  # better accuracy, slower
 
 # Boost mic input (useful for quiet microphones)
-python test_stt.py --gain 2.0 --push-to-talk
+python scripts/test_stt.py --gain 2.0 --push-to-talk
 
 # Record for longer
-python test_stt.py --duration 10
+python scripts/test_stt.py --duration 10
 ```
 
 ### Test Wheel Button Discovery
 
-Use `test_wheel.py` to identify your steering wheel's device and button indices for push-to-talk:
+Use `scripts/test_wheel.py` to identify your steering wheel's device and button indices for push-to-talk:
 
 ```bash
 # List connected controllers
-python test_wheel.py --list
+python scripts/test_wheel.py --list
 
 # Watch for button presses (press buttons on your wheel to identify them)
-python test_wheel.py
+python scripts/test_wheel.py
 
 # Monitor only a specific device
-python test_wheel.py --device 0
+python scripts/test_wheel.py --device 0
 
 # Also show analog axis movements
-python test_wheel.py --watch-axes
+python scripts/test_wheel.py --watch-axes
 ```
 
 When you press a button, the script prints the device index, button number, and a suggested `config.yaml` snippet.
@@ -310,15 +314,15 @@ Both use pygame to read wheel buttons. Configure in `config.yaml`:
 1. Install pygame: `uv sync --extra wheel`
 2. Discover your wheel's device and button indices:
    ```bash
-   python test_wheel.py --list      # List connected controllers
-   python test_wheel.py              # Press buttons to see their indices
+   python scripts/test_wheel.py --list      # List connected controllers
+   python scripts/test_wheel.py              # Press buttons to see their indices
    ```
 3. Configure in `config.yaml`:
    ```yaml
    # LLM query trigger (press to ask the race engineer)
    trigger:
-     device_index: 0    # From test_wheel.py --list
-     button_index: 4    # From pressing buttons in test_wheel.py
+     device_index: 0    # From scripts/test_wheel.py --list
+     button_index: 4    # From pressing buttons in scripts/test_wheel.py
 
    # Voice push-to-talk (hold to speak, release to transcribe)
    voice:
@@ -362,8 +366,8 @@ voice:
 
 Find device indices with:
 ```bash
-python test_tts.py --list-devices   # Output devices (for TTS + spotter)
-python test_stt.py --list-devices   # Input devices (for STT mic)
+python scripts/test_tts.py --list-devices   # Output devices (for TTS + spotter)
+python scripts/test_stt.py --list-devices   # Input devices (for STT mic)
 ```
 
 Set to `null` (or omit) to use the system default.
@@ -402,7 +406,7 @@ The solution is to route race engineer audio through a **virtual audio cable** s
    spotter:
      output_device: "CABLE Input"       # Same device for spotter calls
    ```
-   Use the exact device name string, or the numeric index from `python test_tts.py --list-devices`.
+   Use the exact device name string, or the numeric index from `python scripts/test_tts.py --list-devices`.
 
 3. **Route the virtual cable to your headset** so you can still hear it:
    - Windows Sound settings → Recording tab → right-click "CABLE Output" → Properties
@@ -509,7 +513,7 @@ llm:
 
 # Button trigger — wheel button to query the LLM
 trigger:
-  device_index: 0    # Joystick device index (use test_wheel.py to find)
+  device_index: 0    # Joystick device index (use scripts/test_wheel.py to find)
   button_index: 4    # Button index on device
 
 # Voice input/output (optional: uv sync --extra voice)
@@ -708,18 +712,28 @@ Same as `--capture` but always saves to the `tests/sample_data/` folder (from co
 
 | Module | Purpose |
 |--------|---------|
-| `main.py` | Entry point — CLI args, poll loop, wheel button triggers, interactive replay, voice |
-| `iracing_client.py` | pyirsdk wrapper — telemetry, session info, pit commands |
-| `race_state.py` | In-memory model — positions, gaps, fuel, tyres, engine health, lap trends |
-| `context_builder.py` | Condenses state → LLM prompt (3 depth levels, format helpers) |
-| `llm_client.py` | OpenAI-compatible API caller (works with any `/v1` endpoint) |
-| `spotter.py` | Deterministic car proximity & race alert calls — CarLeftRight transitions, car-behind-closing, flags, fuel, penalties, pit transitions |
-| `stt_client.py` | Speech-to-text — Whisper (faster-whisper) + mic capture (sounddevice) |
-| `tts_client.py` | Text-to-speech — Piper TTS + audio playback (sounddevice) |
-| `capture.py` | Record/replay telemetry JSON for testing |
-| `test_stt.py` | Standalone STT test — record + transcribe without iRacing |
-| `test_tts.py` | Standalone TTS test — speak text without iRacing |
-| `test_wheel.py` | Standalone wheel button discovery — find device/button indices for push-to-talk |
+| `main.py` | Entry point — CLI dispatch: live, capture, replay, generate-samples modes |
+| `modules/iracing_client.py` | pyirsdk wrapper — telemetry, session info, pit commands |
+| `modules/race_state.py` | In-memory model — positions, gaps, fuel, tyres, engine health, lap trends |
+| `modules/context_builder.py` | Condenses state → LLM prompt (3 depth levels, format helpers) |
+| `modules/llm_client.py` | OpenAI-compatible API caller (works with any `/v1` endpoint) |
+| `modules/spotter.py` | Deterministic car proximity & race alert calls — CarLeftRight transitions, car-behind-closing, flags, fuel, penalties, pit transitions |
+| `modules/stt_client.py` | Speech-to-text — Whisper (faster-whisper) + mic capture (sounddevice) |
+| `modules/tts_client.py` | Text-to-speech — Piper TTS + audio playback (sounddevice) |
+| `modules/capture.py` | Record/replay telemetry JSON for testing |
+| `modules/chat_macros.py` | Chat macro actions — `[CMD:name]` tags → iRacing chat macros |
+| `modules/single_instance.py` | Single-instance guard — OS lock against duplicate runs |
+| `modules/engineer_query.py` | Shared LLM query seam — ask_engineer() with locks, response cleaning, chat macro firing |
+| `modules/live_mode.py` | Live mode — iRacing poll loop, spotter, wheel button triggers |
+| `modules/replay_mode.py` | Replay mode — feed captured data through the pipeline, interactive questions |
+| `modules/capture_mode.py` | Capture mode — record live telemetry to JSON; generate-samples |
+| `modules/push_to_talk.py` | PushToTalkController — hold-to-talk recording lifecycle |
+| `modules/voice_setup.py` | Voice setup — TTS/STT construction, CUDA DLLs, model preload |
+| `modules/logging_setup.py` | Timestamped session log files (LLM query + console mirror) |
+| `modules/wheel_button.py` | WheelButtonListener — pygame button events (query press / PTT hold) |
+| `scripts/test_stt.py` | Standalone STT test — record + transcribe without iRacing |
+| `scripts/test_tts.py` | Standalone TTS test — speak text without iRacing |
+| `scripts/test_wheel.py` | Standalone wheel button discovery — find device/button indices for push-to-talk |
 | `tests/test_modules.py` | Unit tests — RaceState, ContextBuilder, TelemetryReplay |
 | `tests/test_spotter.py` | Unit tests — ProximityDetector, CarBehindTracker, SpotterAudioPlayer, Spotter coordinator |
 | `tests/eval_llm_responses.py` | Batch LLM evaluation — asks 50 questions against replay data, logs results |

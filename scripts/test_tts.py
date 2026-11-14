@@ -5,19 +5,23 @@ Tests text-to-speech independently from the main iRaceEngineer pipeline.
 Use this to verify Piper setup, voice model, and audio output device.
 
 Usage:
-    python test_tts.py "Box this lap, tyres are gone"     # Speak the text
-    python test_tts.py --list-devices                      # List output devices
-    python test_tts.py --device 5 "Hello"                  # Use output device 5
-    python test_tts.py --voice alan "Hello"                   # Use --voice shortcut
-    python test_tts.py --model en_GB-alan-medium "Hello"   # Use specific model
-    python test_tts.py --download en_GB-alan-medium        # Download a voice model
-    python test_tts.py --file response.txt                 # Speak contents of file
-    python test_tts.py --wav out.wav "Box this lap"        # Write to WAV (no playback)
-    python test_tts.py --remote "Box this lap"             # Use Strix Halo remote TTS (Kokoro)
+    python scripts/test_tts.py "Box this lap, tyres are gone"     # Speak the text
+    python scripts/test_tts.py --list-devices                      # List output devices
+    python scripts/test_tts.py --device 5 "Hello"                  # Use output device 5
+    python scripts/test_tts.py --voice alan "Hello"                   # Use --voice shortcut
+    python scripts/test_tts.py --model en_GB-alan-medium "Hello"   # Use specific model
+    python scripts/test_tts.py --download en_GB-alan-medium        # Download a voice model
+    python scripts/test_tts.py --file response.txt                 # Speak contents of file
+    python scripts/test_tts.py --wav out.wav "Box this lap"        # Write to WAV (no playback)
+    python scripts/test_tts.py --remote "Box this lap"             # Use Strix Halo remote TTS (Kokoro)
 """
 
 import argparse
 import sys
+from pathlib import Path
+
+# Allow running from tests/ — add project root to path so `modules` imports work
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 
@@ -155,7 +159,7 @@ def speak_text(
         }
     config = {"voice": {"tts": tts}}
 
-    from voice_clients import create_tts_client
+    from modules.voice_clients import create_tts_client
 
     tts_client = create_tts_client(config)
 

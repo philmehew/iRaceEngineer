@@ -33,20 +33,7 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = [
-    "capture",
-    "context_builder",
-    "iracing_client",
-    "llm_client",
-    "main",
-    "race_state",
-    "remote_stt_client",
-    "remote_tts_client",
-    "spotter",
-    "stt_client",
-    "tts_client",
-    "voice_clients",
-]
+packages = ["modules"]
 
 [dependency-groups]
 dev = [

@@ -14,8 +14,8 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from stt_client import STTClient
-    from tts_client import TTSClient
+    from modules.stt_client import STTClient
+    from modules.tts_client import TTSClient
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +26,11 @@ def create_stt_client(config: dict) -> "STTClient":
     backend = stt_config.get("backend", "local")
 
     if backend == "remote":
-        from remote_stt_client import RemoteSTTClient
+        from modules.remote_stt_client import RemoteSTTClient
 
         return RemoteSTTClient(config)
 
-    from stt_client import STTClient
+    from modules.stt_client import STTClient
 
     return STTClient(config)
 
@@ -41,10 +41,10 @@ def create_tts_client(config: dict) -> "TTSClient":
     backend = tts_config.get("backend", "local")
 
     if backend == "remote":
-        from remote_tts_client import RemoteTTSClient
+        from modules.remote_tts_client import RemoteTTSClient
 
         return RemoteTTSClient(config)
 
-    from tts_client import TTSClient
+    from modules.tts_client import TTSClient
 
     return TTSClient(config)
