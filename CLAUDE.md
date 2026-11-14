@@ -30,7 +30,7 @@ dirs stay at the project root. Import with absolute paths:
 - **modules/capture.py** — record/replay telemetry JSON for testing without iRacing
 - **modules/chat_macros.py** — `ChatMacroManager`: maps LLM-declared actions (`[CMD:name]` tags in LLM replies) to iRacing chat macros (AutoChatStr1-15), fired via the SDK broadcast; validates macro slots against app.ini at startup. Used for driver commands like `!clearall` (clear black flag) that have no SDK broadcast of their own
 - **modules/single_instance.py** — `SingleInstanceGuard`: OS-held lock so a second iRaceEngineer instance can't fight over the wheel, audio devices, and LLM queries
-- **main.py** — entry point with CLI: live, --capture, --replay, --generate-samples, --voice; includes WheelButtonListener for steering wheel query and PTT triggers
+- **main.py** — entry point with CLI: live, --capture, --replay, --generate-samples, --voice
 
 ## Key Design Decisions
 
@@ -39,7 +39,7 @@ dirs stay at the project root. Import with absolute paths:
 - **Config-driven context depth** — minimal (~200B), medium (~500B), full (~1-2KB), controlled by config.yaml
 - **Testable without iRacing** — `--generate-samples` creates fake data, `--replay <dir>` feeds it through the pipeline
 - **Voice is optional** — voice deps in `[voice]` extra (`uv sync --extra voice`), graceful degradation if not installed
-- **Wheel button triggers** — pygame in `[wheel]` extra (`uv sync --extra wheel`), used for both LLM query (press) and push-to-talk voice (hold) via steering wheel buttons
+- **Wheel button triggers** — pygame in `[wheel]` extra (`uv sync --extra wheel`), used for both LLM query (press) and push-to-talk voice (hold) via steering wheel buttons. `voice.trigger.buttons` is a list of named `{device_index, button_index}` pairs (one per wheel); any configured button triggers, and all must be released to stop PTT
 - **Voice tested independently** — `scripts/test_stt.py` and `scripts/test_tts.py` are standalone scripts for testing each component
 - **Remote voice backend** — `voice.stt.backend`/`voice.tts.backend` (`"local"` default | `"remote"`) selects faster-whisper/Piper (local) vs Strix Halo HTTP (remote). Backend-specific settings live in symmetric `local:`/`remote:` blocks; shared mic/speaker keys (`input_device`, `output_device`, `volume`, etc.) stay at the service level because audio capture/playback always happens on this machine. Remote STT = speaches at `192.168.0.117:9000`, remote TTS = Kokoro-FastAPI at `192.168.0.117:8880` (voice `bm_fable`).
 - **Spotter is local and deterministic** — reads CarLeftRight telemetry at 30Hz, plays pre-recorded WAV files on transitions (car appears/clears alongside). Also detects car-behind-closing using lap-time delta comparison (not noisy CarDistBehind derivative). No LLM involved. Edge-detection with cooldown timers prevents repeated calls. Uses sounddevice.OutputStream (not sd.play) to avoid conflicting with TTS.

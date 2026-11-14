@@ -90,9 +90,15 @@ voice:
       timeout: 30.0                   # Seconds
 
   trigger:
-    device_index: 0              # Joystick device index (use test_wheel.py to find)
-    button_index: 9              # Button index on device (use test_wheel.py to find)
-    # PTT is always hold-to-talk: hold button = record, release = transcribe
+    # One entry per steering wheel. Use scripts/test_wheel.py to find the
+    # device and button indices, then give each entry a name.
+    buttons:
+      - name: Wheel 1
+        device_index: 0
+        button_index: 9
+      # - name: Wheel 2
+      #   device_index: 1
+      #   button_index: 4
     max_record_seconds: 15           # Safety: auto-stop recording after this
 
 # Spotter — real-time audio calls for car proximity and track events

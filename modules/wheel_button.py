@@ -2,50 +2,160 @@
 Wheel button listener — pygame-based steering wheel button input.
 
 Runs a background thread that polls pygame events and calls on_press/on_release
-callbacks when the target button is triggered. Used for both LLM query triggers
-(press to query) and push-to-talk voice input (hold to record, release to
-transcribe).
+callbacks when any configured button is triggered. Used for both LLM query
+triggers (press to query) and push-to-talk voice input (hold to record, release
+to transcribe).
+
+Each binding pairs a device index with a button index, so several steering
+wheels can be configured independently:
+
+    voice:
+      trigger:
+        buttons:
+          - name: Formula
+            device_index: 0
+            button_index: 9
+          - name: GT
+            device_index: 1
+            button_index: 4
+
+The listener treats all configured buttons as one trigger: pressing any button
+starts, and all must be released to stop.
 """
 
 import logging
 import threading
 import time
+from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger("iraceengineer")
 
 
+@dataclass(frozen=True)
+class ButtonBinding:
+    """One steering-wheel button: a device index plus a button index."""
+
+    device_index: int
+    button_index: int
+    name: str = ""
+
+    @property
+    def label(self) -> str:
+        target = f"button {self.button_index} (device {self.device_index})"
+        return f"{self.name}: {target}" if self.name else target
+
+
+def _as_int(value: Any) -> int:
+    """Coerce a config value to int, rejecting bools and bad strings."""
+    if isinstance(value, bool):
+        raise ValueError("boolean is not a button index")
+    return int(value)
+
+
+def _dedupe_bindings(bindings: list[ButtonBinding]) -> list[ButtonBinding]:
+    """Drop duplicate device/button pairs, preserving order."""
+    seen: set[tuple[int, int]] = set()
+    result: list[ButtonBinding] = []
+    for binding in bindings:
+        key = (binding.device_index, binding.button_index)
+        if key not in seen:
+            seen.add(key)
+            result.append(binding)
+    return result
+
+
+def button_bindings_from_config(trigger_config: dict) -> list[ButtonBinding]:
+    """Return the configured wheel button bindings.
+
+    Expects one entry per steering wheel::
+
+        buttons:
+          - name: Formula
+            device_index: 0
+            button_index: 9
+
+    A missing or empty ``buttons`` list means no wheel triggers.
+    """
+    raw_buttons = trigger_config.get("buttons")
+    if raw_buttons is None:
+        return []
+    if not isinstance(raw_buttons, list):
+        logger.warning(
+            "voice.trigger.buttons must be a list — no wheel buttons configured"
+        )
+        return []
+
+    bindings: list[ButtonBinding] = []
+    for i, entry in enumerate(raw_buttons):
+        if not isinstance(entry, dict):
+            logger.warning(f"Ignoring voice.trigger.buttons[{i}]: expected a mapping")
+            continue
+
+        raw_name = entry.get("name")
+        name = str(raw_name).strip() if raw_name is not None else ""
+        try:
+            device_index = _as_int(entry["device_index"])
+            button_index = _as_int(entry["button_index"])
+        except KeyError as e:
+            logger.warning(f"Ignoring voice.trigger.buttons[{i}]: missing {e.args[0]}")
+            continue
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Ignoring voice.trigger.buttons[{i}]: device_index and "
+                "button_index must be integers"
+            )
+            continue
+
+        bindings.append(ButtonBinding(device_index, button_index, name))
+
+    return _dedupe_bindings(bindings)
+
+
 class WheelButtonListener:
-    """Listen for joystick/wheel button presses using pygame.
+    """Listen for configured buttons across one or more joystick devices.
 
     Runs a background thread that polls pygame events and calls
-    on_press/on_release callbacks when the target button is triggered.
+    on_press/on_release callbacks when any configured button is triggered.
 
     Used for both LLM query triggers (press to query) and push-to-talk
     voice input (hold to record, release to transcribe).
 
-    Config keys:
-        device_index: Joystick device index (use scripts/test_wheel.py to find)
-        button_index: Button index on the device
+    Bindings whose device isn't connected are ignored; the listener keeps
+    scanning and starts using them when the device appears (e.g. after a
+    wheel swap).
     """
 
     def __init__(
         self,
-        device_index: int,
-        button_index: int,
+        bindings: list[ButtonBinding],
         on_press=None,
         on_release=None,
     ):
-        self.device_index = device_index
-        self.button_index = button_index
+        self.bindings = _dedupe_bindings(bindings)
         self.on_press = on_press
         self.on_release = on_release
         self._running = False
         self._thread: threading.Thread | None = None
-        self._joystick = None
+        self._joysticks: dict[int, Any] = {}
+        self._known_count: int | None = None
+        self._warned_unavailable: set[tuple[int, int]] = set()
         self._pygame_initialized = False
+        self._was_pressed = False
+
+    @property
+    def device_indices(self) -> list[int]:
+        return sorted({binding.device_index for binding in self.bindings})
 
     def start(self):
         """Start listening for button events in a background thread."""
+        if not self.bindings:
+            logger.error(
+                "Wheel button listener: no buttons configured — set "
+                "voice.trigger.buttons in config.yaml."
+            )
+            return
+
         # Skip if already running, but allow restart after the thread died
         if self._running and self._thread and self._thread.is_alive():
             return
@@ -70,20 +180,106 @@ class WheelButtonListener:
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
+        self._close_joysticks()
         if self._pygame_initialized:
             try:
                 import pygame
 
-                if self._joystick is not None:
-                    self._joystick.quit()
                 pygame.joystick.quit()
                 pygame.quit()
             except Exception:
                 pass
             self._pygame_initialized = False
 
+    def _close_joysticks(self):
+        """Close every open joystick handle."""
+        for joystick in self._joysticks.values():
+            try:
+                joystick.quit()
+            except Exception:
+                pass
+        self._joysticks.clear()
+
+    def _open_missing_devices(self, pygame):
+        """Open handles for configured devices that are now available."""
+        try:
+            count = pygame.joystick.get_count()
+        except Exception:
+            return
+
+        for index in self.device_indices:
+            if index in self._joysticks or index >= count:
+                continue
+            try:
+                joystick = pygame.joystick.Joystick(index)
+                joystick.init()
+            except Exception as e:
+                logger.debug(
+                    f"Wheel button listener: device {index} not available ({e})"
+                )
+                continue
+            self._joysticks[index] = joystick
+            logger.info(
+                f"Wheel button listener: opened device {index} ({joystick.get_name()})"
+            )
+
+    def _read_pressed_bindings(self) -> list[ButtonBinding]:
+        """Return the bindings whose button is currently held."""
+        pressed: list[ButtonBinding] = []
+        for binding in self.bindings:
+            joystick = self._joysticks.get(binding.device_index)
+            if joystick is None:
+                continue
+            try:
+                num_buttons = joystick.get_numbuttons()
+                if binding.button_index >= num_buttons:
+                    key = (binding.device_index, binding.button_index)
+                    if key not in self._warned_unavailable:
+                        self._warned_unavailable.add(key)
+                        logger.warning(
+                            f"Configured {binding.label} does not exist on the "
+                            f"connected wheel ({num_buttons} buttons) — ignoring"
+                        )
+                    continue
+                if joystick.get_button(binding.button_index):
+                    pressed.append(binding)
+            except Exception as e:
+                logger.warning(
+                    f"Wheel device {binding.device_index} lost ({e}) — will reconnect"
+                )
+                joystick = self._joysticks.pop(binding.device_index, None)
+                if joystick is not None:
+                    try:
+                        joystick.quit()
+                    except Exception:
+                        pass
+        return pressed
+
+    def _update_press_state(self, is_pressed: bool, detail: str = ""):
+        """Fire on_press/on_release on aggregate button-state edges.
+
+        The configured buttons act as one trigger: on_press fires when any
+        button goes down, on_release when the last one comes up.
+        """
+        if is_pressed and not self._was_pressed:
+            self._was_pressed = True
+            logger.info(f"Wheel trigger pressed ({detail})")
+            if self.on_press:
+                try:
+                    self.on_press()
+                except Exception:
+                    logger.exception("Wheel button on_press callback failed")
+        elif not is_pressed and self._was_pressed:
+            self._was_pressed = False
+            logger.info("Wheel trigger released")
+            if self.on_release:
+                try:
+                    self.on_release()
+                except Exception:
+                    logger.exception("Wheel button on_release callback failed")
+
     def _run(self):
-        """Background thread: init pygame, open joystick, poll button state.
+        """Background thread: init pygame, open devices, poll button state.
 
         Uses direct get_button() polling to detect press/release edges.
         This approach is more reliable than pygame's event system because:
@@ -91,9 +287,8 @@ class WheelButtonListener:
         - It doesn't require a display window
         - It doesn't depend on the Windows message pump
 
-        Falls back to event-based detection if polling reports stale state
-        (all buttons permanently pressed), which can happen if the event pump
-        isn't running.
+        Device add/remove events are still drained so wheel swaps can be
+        picked up without restarting the app.
         """
         try:
             import pygame
@@ -105,99 +300,71 @@ class WheelButtonListener:
         pygame.init()
         pygame.joystick.init()
         self._pygame_initialized = True
+        self._known_count = pygame.joystick.get_count()
+        self._open_missing_devices(pygame)
 
-        count = pygame.joystick.get_count()
-        logger.info(f"Wheel button listener: pygame init, {count} joystick(s) found")
-
-        if self.device_index >= count:
-            logger.error(
-                f"Joystick device index {self.device_index} not found "
-                f"(only {count} device(s) available). "
-                f"Run scripts/test_wheel.py --list to see devices."
+        if self._joysticks:
+            logger.info(
+                f"Wheel button listener: {len(self.bindings)} binding(s) across "
+                f"{self.device_indices} — open device(s) {sorted(self._joysticks)}"
             )
-            self._running = False
-            pygame.quit()
-            self._pygame_initialized = False
-            return
+        else:
+            logger.warning(
+                f"Wheel button listener: none of the configured devices "
+                f"{self.device_indices} are connected yet — waiting"
+            )
 
-        self._joystick = pygame.joystick.Joystick(self.device_index)
-        self._joystick.init()
-        js_name = self._joystick.get_name()
-        js_buttons = self._joystick.get_numbuttons()
-        logger.info(
-            f"Wheel button listener: device {self.device_index} "
-            f"({js_name}), button {self.button_index} of {js_buttons}"
-        )
-
-        # Track button state to detect press/release edges
-        was_pressed = False
         last_log_time = 0
+        last_scan_time = time.monotonic()
 
         try:
             while self._running:
-                # Pump pygame events so joystick state stays fresh.
-                # Even though we read state via get_button(), the internal
-                # joystick state only updates when the event pump runs.
-                pygame.event.pump()
-
-                if self._joystick is None:
-                    # Joystick was disconnected — try to reopen it
-                    try:
-                        self._joystick = pygame.joystick.Joystick(self.device_index)
-                        self._joystick.init()
-                        js_name = self._joystick.get_name()
-                        logger.info(
-                            f"Wheel button listener: reconnected to "
-                            f"device {self.device_index} ({js_name})"
-                        )
-                    except Exception:
-                        # Still gone — retry later (don't spam the log)
-                        time.sleep(1.0)
-                        continue
+                # Drain joystick hot-plug events; polling get_button() still
+                # handles the actual button state.
+                rescan = False
+                try:
+                    for event in pygame.event.get():
+                        if event.type in (
+                            pygame.JOYDEVICEADDED,
+                            pygame.JOYDEVICEREMOVED,
+                        ):
+                            rescan = True
+                except Exception as e:
+                    logger.debug(f"Wheel button listener: event pump failed ({e})")
 
                 try:
-                    is_pressed = bool(self._joystick.get_button(self.button_index))
-                except Exception as e:
-                    # Joystick disconnected mid-read — drop it and retry
-                    logger.warning(f"Wheel device lost ({e}) — attempting reconnect")
-                    try:
-                        self._joystick.quit()
-                    except Exception:
-                        pass
-                    self._joystick = None
-                    was_pressed = False  # don't hold a phantom press
-                    continue
+                    count = pygame.joystick.get_count()
+                    if count != self._known_count:
+                        self._known_count = count
+                        rescan = True
+                except Exception:
+                    pass
 
-                if is_pressed and not was_pressed:
-                    was_pressed = True
+                if rescan:
                     logger.info(
-                        f"Wheel button {self.button_index} pressed "
-                        f"(device {self.device_index}: {js_name})"
+                        "Wheel button listener: controller list changed — re-scanning"
                     )
-                    if self.on_press:
-                        try:
-                            self.on_press()
-                        except Exception:
-                            logger.exception("Wheel button on_press callback failed")
-                elif not is_pressed and was_pressed:
-                    was_pressed = False
-                    logger.info(
-                        f"Wheel button {self.button_index} released "
-                        f"(device {self.device_index}: {js_name})"
-                    )
-                    if self.on_release:
-                        try:
-                            self.on_release()
-                        except Exception:
-                            logger.exception("Wheel button on_release callback failed")
+                    self._close_joysticks()
+                    self._open_missing_devices(pygame)
+                    last_scan_time = time.monotonic()
+                elif time.monotonic() - last_scan_time > 1.0:
+                    # Retry devices that were missing at startup
+                    last_scan_time = time.monotonic()
+                    self._open_missing_devices(pygame)
+
+                pressed = self._read_pressed_bindings()
+                detail = ", ".join(binding.label for binding in pressed)
+                self._update_press_state(bool(pressed), detail)
 
                 # Periodic alive log (every 30s) to confirm thread is running
                 now = time.monotonic()
                 if now - last_log_time > 30:
                     last_log_time = now
                     logger.debug(
-                        f"Wheel button listener alive: device {self.device_index}, "
-                        f"button {self.button_index}, state={'pressed' if was_pressed else 'released'}"
+                        f"Wheel button listener alive: "
+                        f"{len(self._joysticks)}/{len(self.device_indices)} "
+                        f"device(s) open, state="
+                        f"{'pressed' if self._was_pressed else 'released'}"
                     )
 
                 time.sleep(1 / 30)  # ~30Hz polling
@@ -205,13 +372,10 @@ class WheelButtonListener:
         except Exception as e:
             logger.exception(f"Wheel button listener error: {e}")
         finally:
-            if self._joystick is not None:
-                try:
-                    self._joystick.quit()
-                except Exception:
-                    pass
+            self._close_joysticks()
             pygame.joystick.quit()
             pygame.quit()
             self._pygame_initialized = False
+            self._was_pressed = False
             # Allow a later start() call to spin up a fresh listener thread
             self._running = False

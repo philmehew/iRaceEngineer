@@ -304,12 +304,12 @@ When you press a button, the script prints the device index, button number, and 
 
 ### Voice in Live Mode
 
-In live mode, two triggers are available via steering wheel buttons:
+In live mode, wheel buttons trigger the race engineer:
 
-- **Query button** — Press to send a general strategy query to the LLM
-- **Voice PTT button** — Hold to speak your question, release to transcribe
+- **With voice enabled** (default) — Hold any configured button to speak your question; release to transcribe.
+- **Without voice** (STT unavailable, or `--no-voice`) — Press any configured button to ask the LLM directly.
 
-Both use pygame to read wheel buttons. Configure in `config.yaml`:
+Both use pygame to read wheel buttons. Each configured entry pairs a device index with a button index, so you can add one entry per steering wheel. Any configured button triggers the engineer. Configure in `config.yaml`:
 
 1. Install pygame: `uv sync --extra wheel`
 2. Discover your wheel's device and button indices:
@@ -319,17 +319,15 @@ Both use pygame to read wheel buttons. Configure in `config.yaml`:
    ```
 3. Configure in `config.yaml`:
    ```yaml
-   # LLM query trigger (press to ask the race engineer)
-   trigger:
-     device_index: 0    # From scripts/test_wheel.py --list
-     button_index: 4    # From pressing buttons in scripts/test_wheel.py
-
-   # Voice push-to-talk (hold to speak, release to transcribe)
    voice:
      trigger:
-       device_index: 0
-       button_index: 9
-       push_to_talk: true
+       buttons:
+         - name: Formula
+           device_index: 0          # From scripts/test_wheel.py --list
+           button_index: 9          # From pressing buttons in test_wheel.py
+         - name: GT
+           device_index: 1
+           button_index: 4
        max_record_seconds: 15
    ```
 
@@ -511,11 +509,6 @@ llm:
   max_tokens: 300
   temperature: 0.3
 
-# Button trigger — wheel button to query the LLM
-trigger:
-  device_index: 0    # Joystick device index (use scripts/test_wheel.py to find)
-  button_index: 4    # Button index on device
-
 # Voice input/output (optional: uv sync --extra voice)
 voice:
   stt:
@@ -536,9 +529,13 @@ voice:
     volume: 1.0
     sentence_silence: 0.2
   trigger:
-    device_index: 0           # Joystick device index
-    button_index: 9           # Button index on device
-    push_to_talk: true
+    buttons:
+      - name: Formula
+        device_index: 0           # Joystick device index
+        button_index: 9           # Button index on that device
+      - name: GT
+        device_index: 1
+        button_index: 4
     max_record_seconds: 15
 
 # Spotter — real-time audio calls for car proximity & race alerts (local, no LLM)

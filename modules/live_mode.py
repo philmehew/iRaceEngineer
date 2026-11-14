@@ -21,7 +21,7 @@ from modules.push_to_talk import PushToTalkController
 from modules.race_state import RaceState
 from modules.spotter import Spotter
 from modules.voice_setup import preload_voice_models, setup_stt, setup_tts
-from modules.wheel_button import WheelButtonListener
+from modules.wheel_button import WheelButtonListener, button_bindings_from_config
 
 logger = logging.getLogger("iraceengineer")
 
@@ -108,6 +108,7 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30, question: str = ""):
     # Set up wheel button triggers
     voice_config = config.get("voice", {})
     voice_trigger_config = voice_config.get("trigger", {})
+    trigger_bindings = button_bindings_from_config(voice_trigger_config)
 
     # Connect to iRacing
     print("\n🔌 Connecting to iRacing...")
@@ -166,9 +167,7 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30, question: str = ""):
 
     # Voice PTT trigger — wheel button hold-to-talk
     if stt is not None:
-        voice_device = voice_trigger_config.get("device_index")
-        voice_button = voice_trigger_config.get("button_index")
-        if voice_device is not None and voice_button is not None:
+        if trigger_bindings:
 
             def _on_voice_question(text, timing_steps):
                 handle_button_press(
@@ -188,20 +187,18 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30, question: str = ""):
                 max_record_seconds=voice_trigger_config.get("max_record_seconds", 15),
             )
             voice_listener = WheelButtonListener(
-                device_index=voice_device,
-                button_index=voice_button,
+                bindings=trigger_bindings,
                 on_press=ptt.on_press,
                 on_release=ptt.on_release,
             )
             voice_listener.start()
-            print(
-                f"   Voice PTT: hold wheel button {voice_button} (device {voice_device}) "
-                f"to speak your question."
-            )
+            print("   Voice PTT: hold any of these wheel buttons to speak:")
+            for binding in trigger_bindings:
+                print(f"     - {binding.label}")
         else:
             logger.warning(
                 "Voice enabled but no wheel button trigger configured — "
-                "set voice.trigger.device_index and voice.trigger.button_index."
+                "set voice.trigger.buttons in config.yaml."
             )
             print(
                 "   ⚠️  Voice PTT not configured. Edit config.yaml voice.trigger section."
@@ -211,9 +208,7 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30, question: str = ""):
     # Only wired when the voice PTT listener isn't already using the button
     # (STT unavailable, or voice disabled via --no-voice).
     if voice_listener is None:
-        query_device = voice_trigger_config.get("device_index")
-        query_button = voice_trigger_config.get("button_index")
-        if query_device is not None and query_button is not None:
+        if trigger_bindings:
 
             def _on_query_button_down():
                 handle_button_press(
@@ -227,24 +222,21 @@ def run_live_mode(config: dict, tick_rate_hz: int = 30, question: str = ""):
                 )
 
             voice_listener = WheelButtonListener(
-                device_index=query_device,
-                button_index=query_button,
+                bindings=trigger_bindings,
                 on_press=_on_query_button_down,
             )
             voice_listener.start()
-            print(
-                f"   Wheel button {query_button} (device {query_device}) "
-                f"press = ask LLM."
-            )
+            print("   Wheel button press = ask LLM. Configured buttons:")
+            for binding in trigger_bindings:
+                print(f"     - {binding.label}")
         else:
             logger.warning(
                 "No wheel button trigger configured — LLM queries only via "
-                "--question. Set voice.trigger.device_index and "
-                "voice.trigger.button_index."
+                "--question. Set voice.trigger.buttons in config.yaml."
             )
             print(
                 "   ⚠️  No query trigger configured. Use --question, or set "
-                "voice.trigger.device_index and voice.trigger.button_index."
+                "voice.trigger.buttons."
             )
 
     print("   Press Ctrl+C to exit.\n")

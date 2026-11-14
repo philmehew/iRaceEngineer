@@ -147,6 +147,9 @@ def watch_buttons(device_index: int | None = None, watch_axes: bool = False):
 
     # Track last suggested button to avoid repeating the same config snippet
     last_suggestion = None
+    # Bindings seen so far, so the suggested list grows as you press the
+    # race-engineer button on each of your wheels.
+    seen_bindings: list[tuple[int, int]] = []
 
     try:
         while True:
@@ -186,12 +189,21 @@ def watch_buttons(device_index: int | None = None, watch_axes: bool = False):
                     suggestion_key = (dev_idx, btn)
                     if suggestion_key != last_suggestion:
                         last_suggestion = suggestion_key
+                        if suggestion_key not in seen_bindings:
+                            seen_bindings.append(suggestion_key)
                         print("\n  📋 Suggested config.yaml:")
                         print("     voice:")
                         print("       trigger:")
-                        print(f"         device_index: {dev_idx}")
-                        print(f"         button_index: {btn}")
-                        print("         max_record_seconds: 15\n")
+                        print("         buttons:")
+                        for index, (dev, button) in enumerate(seen_bindings, start=1):
+                            print(f"           - name: Wheel {index}")
+                            print(f"             device_index: {dev}")
+                            print(f"             button_index: {button}")
+                        print("         max_record_seconds: 15")
+                        print(
+                            "     (Press your race-engineer button on each wheel "
+                            "to add it to the list.)\n"
+                        )
 
                 elif event.type == pygame.JOYBUTTONUP:
                     btn = event.button
