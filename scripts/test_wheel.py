@@ -1,9 +1,13 @@
 """
-Standalone wheel/controller button discovery — find device and button indices
-for push-to-talk on a steering wheel or game controller.
+Standalone wheel/controller button discovery — find a device's identity and
+button index for push-to-talk on a steering wheel or game controller.
 
-Lists connected joystick devices and watches for button presses, printing
-the exact config.yaml entries you need for wheel_button trigger mode.
+Lists connected joystick devices and watches for button presses, printing the
+exact config.yaml entries you need for wheel_button trigger mode.
+
+Wheels are matched by device name and/or USB GUID rather than connection
+index, because the index changes when devices are plugged in or removed and is
+always 0 when only one wheel is connected.
 
 IMPORTANT: pygame assigns each joystick an "instance_id" that may differ from
 the device index. This script maps events to the correct device using the
@@ -17,6 +21,7 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 import time
 
@@ -24,6 +29,22 @@ import time
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+
+
+def _device_name(js) -> str:
+    """Return a joystick's name, or an empty string if it can't be read."""
+    try:
+        return str(js.get_name())
+    except Exception:
+        return ""
+
+
+def _device_guid(js) -> str:
+    """Return a joystick's USB GUID, or an empty string if unavailable."""
+    try:
+        return str(js.get_guid())
+    except Exception:
+        return ""
 
 
 def list_devices():
@@ -49,21 +70,24 @@ def list_devices():
 
     print(f"\n🎮 Found {count} device(s):\n")
     print(
-        f"  {'Idx':<5} {'Instance':<10} {'Name':<45} {'Btns':<6} {'Axes':<6} {'Hats'}"
+        f"  {'Idx':<4} {'Instance':<9} {'Name':<40} {'GUID':<34} "
+        f"{'Btns':<5} {'Axes':<5} {'Hats'}"
     )
-    print("  " + "-" * 80)
+    print("  " + "-" * 105)
 
     for i in range(count):
         js = pygame.joystick.Joystick(i)
         js.init()
         iid = js.get_instance_id() if hasattr(js, "get_instance_id") else i
         print(
-            f"  {i:<5} {iid:<10} {js.get_name():<45} {js.get_numbuttons():<6} "
-            f"{js.get_numaxes():<6} {js.get_numhats()}"
+            f"  {i:<4} {iid:<9} {_device_name(js):<40} {_device_guid(js):<34} "
+            f"{js.get_numbuttons():<5} {js.get_numaxes():<5} {js.get_numhats()}"
         )
         js.quit()
 
-    print("\n  The 'Idx' column is the device_index for config.yaml.")
+    print("\n  'Idx' is only the current connection order — it changes when")
+    print("  devices are plugged/unplugged. In config.yaml, match wheels by")
+    print("  device_name and/or device_guid instead.")
     print("  Run without --list to watch for button presses.\n")
     pygame.quit()
 
@@ -72,7 +96,8 @@ def watch_buttons(device_index: int | None = None, watch_axes: bool = False):
     """Watch for button presses on joystick devices.
 
     Args:
-        device_index: Specific device to monitor, or None for all devices.
+        device_index: Specific device index to monitor, or None for all devices.
+            This is only for monitoring; config uses device_name/device_guid.
         watch_axes: If True, also print analog axis movements.
     """
     try:
@@ -127,13 +152,17 @@ def watch_buttons(device_index: int | None = None, watch_axes: bool = False):
         axes = js.get_numaxes()
         hats = js.get_numhats()
         print(
-            f"  Device {i} (instance {iid}): {js.get_name()} "
+            f"  Device {i} (instance {iid}): {_device_name(js)} "
             f"({btns} buttons, {axes} axes, {hats} hats)"
         )
+        guid = _device_guid(js)
+        if guid:
+            print(f"    GUID: {guid}")
 
     print("\n  🎯 Press buttons on your wheel to identify them.")
     print(
-        "     The 'device_index' in the config suggestion is the correct value to use."
+        "     The config suggestion uses device_name/device_guid, so the "
+        "binding follows the wheel regardless of connection order."
     )
     print("     Press Ctrl+C to exit.\n")
 
@@ -149,7 +178,7 @@ def watch_buttons(device_index: int | None = None, watch_axes: bool = False):
     last_suggestion = None
     # Bindings seen so far, so the suggested list grows as you press the
     # race-engineer button on each of your wheels.
-    seen_bindings: list[tuple[int, int]] = []
+    seen_bindings: list[tuple[str, str, int]] = []
 
     try:
         while True:
@@ -178,15 +207,18 @@ def watch_buttons(device_index: int | None = None, watch_axes: bool = False):
                 if dev_idx is None:
                     # Event from a device we didn't open — skip
                     continue
-                name = joysticks[dev_idx].get_name()
+                name = _device_name(joysticks[dev_idx])
 
                 if event.type == pygame.JOYBUTTONDOWN:
                     btn = event.button
                     print(f"  ✅ Button {btn} PRESSED on device {dev_idx} ({name})")
                     button_states[dev_idx][btn] = True
 
-                    # Print config suggestion
-                    suggestion_key = (dev_idx, btn)
+                    # Print config suggestion keyed by device identity, not
+                    # connection index.
+                    dev_name = _device_name(joysticks[dev_idx])
+                    dev_guid = _device_guid(joysticks[dev_idx])
+                    suggestion_key = (dev_name, dev_guid, btn)
                     if suggestion_key != last_suggestion:
                         last_suggestion = suggestion_key
                         if suggestion_key not in seen_bindings:
@@ -195,9 +227,19 @@ def watch_buttons(device_index: int | None = None, watch_axes: bool = False):
                         print("     voice:")
                         print("       trigger:")
                         print("         buttons:")
-                        for index, (dev, button) in enumerate(seen_bindings, start=1):
+                        for index, (d_name, d_guid, button) in enumerate(
+                            seen_bindings, start=1
+                        ):
                             print(f"           - name: Wheel {index}")
-                            print(f"             device_index: {dev}")
+                            if d_name:
+                                print(f"             device_name: {json.dumps(d_name)}")
+                            if d_guid:
+                                print(f"             device_guid: {json.dumps(d_guid)}")
+                            if not d_name and not d_guid:
+                                print(
+                                    "             # device identity unavailable — "
+                                    "restart the script"
+                                )
                             print(f"             button_index: {button}")
                         print("         max_record_seconds: 15")
                         print(
@@ -261,7 +303,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Standalone wheel/controller button discovery — "
-            "find device and button indices for push-to-talk."
+            "find a device's identity and button index for push-to-talk."
         )
     )
     parser.add_argument(
@@ -273,7 +315,10 @@ def main():
         "--device",
         type=int,
         default=None,
-        help="Monitor only this device index (default: monitor all devices)",
+        help=(
+            "Monitor only this device index (default: monitor all devices). "
+            "This is only for monitoring; config uses device_name/device_guid."
+        ),
     )
     parser.add_argument(
         "--watch-axes",

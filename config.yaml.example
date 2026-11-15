@@ -91,13 +91,17 @@ voice:
 
   trigger:
     # One entry per steering wheel. Use scripts/test_wheel.py to find the
-    # device and button indices, then give each entry a name.
+    # device name/GUID and button index, then give each entry a name.
+    # device_name and/or device_guid identify the wheel, so bindings keep
+    # working when devices are plugged in a different order. device_index is
+    # ignored.
     buttons:
       - name: Wheel 1
-        device_index: 0
+        device_name: "Simucube 2 Pro"
+        device_guid: "030000005e0400008e02000000000000"
         button_index: 9
       # - name: Wheel 2
-      #   device_index: 1
+      #   device_name: "FANATEC Podium DD1"
       #   button_index: 4
     max_record_seconds: 15           # Safety: auto-stop recording after this
 
