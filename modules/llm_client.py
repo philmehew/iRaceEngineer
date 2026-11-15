@@ -103,10 +103,11 @@ class LLMClient:
         self.retries = llm_config.get("retries", 2)
         self.retry_backoff = llm_config.get("retry_backoff", 1.0)
         # Optional thinking/reasoning depth control. Sent via extra_body with
-        # both known spellings — "think" (Ollama, honours false|"low"|"medium"|
-        # "high") and "reasoning_effort" (OpenAI, "low"|"medium"|"high") — each
-        # endpoint uses whichever it recognises and ignores the other.
-        #   thinking: false     → disable thinking (Ollama) / "low" (OpenAI)
+        # all known spellings — "think" (Ollama, honours false|"low"|"medium"|
+        # "high"), "reasoning_effort" (OpenAI, "low"|"medium"|"high"), and
+        # "chat_template_kwargs.enable_thinking" (llama.cpp, boolean) — each
+        # endpoint uses whichever it recognises and ignores the others.
+        #   thinking: false     → disable thinking across all dialects
         #   thinking: "low"     → light reasoning
         #   thinking: "high"    → deep reasoning
         #   thinking: "" / unset → don't send anything (model default)
@@ -131,6 +132,37 @@ class LLMClient:
         logger.info(
             f"LLM client initialised: {base_url} model={model} api_key={key_status}"
         )
+
+    def _thinking_extra_body(self) -> dict | None:
+        """Build the thinking-control payload for extra_body, or None.
+
+        Endpoints have no standard spelling for this — pass all known keys;
+        each endpoint uses whichever it recognises:
+          - Ollama "think": false|true|"low"|"medium"|"high"
+          - OpenAI "reasoning_effort": "none" when disabled, the depth string
+            otherwise (booleans are not accepted)
+          - llama.cpp "chat_template_kwargs.enable_thinking": boolean (Qwen/
+            DeepSeek chat templates)
+        """
+        if self.thinking is None:
+            return None
+        body: dict = {
+            "think": self.thinking,
+            # llama.cpp dialect: boolean flag in the chat template kwargs.
+            # Depth beyond on/off isn't supported there, so any truthy value
+            # (True or "low"/"medium"/"high") maps to True.
+            "chat_template_kwargs": {"enable_thinking": self.thinking is not False},
+        }
+        # OpenAI's "reasoning_effort" only accepts strings. When thinking is
+        # disabled this MUST be a disabling value ("none"), not "low" — some
+        # servers (llama.cpp) reject the request outright when the controls
+        # disagree about whether thinking is on. True has no string
+        # equivalent, so it's omitted and the other keys carry the intent.
+        if self.thinking is False:
+            body["reasoning_effort"] = "none"
+        elif self.thinking is not True:
+            body["reasoning_effort"] = self.thinking
+        return body
 
     def ask(self, messages: list[dict], question: str = "") -> str:
         """Send messages to the LLM and return the response text.
@@ -165,18 +197,9 @@ class LLMClient:
                     "temperature": self.temperature,
                     "timeout": self.timeout,
                 }
-                if self.thinking is not None:
-                    # Endpoints have no standard spelling for this — pass both
-                    # known keys; the endpoint uses whichever it recognises.
-                    # Ollama's "think" accepts false|true|"low"|"medium"|"high";
-                    # OpenAI's "reasoning_effort" only accepts strings, so a
-                    # disabled-thinking request maps to "low" there.
-                    create_kwargs["extra_body"] = {
-                        "think": self.thinking,
-                        "reasoning_effort": (
-                            "low" if self.thinking is False else self.thinking
-                        ),
-                    }
+                thinking_body = self._thinking_extra_body()
+                if thinking_body is not None:
+                    create_kwargs["extra_body"] = thinking_body
                 response = self.client.chat.completions.create(**create_kwargs)
                 t_done = time.monotonic()
 
@@ -245,14 +268,19 @@ class LLMClient:
         if question:
             messages = messages + [{"role": "user", "content": question}]
 
+        create_kwargs: dict = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "stream": True,
+        }
+        thinking_body = self._thinking_extra_body()
+        if thinking_body is not None:
+            create_kwargs["extra_body"] = thinking_body
+
         try:
-            stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                stream=True,
-            )
+            stream = self.client.chat.completions.create(**create_kwargs)
 
             for chunk in stream:
                 if not chunk.choices:

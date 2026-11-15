@@ -1197,10 +1197,13 @@ class TestLLMClientRetry:
         extra = captured.get("extra_body", {})
         assert extra.get("think") == "high"
         assert extra.get("reasoning_effort") == "high"
+        # llama.cpp dialect: any truthy depth enables thinking
+        assert extra.get("chat_template_kwargs") == {"enable_thinking": True}
 
-    def test_thinking_false_maps_to_low_effort(self):
-        """thinking: false sends think=false; OpenAI's reasoning_effort (strings
-        only) gets "low" as the closest equivalent."""
+    def test_thinking_false_disables_across_dialects(self):
+        """thinking: false must disable in every dialect at once — servers
+        that validate consistency (llama.cpp) reject mixed signals like
+        enable_thinking=false + reasoning_effort=low."""
         client = self._make_client(thinking=False)
         captured = {}
 
@@ -1212,7 +1215,8 @@ class TestLLMClientRetry:
         client.ask([{"role": "user", "content": "q"}])
         extra = captured.get("extra_body", {})
         assert extra.get("think") is False
-        assert extra.get("reasoning_effort") == "low"
+        assert extra.get("reasoning_effort") == "none"
+        assert extra.get("chat_template_kwargs") == {"enable_thinking": False}
 
     def test_thinking_string_aliases(self):
         """String spellings normalise: "False"/"off"/"none" → False."""
@@ -1237,6 +1241,21 @@ class TestLLMClientRetry:
             client.client.chat.completions.create = capture
             client.ask([{"role": "user", "content": "q"}])
             assert "extra_body" not in captured
+
+    def test_thinking_sent_in_streaming(self):
+        """ask_streaming sends the same thinking extra_body as ask()."""
+        client = self._make_client(thinking=False)
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return iter([])  # empty stream
+
+        client.client.chat.completions.create = capture
+        list(client.ask_streaming([{"role": "user", "content": "q"}]))
+        extra = captured.get("extra_body", {})
+        assert extra.get("think") is False
+        assert extra.get("chat_template_kwargs") == {"enable_thinking": False}
 
 
 # --- Eval quality-check tests ---
