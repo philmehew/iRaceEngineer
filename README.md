@@ -284,52 +284,51 @@ python scripts/test_stt.py --duration 10
 
 ### Test Wheel Button Discovery
 
-Use `scripts/test_wheel.py` to identify your steering wheel's device and button indices for push-to-talk:
+Use `scripts/test_wheel.py` to identify your steering wheel's device identity and button index for push-to-talk:
 
 ```bash
-# List connected controllers
+# List connected controllers (name, GUID, button count)
 python scripts/test_wheel.py --list
 
 # Watch for button presses (press buttons on your wheel to identify them)
 python scripts/test_wheel.py
 
-# Monitor only a specific device
+# Monitor only a specific device index (monitoring only; config uses identity)
 python scripts/test_wheel.py --device 0
 
 # Also show analog axis movements
 python scripts/test_wheel.py --watch-axes
 ```
 
-When you press a button, the script prints the device index, button number, and a suggested `config.yaml` snippet.
+When you press a button, the script prints the device name/GUID, button number, and a suggested `config.yaml` snippet. Device identity is used instead of the connection index so bindings keep working when wheels are plugged in a different order.
 
 ### Voice in Live Mode
 
-In live mode, two triggers are available via steering wheel buttons:
+In live mode, wheel buttons trigger the race engineer:
 
-- **Query button** — Press to send a general strategy query to the LLM
-- **Voice PTT button** — Hold to speak your question, release to transcribe
+- **With voice enabled** (default) — Hold any configured button to speak your question; release to transcribe.
+- **Without voice** (STT unavailable, or `--no-voice`) — Press any configured button to ask the LLM directly.
 
-Both use pygame to read wheel buttons. Configure in `config.yaml`:
+Both use pygame to read wheel buttons. Each configured entry identifies a wheel by its device name and/or USB GUID, so you can add one entry per steering wheel. This avoids the connection index, which changes when devices are plugged in or unplugged and is always 0 when only one wheel is connected. Any configured button triggers the engineer. Configure in `config.yaml`:
 
 1. Install pygame: `uv sync --extra wheel`
-2. Discover your wheel's device and button indices:
+2. Discover your wheel's identity and button index:
    ```bash
    python scripts/test_wheel.py --list      # List connected controllers
    python scripts/test_wheel.py              # Press buttons to see their indices
    ```
 3. Configure in `config.yaml`:
    ```yaml
-   # LLM query trigger (press to ask the race engineer)
-   trigger:
-     device_index: 0    # From scripts/test_wheel.py --list
-     button_index: 4    # From pressing buttons in scripts/test_wheel.py
-
-   # Voice push-to-talk (hold to speak, release to transcribe)
    voice:
      trigger:
-       device_index: 0
-       button_index: 9
-       push_to_talk: true
+       buttons:
+         - name: Formula
+           device_name: "Simucube 2 Pro"       # From --list or the press prompt
+           device_guid: "030000005e0400008e02000000000000"  # Optional; most precise
+           button_index: 9                     # From pressing buttons in test_wheel.py
+         - name: GT
+           device_name: "FANATEC Podium DD1"
+           button_index: 4
        max_record_seconds: 15
    ```
 
@@ -511,11 +510,6 @@ llm:
   max_tokens: 300
   temperature: 0.3
 
-# Button trigger — wheel button to query the LLM
-trigger:
-  device_index: 0    # Joystick device index (use scripts/test_wheel.py to find)
-  button_index: 4    # Button index on device
-
 # Voice input/output (optional: uv sync --extra voice)
 voice:
   stt:
@@ -536,9 +530,14 @@ voice:
     volume: 1.0
     sentence_silence: 0.2
   trigger:
-    device_index: 0           # Joystick device index
-    button_index: 9           # Button index on device
-    push_to_talk: true
+    buttons:
+      - name: Formula
+        device_name: "Simucube 2 Pro"      # Wheel identity (from test_wheel.py)
+        device_guid: "030000005e0400008e02000000000000"  # Optional unique USB GUID
+        button_index: 9                    # Button index on that wheel
+      - name: GT
+        device_name: "FANATEC Podium DD1"
+        button_index: 4
     max_record_seconds: 15
 
 # Spotter — real-time audio calls for car proximity & race alerts (local, no LLM)
@@ -733,7 +732,7 @@ Same as `--capture` but always saves to the `tests/sample_data/` folder (from co
 | `modules/wheel_button.py` | WheelButtonListener — pygame button events (query press / PTT hold) |
 | `scripts/test_stt.py` | Standalone STT test — record + transcribe without iRacing |
 | `scripts/test_tts.py` | Standalone TTS test — speak text without iRacing |
-| `scripts/test_wheel.py` | Standalone wheel button discovery — find device/button indices for push-to-talk |
+| `scripts/test_wheel.py` | Standalone wheel button discovery — find device identity/button indices for push-to-talk |
 | `tests/test_modules.py` | Unit tests — RaceState, ContextBuilder, TelemetryReplay |
 | `tests/test_spotter.py` | Unit tests — ProximityDetector, CarBehindTracker, SpotterAudioPlayer, Spotter coordinator |
 | `tests/eval_llm_responses.py` | Batch LLM evaluation — asks 50 questions against replay data, logs results |
