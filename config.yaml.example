@@ -15,9 +15,10 @@ llm:
   retries: 2                                # Retry attempts for transient errors (rate limits, overload)
   retry_backoff: 1.0                        # Base delay between retries (seconds, scales per attempt)
   thinking: false                           # false | true | "low" | "medium" | "high" — thinking-model
-                                            # reasoning control (Ollama "think" / OpenAI "reasoning_effort").
-                                            # false = fastest replies; "high" = deep analysis.
-                                            # Unset/empty = model default (don't send anything).
+                                            # reasoning control. Sent in every known dialect so it works across
+                                            # endpoints: Ollama "think", OpenAI "reasoning_effort", and llama.cpp
+                                            # "chat_template_kwargs.enable_thinking" (Qwen/DeepSeek). false =
+                                            # fastest replies; "high" = deep analysis. Unset/empty = model default.
 
 # Team identification — how to recognise your teammates
 # AUTO-DETECT (default): iRacing assigns each driver a TeamName in session info.
